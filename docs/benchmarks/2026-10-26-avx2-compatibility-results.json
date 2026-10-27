@@ -1,0 +1,621 @@
+{
+  "report_date_local": "2026-10-26",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 3900X (Zen 2, AVX2; no AVX-512)",
+    "gpus": "2 × AMD Radeon RX 7900 XTX 24 GB",
+    "system_memory": "125 GiB detected",
+    "rocm": "10.1.0"
+  },
+  "benchmark_source": {
+    "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+    "measurement": "Engine-reported API fields timings.prompt_per_second and timings.predicted_per_second; not UI estimates.",
+    "harness": "rdna3/bench.py request/payload method, run through local 8080 matrix harness.",
+    "prompt_source": "Local validation retrieval corpus: rdna3-validation/prompts.json (three fixed prompts).",
+    "prompt_corpus_sha256": "d9fd5a98b7cbc7f9057a08c0b12c6ba02c25f9f54900dca120940acef68e9754",
+    "prompt_tokens": 32768,
+    "output_tokens": 256,
+    "warmup_output_tokens": 128,
+    "sampling": {
+      "temperature": 0,
+      "seed": 42,
+      "cache_prompt": false,
+      "thinking": false
+    },
+    "repeats": 3,
+    "validation": "exact 32768 prompt tokens, cache_n=0, exact 256 output tokens, three retrieval codes present, nonempty text, no replacement character, no standalone NaN token."
+  },
+  "builds": {
+    "official_control": {
+      "engine": "Strata official",
+      "version": "0.1.50",
+      "binary_sha256": "52f4aef8ca31e05c2b8e5ccfec4b2cebb605d3ef9d9db0f8dd511d0f538e0da2"
+    },
+    "pr_branch": {
+      "repo": "nicejunjie/Strata-rdna3",
+      "branch": "fix/avx2-safe-isa-probe",
+      "commit": "dc6c8edd51e17166e2c7d7aa9032922b9d1f429a",
+      "engine_version": "0.1.43",
+      "binary_sha256": "648432c4683602fe7ccdf960a23a66b9ea129d1c5ff0f9186123323ae4e6c6d7"
+    }
+  },
+  "configurations": {
+    "single_gpu1": {
+      "gpu_order": [
+        1
+      ],
+      "layer_split": "auto",
+      "server_host": "127.0.0.1",
+      "port": 8080,
+      "cli_args": [
+        "--pack",
+        "rdna3-validation/data/packs/swift-iq3_s-ablit",
+        "--native",
+        "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+        "--ple-gguf",
+        "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+        "--expert-profile",
+        "data/expert-profile.bin (identical contents in both checkouts)",
+        "--prefill",
+        "auto",
+        "--spec",
+        "4",
+        "--spec-min-p",
+        "0.5",
+        "--mtp",
+        "Strata-data/mtp/rt",
+        "--max-context",
+        "262144",
+        "--kv",
+        "int8",
+        "--ple-io",
+        "direct",
+        "--stats",
+        "--expert-cache",
+        "auto",
+        "--ple-row-cache",
+        "1048576",
+        "--kv-resident",
+        "32768",
+        "--pcie-frac",
+        "0",
+        "--vram-reserve-mib",
+        "512",
+        "--pool-workers",
+        "12",
+        "--mtp-q4",
+        "all",
+        "--mtp-window",
+        "4096"
+      ],
+      "environment": {
+        "GPU_MAX_HW_QUEUES": "6",
+        "STRATA_COMBINE_CPU": "1",
+        "STRATA_FUSE_CONVAB": "1",
+        "STRATA_GDN_CHUNKED": "1",
+        "STRATA_GDN_CHUNK_GDV": "0",
+        "STRATA_GDN_CONVL2": "1",
+        "STRATA_GDN_HEAD": "1",
+        "STRATA_GDN_NOY": "1",
+        "STRATA_GDN_PP": "1",
+        "STRATA_GR_FUSED": "1",
+        "STRATA_GR_INJ_UP": "1",
+        "STRATA_GR_RDNA": "1",
+        "STRATA_GR_RDNA_A8": "1",
+        "STRATA_GR_RDNA_Q8": "1",
+        "STRATA_HC_UPMIX": "1",
+        "STRATA_HEAD_MIX_MULTI": "1",
+        "STRATA_HIPBLASLT_TUNING": "tools/hip/gfx1100-hipblaslt-100401.txt",
+        "STRATA_HIP_WMMA": "1",
+        "STRATA_KV_HOST_DMA": "1",
+        "STRATA_PA_FAST": "1",
+        "STRATA_PA_KLDS": "1",
+        "STRATA_PEER_TRANSPORT": "host",
+        "STRATA_PF_F16": "2",
+        "STRATA_PF_FUSED": "1",
+        "STRATA_PF_GEMM": "1",
+        "STRATA_PF_GROUP_RES": "1",
+        "STRATA_PF_HCDOWN": "1",
+        "STRATA_PF_PAD": "1",
+        "STRATA_PREFILL_AUTO_MAX": "32768",
+        "STRATA_PREFILL_CPU_SHARE": "auto",
+        "STRATA_PREFILL_CPU_SHARE_MAX": "6144",
+        "STRATA_PREFILL_MMQ_TILE_ROWS": "32",
+        "STRATA_PREFILL_RING": "192",
+        "STRATA_QFUSE": "1",
+        "STRATA_RDNA_MMVQ_WAVE": "3",
+        "STRATA_RDNA_Q6K": "1",
+        "STRATA_ROUTE_PUBLISH": "1",
+        "STRATA_SELECT_WMMA": "1",
+        "STRATA_SH_STREAM": "0",
+        "STRATA_STAGER_RING": "64",
+        "STRATA_VERIFY_QDEDUP": "1",
+        "STRATA_WAIT_FUSE": "1"
+      },
+      "model": "SC117 Swift 1.5 Qwen3.8-Flash-Next Abliterated IQ3_S",
+      "pack": "swift-iq3_s-ablit",
+      "native_and_ple_gguf_argument": "IQ3_S shard 00001-of-00002.gguf",
+      "mtp": "Qwen3.8-Flash-Next rt draft directory",
+      "expert_profile_sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf"
+    },
+    "dual_gpu1_gpu0": {
+      "gpu_order": [
+        1,
+        0
+      ],
+      "layer_split": "24",
+      "server_host": "127.0.0.1",
+      "port": 8080,
+      "cli_args": [
+        "--pack",
+        "rdna3-validation/data/packs/swift-iq3_s-ablit",
+        "--native",
+        "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+        "--ple-gguf",
+        "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+        "--expert-profile",
+        "data/expert-profile.bin (identical contents in both checkouts)",
+        "--prefill",
+        "auto",
+        "--spec-min-p",
+        "0.5",
+        "--mtp",
+        "Strata-data/mtp/rt",
+        "--max-context",
+        "262144",
+        "--kv",
+        "int8",
+        "--ple-io",
+        "direct",
+        "--stats",
+        "--pool-workers",
+        "8",
+        "--expert-cache",
+        "auto",
+        "--ple-row-cache",
+        "1048576",
+        "--kv-resident",
+        "32768",
+        "--pipeline-windows",
+        "2",
+        "--mtp-q4",
+        "all",
+        "--mtp-window",
+        "4096",
+        "--pcie-frac",
+        "0",
+        "--spec",
+        "3",
+        "--vram-reserve-mib",
+        "512",
+        "--vram-reserve-later-mib",
+        "2048"
+      ],
+      "environment": {
+        "GPU_MAX_HW_QUEUES": "8",
+        "STRATA_AUX_CPUS": "off",
+        "STRATA_COMBINE_CPU": "1",
+        "STRATA_DP_PREFILL": "1",
+        "STRATA_FUSE_CONVAB": "1",
+        "STRATA_GDN_CHUNKED": "1",
+        "STRATA_GDN_CHUNK_GDV": "0",
+        "STRATA_GDN_CONVL2": "1",
+        "STRATA_GDN_HEAD": "1",
+        "STRATA_GDN_NOY": "1",
+        "STRATA_GDN_PP": "1",
+        "STRATA_GR_FUSED": "1",
+        "STRATA_GR_INJ_UP": "1",
+        "STRATA_GR_RDNA": "1",
+        "STRATA_GR_RDNA_A8": "1",
+        "STRATA_GR_RDNA_Q8": "1",
+        "STRATA_HC_Q8": "0",
+        "STRATA_HC_UPMIX": "1",
+        "STRATA_HEAD_MIX_MULTI": "1",
+        "STRATA_HIPBLASLT_TUNING": "tools/hip/gfx1100-hipblaslt-100401.txt",
+        "STRATA_HIP_WMMA": "1",
+        "STRATA_KV_HOST_DMA": "1",
+        "STRATA_ONE_TOKEN_COMMIT": "0",
+        "STRATA_PA_FAST": "1",
+        "STRATA_PA_KLDS": "1",
+        "STRATA_PEER_TRANSPORT": "host",
+        "STRATA_PF_F16": "2",
+        "STRATA_PF_FUSED": "1",
+        "STRATA_PF_GEMM": "1",
+        "STRATA_PF_GROUP_RES": "1",
+        "STRATA_PF_HCDOWN": "1",
+        "STRATA_PF_PAD": "1",
+        "STRATA_PREFILL_AUTO_MAX": "32768",
+        "STRATA_PREFILL_CPU_SHARE": "auto",
+        "STRATA_PREFILL_CPU_SHARE_MAX": "1024",
+        "STRATA_PREFILL_MMQ_TILE_ROWS": "32",
+        "STRATA_PREFILL_RING": "384",
+        "STRATA_PREFILL_SMALL_MAX": "4096",
+        "STRATA_PREFILL_SMALL_RING": "96",
+        "STRATA_QFUSE": "1",
+        "STRATA_RDNA_MMVQ_WAVE": "3",
+        "STRATA_RDNA_Q6K": "1",
+        "STRATA_ROUTE_PUBLISH": "1",
+        "STRATA_ROUTE_TAIL_SKIP": "0",
+        "STRATA_SELECT_WMMA": "1",
+        "STRATA_STAGER_RING": "64",
+        "STRATA_VERIFY_QDEDUP": "1",
+        "STRATA_WAIT_FUSE": "1"
+      },
+      "model": "SC117 Swift 1.5 Qwen3.8-Flash-Next Abliterated IQ3_S",
+      "pack": "swift-iq3_s-ablit",
+      "native_and_ple_gguf_argument": "IQ3_S shard 00001-of-00002.gguf",
+      "mtp": "Qwen3.8-Flash-Next rt draft directory",
+      "expert_profile_sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf"
+    }
+  },
+  "runs": {
+    "saved_1_50_previous": {
+      "source": "rdna3-validation/results/baseline-1gpu.json and baseline-2gpu.json (previous saved run; official engine 0.1.50)",
+      "single_gpu1": {
+        "engine": "Strata official engine 0.1.50",
+        "engine_version": "0.1.50",
+        "gpu_order": [
+          1
+        ],
+        "layer_split": "auto",
+        "runs": [
+          {
+            "prefill_tok_s": 3234.2,
+            "decode_tok_s": 67.8,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3188.1,
+            "decode_tok_s": 73.4,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3180.3,
+            "decode_tok_s": 78.4,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 3188.1,
+        "median_decode_tok_s": 73.4,
+        "all_checks_passed": true
+      },
+      "dual_gpu1_gpu0": {
+        "engine": "Strata official engine 0.1.50",
+        "engine_version": "0.1.50",
+        "gpu_order": [
+          1,
+          0
+        ],
+        "layer_split": "24",
+        "runs": [
+          {
+            "prefill_tok_s": 3087.2,
+            "decode_tok_s": 87.9,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3024.3,
+            "decode_tok_s": 88.9,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3017.0,
+            "decode_tok_s": 91.9,
+            "passed": true,
+            "checks": {
+              "prompt_tokens": true,
+              "prompt_n": true,
+              "uncached": true,
+              "completion_tokens": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 3024.3,
+        "median_decode_tok_s": 88.9,
+        "all_checks_passed": true
+      }
+    },
+    "fresh_1_50_on_8080": {
+      "single_gpu1": {
+        "engine": "Strata official engine 0.1.50",
+        "engine_version": "0.1.50",
+        "gpu_order": [
+          1
+        ],
+        "layer_split": "auto",
+        "runs": [
+          {
+            "prefill_tok_s": 3253.7,
+            "decode_tok_s": 64.3,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 3200.9,
+            "decode_tok_s": 69.5,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 3201.8,
+            "decode_tok_s": 73.4,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 3201.8,
+        "median_decode_tok_s": 69.5,
+        "all_checks_passed": true
+      },
+      "dual_gpu1_gpu0": {
+        "engine": "Strata official engine 0.1.50",
+        "engine_version": "0.1.50",
+        "gpu_order": [
+          1,
+          0
+        ],
+        "layer_split": "24",
+        "runs": [
+          {
+            "prefill_tok_s": 3155.3,
+            "decode_tok_s": 94.1,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3098.1,
+            "decode_tok_s": 91.5,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          },
+          {
+            "prefill_tok_s": 3087.0,
+            "decode_tok_s": 88.7,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 3098.1,
+        "median_decode_tok_s": 91.5,
+        "all_checks_passed": true
+      }
+    },
+    "pr_branch_fresh_on_8080": {
+      "single_gpu1": {
+        "engine": "Strata RDNA3 fork engine 0.1.43",
+        "engine_version": "0.1.43",
+        "binary_sha256": "648432c4683602fe7ccdf960a23a66b9ea129d1c5ff0f9186123323ae4e6c6d7",
+        "gpu_order": [
+          1
+        ],
+        "layer_split": "auto",
+        "runs": [
+          {
+            "prefill_tok_s": 3505.5,
+            "decode_tok_s": 77.5,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 3529.9,
+            "decode_tok_s": 88.1,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 3529.4,
+            "decode_tok_s": 91.3,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 3529.4,
+        "median_decode_tok_s": 88.1,
+        "all_checks_passed": true
+      },
+      "dual_gpu1_gpu0": {
+        "engine": "Strata RDNA3 fork engine 0.1.43",
+        "engine_version": "0.1.43",
+        "binary_sha256": "648432c4683602fe7ccdf960a23a66b9ea129d1c5ff0f9186123323ae4e6c6d7",
+        "gpu_order": [
+          1,
+          0
+        ],
+        "layer_split": "24",
+        "runs": [
+          {
+            "prefill_tok_s": 5474.6,
+            "decode_tok_s": 120.3,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 5502.8,
+            "decode_tok_s": 117.1,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          },
+          {
+            "prefill_tok_s": 5426.0,
+            "decode_tok_s": 113.9,
+            "passed": true,
+            "checks": {
+              "prompt_tokens_32768": true,
+              "engine_prompt_n_32768": true,
+              "uncached": true,
+              "output_tokens_256": true,
+              "retrieval_codes": true,
+              "has_text": true,
+              "no_replacement_char": true,
+              "no_nan_token": true
+            }
+          }
+        ],
+        "median_prefill_tok_s": 5474.6,
+        "median_decode_tok_s": 117.1,
+        "all_checks_passed": true
+      }
+    }
+  },
+  "interpretation": [
+    "The historical 1.50 single and dual presets are close in prefill; the fresh medians are 3201.8 and 3098.1 tok/s (dual is 3.2% lower).",
+    "Both 1.50 dual and PR dual use layer split. The 1.50 engine log reports one hand-off per window and adaptive overlap off; it does not log the RDNA3 fork DP prompt path. The PR engine log explicitly reports DP prompt path on, with prompts >= STRATA_DP_MIN reading both GPUs on alternating chunks.",
+    "The full-build comparison is not an isolated AVX2 patch performance test: official 1.50 is engine 0.1.50, PR branch is engine 0.1.43 with additional RDNA3 changes. The AVX2 change makes CPU ISA detection safe; it does not add an AVX2 kernel or by itself claim speedup.",
+    "Single and dual presets differ in some operational settings (for example --spec, --pool-workers, prompt-ring and CPU-share limits), so single-vs-dual results do not isolate GPU count alone. Within each GPU mode, official and PR builds use the same preset; the expert profile files have identical hashes."
+  ],
+  "notes": [
+    "Fresh Strata 1.50 logs warned that free VRAM at request start was below the configured 512 MiB reserve: 388 MiB in the single-GPU run and 480 MiB in the dual-GPU run. All measured requests completed and passed validation; the runs had little spare VRAM margin."
+  ]
+}
