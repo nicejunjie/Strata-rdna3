@@ -41,9 +41,12 @@ bool kq_ok() {
 #if defined(STRATA_KQ_DSO)
     return kq::available();
 #else
+    // [claude] a build whose K-quant kernels are linked in (no strata_kq library): on unless STRATA_MMQ_KQ=0 - the rdna3
+    // engines before the v0.2.4 merge always ran them, and without them a UD-Q4_K_XL prompt took the FP16 path (2x RX 7900
+    // XTX, Q4 1K 680 -> 480 tok/s, 2K 960 -> 750, 32K 5300 -> 5150 with a 1.9 GiB larger loan)
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MMQ_KQ");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 #endif
