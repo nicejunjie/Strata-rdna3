@@ -1007,6 +1007,8 @@ struct Prefill::Impl {
     cudaEvent_t cpu_ev[2] = {};   // the GPU's expert work of the last CPU-sharing layer, read once the stream is done
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
+    double cs_cpu_ms = 0, cs_wait_ms = 0;   // [claude] STRATA_PREFILL_TIMING: the CPU share's thread time and the host's wait for it
+    int64_t cs_rows = 0;
     int64_t pend_n_cpu = 0, pend_n_gpu = 0;
     // ... and whether sharing pays at all (auto): an eligible layer's wall time per non-resident expert, from before
     // its routing sync to its combine (CUDA events, two sets: a layer's start is recorded before the last one's is
@@ -5457,7 +5459,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
+                        const auto tw0 = Clock::now();
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
+                        m.cs_wait_ms += ms_since(tw0);
+                        m.cs_cpu_ms += cpu_ms;
+                        m.cs_rows += rows_cpu;
                         if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
                             m.cpu_pend = true;
                             m.pend_cpu_ms = cpu_ms;
@@ -5799,6 +5805,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: device %d experts: %lld streamed (%lld straight from the pinned arena), "
                              "%lld resident, %lld on the CPU\n", m.device, (long long) stats_.experts_streamed,
                      (long long) stats_.experts_dma, (long long) stats_.experts_resident, (long long) stats_.experts_cpu);
+        if (m.cs_rows > 0) {
+            std::fprintf(stderr, "strata prefill timing: device %d CPU share: %lld rows, CPU thread %.0f ms, the host waited %.0f ms for it\n",
+                         m.device, (long long) m.cs_rows, m.cs_cpu_ms, m.cs_wait_ms);
+            m.cs_rows = 0; m.cs_cpu_ms = m.cs_wait_ms = 0;
+        }
         if (m.pp && m.pp->hres_experts > 0)
             std::fprintf(stderr, "strata prefill timing: device %d: %lld experts computed by the helper from its own cache\n",
                          m.device, (long long) m.pp->hres_experts);
