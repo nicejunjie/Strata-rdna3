@@ -11,6 +11,10 @@
 
 namespace strata::kernels {
 
+/// [claude] a projection read through a row / block-column map out of a full matrix (WeightRef::map_*); pitch 0: plain
+struct MkMat { int pitch = 0, nr = 0, cw = 0, cgap = 0, cadd = 0; int rlo[8] = {}, radd[8] = {}; };
+/// [claude] y = W x for a mapped Q8_0 matrix (the fallback where the persistent kernel does not run): n_in / n_out logical
+void q80_mmvq_mapped(const void* w, const MkMat& m, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream);
 struct MkGdnArgs {
     // the layer input and its q8_1 image (T columns)
     const float* x = nullptr;        ///< (T, n_embd)
@@ -38,6 +42,7 @@ struct MkGdnArgs {
     void* yq = nullptr;              ///< T columns of q8_1 blocks of value_dim (the out projection's input)
     float* bo = nullptr;             ///< (T, n_embd)
     int n_embd = 0, conv_channels = 0, value_dim = 0, h_k = 0, h_v = 0;
+    MkMat m_qkv, m_z, m_out;         ///< [claude] the TP alias maps (pitch 0: plain)
     float eps = 1e-6f;
     unsigned* counters = nullptr;    ///< device, >= 16 uints, zeroed by mk_gdn_dense before the launch
     unsigned* stall = nullptr;       ///< optional mapped host word: a phase wait that timed out writes its phase + 1 (sticky)

@@ -93,6 +93,17 @@ bool window_copy_logits(void* w, int t, float* host);
 
 namespace strata::core {
 namespace {
+// [claude] WeightRef's TP alias map as the kernels' MkMat (pitch 0: plain)
+strata::kernels::MkMat mkmat_of(const strata::core::WeightRef* w) {
+    strata::kernels::MkMat m;
+    if (w == nullptr || w->map_pitch <= 0) return m;
+    m.pitch = w->map_pitch; m.nr = w->map_nr; m.cw = w->map_cw; m.cgap = w->map_cgap; m.cadd = w->map_cadd;
+    for (int k = 0; k < 8; ++k) { m.rlo[k] = w->map_rlo[k]; m.radd[k] = w->map_radd[k]; }
+    return m;
+}
+}  // namespace
+
+namespace {
 
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
@@ -1494,6 +1505,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             il_ready = false;
         };
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+            if (w->map_pitch > 0) {   // [claude] a TP alias with a map (STRATA_TP_ALIAS_MAP): the mapped Q8_0 GEMV
+                strata::kernels::q80_mmvq_mapped(w->native_data, mkmat_of(w), xq_, out, n_in, n_out, n, cs);
+                return;
+            }
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
@@ -1541,6 +1556,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (use_mk) {
                     strata::kernels::MkGdnArgs a;
                     a.x = xm; a.xq = xq_; a.w_qkv = wqkv->native_data; a.w_z = wg->native_data; a.w_out = wout->native_data;
+                    a.m_qkv = mkmat_of(wqkv); a.m_z = mkmat_of(wg); a.m_out = mkmat_of(wout);
                     a.qkv = qkv; a.z = z_; a.hist = conv; a.w_conv = (const float*) wc->data; a.h = hb;
                     a.w_alpha = (const uint16_t*) wa->data; a.w_beta = (const uint16_t*) wb->data; a.dt = (const float*) wdt->data;
                     a.ssm_a = (const float*) wsa->data; a.gate = gate; a.beta = beta; a.state = state; a.gamma = (const float*) wnm->data;
@@ -1553,6 +1569,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     il_ready = false;
                     if (tp_) tp_xchg(bo_ + tb * N, (int64_t) n * N, 0);   // TP: the half-width partial sums added
                 } else {
+                    // [claude] a mapped TP alias: only mm() reads it (no side projection, branch or RDNA pair)
+                    const bool mapped = wqkv->map_pitch > 0 || wg->map_pitch > 0 || wout->map_pitch > 0;
+                    if (mapped && (side_proj || br)) { err = "verify: a mapped TP projection on a side branch (STRATA_TP_ALIAS_MAP=0)"; return false; }
                     if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                         if (!branch(mfork_, cs, side_, "fork")) return false;
                         gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -1592,7 +1611,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     auto il_path = [&](const WeightRef* w, int n_out) {
                         return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out);
                     };
-                    const bool z_paired = !br && !side_proj && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
+                    const bool z_paired = !mapped && !br && !side_proj && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
                         !il_path(wg, (int) ZV) &&
                         strata::kernels::rdna_mmvq_pair(wqkv->native_type, wqkv->native_data, wg->native_data, xq_,
                                                         qkv + (size_t) tb * C, z_ + (size_t) tb * ZV, (int) N, (int) C,

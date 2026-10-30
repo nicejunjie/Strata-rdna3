@@ -4,6 +4,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/megakernel.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -412,6 +413,108 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                         return true;
                     }()) {
                     r.native_data = (const uint8_t*) r.native_data + rows[0].begin * row_bytes;
+                    r.ne0 = (int64_t) new_in;
+                    r.ne1 = (int64_t) new_out;
+                    r.elements = (int64_t) (new_in * new_out);
+                    r.data = nullptr;
+                    r.bytes = 0;
+                    aliased_ += bytes;
+                    if (new_in > max_in) max_in = new_in;
+                    continue;
+                }
+                // [claude] STRATA_TP_ALIAS_MAP=1: a Q8_0 GDN projection (qkv / gate: up to 4 row ranges; ssm_out: up to 2
+                // block-column ranges) reads the full matrix through a map (WeightRef::map_*, the verifier's Q8_0 GEMVs)
+                static const bool alias_map = [] { const char* v = std::getenv("STRATA_TP_ALIAS_MAP"); return v != nullptr && v[0] == '1'; }();
+                auto why_not = [&](const char* why) {   // once per kind: why a projection keeps its copy
+                    static std::set<std::string> said;
+                    if (alias_map && said.insert(std::string(why) + std::to_string(kind)).second)
+                        std::fprintf(stderr, "strata generate: tensor parallel: %s keeps its copy (STRATA_TP_ALIAS_MAP: %s)\n", t.name.c_str(), why);
+                    return false;
+                };
+                if (alias_env && alias_map && (kind == 0 || kind == 3 || kind == 4) && t.type == 8 &&
+                    (r.native_data != nullptr || why_not("no full matrix on this card")) &&
+                    (r.native_type == 8 || why_not("the full matrix is not Q8_0")) &&
+                    ((rows.size() <= 8 && (rows.empty() != cols.empty()) && [&] {   // columns: equal ranges, equally spaced
+                        for (size_t k = 1; k < cols.size(); ++k)
+                            if (cols[k].count != cols[0].count || cols[k].begin - cols[k - 1].begin != cols[1].begin - cols[0].begin) return false;
+                        const uint64_t cwb = cols.empty() ? 1 : cols[0].count / (uint64_t) be;   // the kernel shifts by log2
+                        return cols.size() <= 1 || (cwb & (cwb - 1)) == 0;
+                    }()) || why_not("ranges")) &&
+                    (strata::kernels::native_mmvq_weight_bytes(8, (int) n_in, (int) n_out) == n_out * row_bytes || why_not("layout size")) && [&] {
+                        const uint64_t full = n_out * row_bytes, n = std::min<uint64_t>(full, 65536);
+                        std::vector<uint8_t> a(n);
+                        for (const uint64_t at : {(uint64_t) 0, full - n}) {
+                            if (cudaMemcpy(a.data(), (const uint8_t*) r.native_data + at, n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                return false;
+                            }
+                            if (std::memcmp(a.data(), src + at, n) != 0) return why_not("the full matrix is not the file's bytes");
+                        }
+                        return true;
+                    }()) {
+                    r.map_pitch = (int) (n_in / (uint64_t) be);
+                    r.map_nr = 1; r.map_rlo[0] = 0; r.map_radd[0] = 0;
+                    r.map_cw = 0; r.map_cgap = 0; r.map_cadd = 0;
+                    if (!rows.empty()) {
+                        int lo = 0;
+                        r.map_nr = (int) rows.size();
+                        for (size_t k = 0; k < rows.size(); ++k) {
+                            r.map_rlo[k] = lo; r.map_radd[k] = (int) rows[k].begin - lo; lo += (int) rows[k].count;
+                        }
+                    } else {
+                        r.map_cadd = (int) (cols[0].begin / (uint64_t) be);
+                        if (cols.size() > 1) {
+                            r.map_cw = (int) (cols[0].count / (uint64_t) be);
+                            r.map_cgap = (int) ((cols[1].begin - cols[0].begin - cols[0].count) / (uint64_t) be);
+                        }
+                    }
+                    // [claude] STRATA_TP_ALIAS_MAP_CHECK (default on): the map against the slice itself - the same GEMV
+                    // kernel through the map and on a dense copy of the slice built from the file, bit for bit
+                    static const bool map_check = [] { const char* v = std::getenv("STRATA_TP_ALIAS_MAP_CHECK"); return v == nullptr || v[0] != '0'; }();
+                    if (map_check) {
+                        std::vector<uint8_t> h((size_t) bytes);
+                        uint64_t off = 0;
+                        if (!rows.empty()) {
+                            for (const Range& x : rows) { std::memcpy(h.data() + off, src + x.begin * row_bytes, x.count * row_bytes); off += x.count * row_bytes; }
+                        } else {
+                            const uint64_t bb_ = (uint64_t) bb;
+                            for (uint64_t o = 0; o < n_out; ++o)
+                                for (const Range& c : cols) {
+                                    const uint64_t cb = c.count / (uint64_t) be * bb_;
+                                    std::memcpy(h.data() + off, src + o * row_bytes + c.begin / (uint64_t) be * bb_, cb);
+                                    off += cb;
+                                }
+                        }
+                        std::vector<float> xh((size_t) new_in);
+                        uint32_t seed = 12345u + (uint32_t) done.size();
+                        for (float& v : xh) { seed = seed * 1664525u + 1013904223u; v = (float) ((int32_t) (seed >> 8) % 2001 - 1000) / 1000.0f; }
+                        void *dcopy = nullptr, *dx = nullptr, *dxq = nullptr, *dy = nullptr;
+                        std::vector<float> y1((size_t) new_out), y2((size_t) new_out);
+                        bool ok = off == bytes && cudaMalloc(&dcopy, bytes) == cudaSuccess && cudaMalloc(&dx, new_in * 4) == cudaSuccess &&
+                                  cudaMalloc(&dxq, strata::kernels::native_q8_1_bytes((int) new_in, 1)) == cudaSuccess &&
+                                  cudaMalloc(&dy, new_out * 4) == cudaSuccess &&
+                                  cudaMemcpy(dcopy, h.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+                                  cudaMemcpy(dx, xh.data(), new_in * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+                        cudaStream_t cks = nullptr;
+                        ok = ok && cudaStreamCreateWithFlags(&cks, cudaStreamNonBlocking) == cudaSuccess;
+                        if (ok) {
+                            strata::kernels::native_quantize_q8_1((const float*) dx, dxq, (int) new_in, 1, cks);
+                            strata::kernels::MkMat plain, m;
+                            m.pitch = r.map_pitch; m.nr = r.map_nr; m.cw = r.map_cw; m.cgap = r.map_cgap; m.cadd = r.map_cadd;
+                            for (int k = 0; k < 8; ++k) { m.rlo[k] = r.map_rlo[k]; m.radd[k] = r.map_radd[k]; }
+                            strata::kernels::q80_mmvq_mapped(dcopy, plain, dxq, (float*) dy, (int) new_in, (int) new_out, 1, cks);
+                            ok = cudaStreamSynchronize(cks) == cudaSuccess && cudaMemcpy(y1.data(), dy, new_out * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                            strata::kernels::q80_mmvq_mapped(r.native_data, m, dxq, (float*) dy, (int) new_in, (int) new_out, 1, cks);
+                            ok = ok && cudaStreamSynchronize(cks) == cudaSuccess && cudaMemcpy(y2.data(), dy, new_out * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+                        }
+                        if (cks) cudaStreamDestroy(cks);
+                        for (void* p : {dcopy, dx, dxq, dy}) if (p) cudaFree(p);
+                        (void) cudaGetLastError();
+                        if (!ok || std::memcmp(y1.data(), y2.data(), y1.size() * 4) != 0) {
+                            err = "tp: " + t.name + ": the mapped read differs from the slice (STRATA_TP_ALIAS_MAP=0 turns the map off)";
+                            return false;
+                        }
+                    }
                     r.ne0 = (int64_t) new_in;
                     r.ne1 = (int64_t) new_out;
                     r.elements = (int64_t) (new_in * new_out);
