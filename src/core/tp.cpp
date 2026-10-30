@@ -424,14 +424,16 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 }
                 // [claude] STRATA_TP_ALIAS_MAP=1: a Q8_0 GDN projection (qkv / gate: up to 4 row ranges; ssm_out: up to 2
                 // block-column ranges) reads the full matrix through a map (WeightRef::map_*, the verifier's Q8_0 GEMVs)
-                static const bool alias_map = [] { const char* v = std::getenv("STRATA_TP_ALIAS_MAP"); return v != nullptr && v[0] == '1'; }();
+                // (STRATA_TP_ALIAS_MAP=rows: qkv / gate only - their rows stay contiguous; ssm_out's column map reads each row in pieces)
+                static const int alias_map_mode = [] { const char* v = std::getenv("STRATA_TP_ALIAS_MAP"); return v == nullptr ? 0 : v[0] == '1' ? 2 : v[0] == 'r' ? 1 : 0; }();
+                const bool alias_map = alias_map_mode > 0;
                 auto why_not = [&](const char* why) {   // once per kind: why a projection keeps its copy
                     static std::set<std::string> said;
                     if (alias_map && said.insert(std::string(why) + std::to_string(kind)).second)
                         std::fprintf(stderr, "strata generate: tensor parallel: %s keeps its copy (STRATA_TP_ALIAS_MAP: %s)\n", t.name.c_str(), why);
                     return false;
                 };
-                if (alias_env && alias_map && (kind == 0 || kind == 3 || kind == 4) && t.type == 8 &&
+                if (alias_env && alias_map && (kind == 0 || kind == 3 || (kind == 4 && alias_map_mode == 2)) && t.type == 8 &&
                     (r.native_data != nullptr || why_not("no full matrix on this card")) &&
                     (r.native_type == 8 || why_not("the full matrix is not Q8_0")) &&
                     ((rows.size() <= 8 && (rows.empty() != cols.empty()) && [&] {   // columns: equal ranges, equally spaced
