@@ -3601,6 +3601,41 @@ void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream) {
     if (n % 4) copy_i32((int32_t*) dst + n4 * 4, (const int32_t*) src + n4 * 4, n % 4, stream);
     check("copy_f32_wide");
 }
+namespace {
+__global__ void add_f32_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] += src[i];
+}
+}  // namespace
+namespace {
+__global__ void add_f32_mapped_wait_kernel(float* __restrict__ dst, const volatile float* src, int64_t n,
+                                           const volatile uint32_t* flag, uint32_t want) {
+    if (threadIdx.x == 0) {
+#if defined(__HIP_DEVICE_COMPILE__)
+        while (*flag != want) __builtin_amdgcn_s_sleep(2);
+#else
+        while (*flag != want) {}
+#endif
+        __threadfence_system();
+    }
+    __syncthreads();
+    __threadfence_system();   // every wave's acquire (the buffer is reused layer after layer)
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] += src[i];
+}
+}  // namespace
+void add_f32_mapped_wait(float* dst, const float* src, int64_t n, const uint32_t* flag, uint32_t want, void* stream) {
+    if (n <= 0) return;
+    const int64_t b = std::min<int64_t>((n + 255) / 256, 512);
+    add_f32_mapped_wait_kernel<<<(unsigned) b, 256, 0, (cudaStream_t) stream>>>(dst, src, n, flag, want);
+    check("add_f32_mapped_wait");
+}
+void add_f32(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const int64_t b = std::min<int64_t>((n + 255) / 256, 4096);
+    add_f32_kernel<<<(unsigned) b, 256, 0, (cudaStream_t) stream>>>(dst, src, n);
+    check("add_f32");
+}
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t b = (n + 255) / 256;

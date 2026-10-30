@@ -997,6 +997,26 @@ struct Prefill::Impl {
     // pool's per-token activations and jobs.
     float *cpu_x = nullptr, *cpu_rows = nullptr, *cpu_ones = nullptr;
     size_t cpu_x_n = 0, cpu_rows_n = 0, cpu_ones_n = 0;
+    // [claude] the routed walk (STRATA_FUSED_ROUTED): the routing weights on the host, the CPU's weighted sums (host and
+    // device, T x N) and the per-layer helper / primary flags as uploaded
+    float *rw_h = nullptr, *rsum_h = nullptr, *rsum_dev = nullptr;
+    size_t rw_n = 0, rsum_n = 0, rsum_dev_n = 0;
+    std::vector<uint8_t> rflag_p, rflag_h;
+    std::vector<float> rrows;   // the routed walk's CPU rows (unweighted, one per routed pair)
+    // [claude] STRATA_FUSED_ASYNC (default on): the CPU's sums go to coherent mapped host memory (rsum_m) and a flag
+    // (rflag_m) the device waits for in the add kernel, so the host does not wait for the CPU at the combine; the
+    // layer's thread is joined at the next layer's plan (r_pending)
+    float* rsum_m = nullptr;
+    uint32_t* rflag_m = nullptr;
+    size_t rsum_m_n = 0;
+    uint32_t rseq = 0;
+    std::future<bool> r_pending;
+    // [claude] STRATA_FUSED_PREFETCH (the routed walk): the experts a layer's previous routed read sent many tokens to
+    // (rprev_cnt) are streamed with the previous layer's plan (its A run, before the layer's routing); ra_end / ra_pend:
+    // where layer l's A run ends in seq / pseq, ra_have: layer l has one, ra_mark: [l * NE + e] in it
+    std::vector<int32_t> rprev_cnt;
+    std::vector<size_t> ra_end, ra_pend;
+    std::vector<char> ra_have, ra_mark;
     bool cpu_dead = false;   // a pinned buffer of the share could not be had (host memory is short): the GPU does it all
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
@@ -1208,6 +1228,11 @@ void Prefill::release() {
     impl_->steps_up.release();
     impl_->tok_up.release();
     impl_->up_ring.release();
+    if (impl_->r_pending.valid()) (void) impl_->r_pending.get();
+    for (float* p : {impl_->rw_h, impl_->rsum_h, impl_->rsum_m}) if (p) cudaFreeHost(p);
+    if (impl_->rflag_m) cudaFreeHost(impl_->rflag_m);
+    impl_->rsum_m = nullptr; impl_->rflag_m = nullptr; impl_->rsum_m_n = 0;
+    if (impl_->rsum_dev) { const core::OnDevice on(impl_->device); cudaFree(impl_->rsum_dev); }
     for (float* p : {impl_->cpu_x, impl_->cpu_rows, impl_->cpu_ones})
         if (p) cudaFreeHost(p);
     for (cudaEvent_t e : impl_->cpu_ev)
@@ -2806,6 +2831,18 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "qsa k norm+rope", "qsa q proj", "qsa gate+out proj",
                                         "qsa kv append+q prep"};
 // [claude] STRATA_PREFILL_TIMING=2: a pinned host buffer allocated inside a prompt read says how long it took
+// [claude] the routed walk's asynchronous CPU join (STRATA_FUSED_ASYNC=0: the host waits at the combine as before)
+static bool r_async_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_FUSED_ASYNC"); return e == nullptr || std::atoi(e) != 0; }();
+    return v;
+}
+static bool r_coherent_alloc(void** p, size_t bytes) {
+#if defined(STRATA_USE_HIP)
+    return hipHostMalloc(p, bytes, hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable) == hipSuccess;
+#else
+    return cudaHostAlloc(p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+#endif
+}
 static cudaError_t pf_host_alloc(void** p, size_t bytes, const char* what) {
     const auto t0 = std::chrono::steady_clock::now();
     const cudaError_t e = cudaHostAlloc(p, bytes, cudaHostAllocDefault);
@@ -3324,6 +3361,45 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        // [claude] STRATA_FUSED_ROUTED=1 (a helped one-chunk prompt of at most STRATA_FUSED_ROUTED_MAX tokens, default
+        // 2048, every layer of the stage on the fused kernels, every expert in the pinned arena): the layer's stream is
+        // planned after its routing (a host sync per layer) instead of streaming every non-resident expert - experts no
+        // token routed to are not streamed, and with the CPU pool free (STRATA_FUSED_CPU_FRAC, default 0.3, of the
+        // layer's routed non-resident experts, those with the fewest tokens, at most STRATA_FUSED_CPU_MAXT each) the
+        // CPU computes some while both cards' links stream the rest.  rcode[l * NE + e] = 2: neither card holds it.
+        bool rmode = false;
+        std::vector<uint8_t> rcode;
+        double r_acc = 0.0;
+        {
+            static const bool r_env = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED"); return v != nullptr && std::atoi(v) != 0; }();
+            static const int64_t r_max = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 2048; }();
+            rmode = r_env && stream_all && ps_on && m.pp->fused && !ds_chunk && !dp && T <= r_max && T == n && m.stager;
+            int r_why = 0;
+            for (int64_t l = LB; rmode && l < LE; ++l) {
+                for (int32_t e = 0; rmode && e < m.g->n_expert; ++e) {
+                    if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (m.src->transient(l, e)) { rmode = false; r_why = 2; }
+                    else if (!m.src->pinned(l, e)) { rmode = false; r_why = 3; }
+                    else if (m.src->blob_stable(l, e) == nullptr) { rmode = false; r_why = 4; }
+                }
+            }
+            if (r_env && std::getenv("STRATA_PREFILL_TIMING") != nullptr)
+                std::fprintf(stderr, "strata prefill: routed walk %s (why %d, stream_all %d help %d fused %d ds %d dp %d T %lld n %lld stager %d)\n",
+                             rmode ? "on" : "off", r_why, (int) stream_all, (int) ps_on, (int) (ps_on && m.pp->fused), (int) ds_chunk,
+                             (int) dp, (long long) T, (long long) n, (int) (m.stager != nullptr));
+            if (rmode) {
+                rcode.assign((size_t) g.n_layers * m.g->n_expert, 0);
+                m.ra_end.assign((size_t) g.n_layers + 1, 0);
+                m.ra_pend.assign((size_t) g.n_layers + 1, 0);
+                m.ra_have.assign((size_t) g.n_layers + 1, 0);
+                m.ra_mark.assign((size_t) g.n_layers * m.g->n_expert, 0);
+                if (m.rprev_cnt.size() != (size_t) g.n_layers * m.g->n_expert) m.rprev_cnt.assign((size_t) g.n_layers * m.g->n_expert, 0);
+            }
+            if (rmode && cpu_pool_ != nullptr && cpu_share_on() && !pool_hold.held) {   // one stage at a time reads
+                bool expect = false;
+                pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+            }
+        }
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
@@ -3405,6 +3481,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     if (ds_chunk && ds_flag[(size_t) l * m.g->n_expert + e] == 1) continue;   // [claude] the other path streams it
+                    if (rmode) { rcode[(size_t) l * m.g->n_expert + e] = 2; continue; }   // [claude] planned at its routing
                     int job = -1;
                     const uint8_t* b = nullptr;
                     if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -3491,7 +3568,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::thread* t;
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
-        const bool threaded_issue = stream_all && issuer_on;
+        const bool threaded_issue = stream_all && issuer_on && !rmode;   // [claude] the routed walk appends to seq
         if (threaded_issue) {
             issuer = std::thread([&] {
                 strata::platform::name_this_thread("strata-issue");
@@ -3555,6 +3632,224 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
+        };
+        // [claude] the routed walk (STRATA_FUSED_ROUTED): layer l's plan once its routing is on the host - the CPU's
+        // experts (the fewest tokens first), then every other routed expert neither card holds into the helper's ring or
+        // this card's (every ps_frac-th to the helper); the per-layer flags go up, both rings' copies go out, and the CPU
+        // computes its experts' weighted sums on a thread (joined at the combine)
+        auto r_plan_layer = [&](int64_t l, std::vector<char>& skip, std::vector<int32_t>& cpu, int64_t& cpu_rows,
+                                std::future<bool>& fut) -> bool {
+            PeerPrefill& P = *m.pp;
+            const int64_t E = m.g->n_expert;
+            if (m.r_pending.valid()) {   // the previous layer's CPU thread (its sums were waited for on the device)
+                const auto tw0 = Clock::now();
+                if (!m.r_pending.get()) { err = "prefill: a CPU expert of the routed walk failed"; return false; }
+                m.cs_wait_ms += ms_since(tw0);
+            }
+            static const double cfrac = [] { const char* v = std::getenv("STRATA_FUSED_CPU_FRAC"); return v ? std::clamp(std::atof(v), 0.0, 1.0) : 0.3; }();
+            static const int cmaxt = [] { const char* v = std::getenv("STRATA_FUSED_CPU_MAXT"); return v ? std::max(1, std::atoi(v)) : 8; }();
+            bool cpu_on = pool_hold.held && cfrac > 0.0 && cpu_pool_ != nullptr && !m.cpu_dead && lay0.native;
+            const size_t tn = (size_t) T * N, tk = (size_t) T * K;
+            auto host_buf = [&](float*& b, size_t& cap, size_t want, const char* what) -> bool {
+                if (cap >= want) return true;
+                if (b) cudaFreeHost(b);
+                b = nullptr;
+                cap = 0;
+                if (pf_host_alloc((void**) &b, want * sizeof(float), what) != cudaSuccess) { (void) cudaGetLastError(); b = nullptr; return false; }
+                cap = want;
+                return true;
+            };
+            if (cpu_on) {
+                cpu_on = host_buf(m.cpu_x, m.cpu_x_n, tn, "m.cpu_x") && host_buf(m.rw_h, m.rw_n, tk, "m.rw_h") &&
+                         host_buf(m.rsum_h, m.rsum_n, tn, "m.rsum_h");
+                if (cpu_on && r_async_on() && m.rsum_m_n < tn) {
+                    if (m.rsum_m) cudaFreeHost(m.rsum_m);
+                    m.rsum_m = nullptr;
+                    m.rsum_m_n = 0;
+                    if (m.rflag_m == nullptr && !r_coherent_alloc((void**) &m.rflag_m, 64)) { (void) cudaGetLastError(); m.rflag_m = nullptr; }
+                    if (m.rflag_m != nullptr && r_coherent_alloc((void**) &m.rsum_m, tn * sizeof(float))) m.rsum_m_n = tn;
+                    else { (void) cudaGetLastError(); m.rsum_m = nullptr; }
+                    if (m.rflag_m) { __atomic_store_n(m.rflag_m, 0u, __ATOMIC_RELEASE); m.rseq = 0; }
+                }
+                if (cpu_on && m.rsum_dev_n < tn) {
+                    if (m.rsum_dev) cudaFree(m.rsum_dev);
+                    m.rsum_dev = nullptr;
+                    m.rsum_dev_n = 0;
+                    if (cudaMalloc((void**) &m.rsum_dev, tn * sizeof(float)) != cudaSuccess) { (void) cudaGetLastError(); cpu_on = false; }
+                    else m.rsum_dev_n = tn;
+                }
+            }
+            cudaMemcpyAsync(m.ids_host.data(), m.ids, tk * 4, cudaMemcpyDeviceToHost, m.cs);
+            if (cpu_on) {
+                cudaMemcpyAsync(m.rw_h, m.w, tk * 4, cudaMemcpyDeviceToHost, m.cs);
+                cudaMemcpyAsync(m.cpu_x, m.mixed, tn * 4, cudaMemcpyDeviceToHost, m.cs);
+            }
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = std::string("prefill: the routed walk's download: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            const int32_t* ids = m.ids_host.data();
+            std::vector<int32_t> cnt((size_t) E, 0);
+            for (size_t i = 0; i < tk; ++i) {
+                if (ids[i] < 0 || ids[i] >= E) { err = "prefill: routed id out of range"; return false; }
+                ++cnt[(size_t) ids[i]];
+            }
+            skip.assign((size_t) E, 0);
+            for (int32_t e = 0; e < E; ++e) m.rprev_cnt[(size_t) (l * E + e)] = cnt[(size_t) e];   // the next read's prefetch
+            std::vector<std::pair<int32_t, int32_t>> cand;
+            int64_t n_routed = 0;
+            for (int32_t e = 0; e < E; ++e) {
+                if (rcode[(size_t) (l * E + e)] != 2) continue;
+                if (m.ra_mark[(size_t) (l * E + e)]) { skip[(size_t) e] = 1; continue; }   // streamed already (the A run)
+                if (cnt[(size_t) e] == 0) { skip[(size_t) e] = 1; continue; }
+                ++n_routed;
+                if (cpu_on && cnt[(size_t) e] <= cmaxt) cand.emplace_back(cnt[(size_t) e], e);
+            }
+            std::sort(cand.begin(), cand.end());
+            const size_t take = std::min(cand.size(), (size_t) std::llround(cfrac * (double) n_routed));
+            std::vector<char> on_cpu((size_t) E, 0);
+            std::vector<const uint8_t*> cblob;
+            for (size_t i = 0; i < take; ++i) {
+                const int32_t e = cand[i].second;
+                on_cpu[(size_t) e] = 1;
+                skip[(size_t) e] = 1;
+                cpu.push_back(e);
+                cblob.push_back(m.src->blob_stable(l, e));
+                cpu_rows += cand[i].first;
+            }
+            if (!m.ra_have[(size_t) l]) {   // no A run: the layer's entries start here
+                seq_start[(size_t) l] = seq.size();
+                P.pseq_start[(size_t) l] = P.pseq.size();
+                m.ra_end[(size_t) l] = seq.size();
+                m.ra_pend[(size_t) l] = P.pseq.size();
+            }
+            for (int32_t e = 0; e < E; ++e) {
+                if (rcode[(size_t) (l * E + e)] != 2 || cnt[(size_t) e] == 0 || on_cpu[(size_t) e] ||
+                    m.ra_mark[(size_t) (l * E + e)]) continue;
+                const uint8_t* b = m.src->blob_stable(l, e);
+                if (b == nullptr) { err = "prefill: expert source has no blob"; return false; }
+                r_acc += P.ps_frac;
+                if (r_acc >= 1.0) {
+                    r_acc -= 1.0;
+                    P.pseq.push_back({(int32_t) l, e, b});
+                    P.ps_flag[(size_t) (l * E + e)] = 1;
+                } else {
+                    seq.push_back({(int32_t) l, e, b, -1});
+                }
+            }
+            seq_start[(size_t) l + 1] = seq.size();
+            P.pseq_start[(size_t) l + 1] = P.pseq.size();
+            // the next layer's A run: its experts the previous routed read sent at least STRATA_FUSED_PREFETCH tokens to
+            // (default 0: off), streamed now, in id order, before that layer's routing is known
+            static const int pf_min = [] { const char* v = std::getenv("STRATA_FUSED_PREFETCH"); return v ? std::max(0, std::atoi(v)) : 0; }();
+            if (pf_min > 0 && l + 1 < LE && (size_t) (l + 1) < P.fh_layer.size() && P.fh_layer[(size_t) l + 1]) {
+                const int64_t l1 = l + 1;
+                for (int32_t e = 0; e < E; ++e) {
+                    const size_t i = (size_t) (l1 * E + e);
+                    if (rcode[i] != 2 || m.rprev_cnt[i] < pf_min) continue;
+                    const uint8_t* b = m.src->blob_stable(l1, e);
+                    if (b == nullptr) continue;
+                    m.ra_mark[i] = 1;
+                    r_acc += P.ps_frac;
+                    if (r_acc >= 1.0) {
+                        r_acc -= 1.0;
+                        P.pseq.push_back({(int32_t) l1, e, b});
+                        P.ps_flag[i] = 1;
+                    } else {
+                        seq.push_back({(int32_t) l1, e, b, -1});
+                    }
+                }
+                m.ra_have[(size_t) l1] = 1;
+                m.ra_end[(size_t) l1] = seq.size();
+                m.ra_pend[(size_t) l1] = P.pseq.size();
+            }
+            const size_t nl = (size_t) g.n_layers * (size_t) E;
+            if (m.rflag_p.size() < nl) { m.rflag_p.assign(nl, 0); m.rflag_h.assign(nl, 0); }
+            for (int32_t e = 0; e < E; ++e) {
+                const size_t i = (size_t) (l * E + e);
+                m.rflag_h[i] = P.ps_flag[i] ? 1 : 0;
+                m.rflag_p[i] = (P.ps_flag[i] || on_cpu[(size_t) e]) ? 1 : 0;
+            }
+            cudaMemcpyAsync(P.flag_p + (size_t) l * NE, m.rflag_p.data() + (size_t) l * E, (size_t) E, cudaMemcpyHostToDevice, m.cs);
+            {
+                int pd = 0;
+                cudaGetDevice(&pd);
+                cudaSetDevice(P.dev);
+                cudaMemcpyAsync(P.flag_h + (size_t) l * NE, m.rflag_h.data() + (size_t) l * E, (size_t) E, cudaMemcpyHostToDevice, P.s);
+                p_issue_until(P.pk + (size_t) P.RP);
+                cudaSetDevice(pd);
+            }
+            issue_until(consumed + (size_t) m.ring);
+            if (cpu.empty()) return true;
+            const bool as = r_async_on() && m.rsum_m != nullptr && m.rflag_m != nullptr && m.rsum_m_n >= tn;
+            const uint32_t seq_v = as ? ++m.rseq : 0u;
+            float* const out_sum = as ? m.rsum_m : m.rsum_h;
+            uint32_t* const flag = as ? m.rflag_m : nullptr;
+            fut = std::async(std::launch::async, [this, &m, cpu, cblob, l, T, tk, tn, out_sum, flag, seq_v, lay_ = &lay0]() -> bool {
+                // the device waits for the flag: it is raised on every path, the result (false: an error) goes by the future
+                struct Raise { uint32_t* f; uint32_t v; ~Raise() { if (f) { std::atomic_thread_fence(std::memory_order_seq_cst); __atomic_store_n(f, v, __ATOMIC_RELEASE); } } } raise{flag, seq_v};
+                try {
+                const auto t0 = std::chrono::steady_clock::now();
+                const strata::kernels::cpu::NativeFmt& cf = lay_->fmt[(size_t) l];
+                constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+                constexpr int MT = strata::kernels::cpu::MAXT;
+                const bool q2 = strata::kernels::cpu::q2_native_kernels(cf.gu_type);
+                const int64_t E2 = m.g->n_expert;
+                const int32_t* ids2 = m.ids_host.data();
+                std::vector<int32_t> sel((size_t) E2, -1);
+                for (size_t j = 0; j < cpu.size(); ++j) sel[(size_t) cpu[j]] = (int32_t) j;
+                std::vector<std::vector<int32_t>> pairs(cpu.size());
+                std::vector<char> need((size_t) T, 0);
+                size_t rows = 0;
+                for (size_t i = 0; i < tk; ++i)
+                    if (sel[(size_t) ids2[i]] >= 0) {
+                        pairs[(size_t) sel[(size_t) ids2[i]]].push_back((int32_t) i);
+                        need[i / (size_t) K] = 1;
+                        ++rows;
+                    }
+                if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
+                if (!q2 && m.cpu_nact.size() < (size_t) T * AB) m.cpu_nact.resize((size_t) T * AB);
+                for (int64_t t = 0; t < T; ++t) {
+                    if (!need[(size_t) t]) continue;
+                    if (q2) strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
+                    else strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact.data() + (size_t) t * AB);
+                }
+                if (m.rrows.size() < rows * (size_t) N) m.rrows.resize(rows * (size_t) N);
+                std::vector<int32_t> row_pair(rows);
+                m.cpu_jobs.clear();
+                size_t r = 0;
+                for (size_t j = 0; j < cpu.size(); ++j) {
+                    if (cblob[j] == nullptr) return false;
+                    const std::vector<int32_t>& pl = pairs[j];
+                    for (size_t a = 0; a < pl.size(); a += (size_t) MT) {
+                        strata::kernels::cpu::ExpertJobMulti job;
+                        job.blob = cblob[j];
+                        job.nt = (int) std::min<size_t>((size_t) MT, pl.size() - a);
+                        for (int q = 0; q < job.nt; ++q) {
+                            const int32_t pi = pl[a + (size_t) q];
+                            const size_t t = (size_t) pi / (size_t) K;
+                            if (q2) job.act[q] = &m.cpu_actq[t];
+                            else job.nact[q] = m.cpu_nact.data() + t * AB;
+                            job.out[q] = m.rrows.data() + r * (size_t) N;
+                            row_pair[r++] = pi;
+                        }
+                        m.cpu_jobs.push_back(job);
+                    }
+                }
+                cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
+                std::fill(out_sum, out_sum + tn, 0.0f);
+                for (size_t q = 0; q < r; ++q) {
+                    const int32_t pi = row_pair[q];
+                    const float wv = m.rw_h[(size_t) pi];
+                    float* dst = out_sum + ((size_t) pi / (size_t) K) * (size_t) N;
+                    const float* src = m.rrows.data() + q * (size_t) N;
+                    for (int64_t c = 0; c < N; ++c) dst[c] += wv * src[c];
+                }
+                m.cs_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                return true;
+                } catch (...) { return false; }
+            });
+            return true;
         };
         // [claude] DP share: this path's share of layer l for the OTHER path's chunk (its request in the mailbox): the
         // activations, routing and weights in pieces of ds_th tokens over P2P, the share's experts from this path's
@@ -4217,6 +4512,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     std::vector<const uint8_t*> cpu_blob;   // the CPU experts' blobs, taken on this thread (the source is not thread-safe)
                     double cpu_ms = 0;                    // the thread's time (the measured share)
                     std::future<bool> cpu_fut;
+                    // [claude] the routed walk: this layer's experts with no blob here (unrouted non-resident ones and
+                    // the CPU's), the CPU's experts, and its thread (weighted sums into rsum_h)
+                    std::vector<char> r_skip;
+                    std::vector<int32_t> r_cpu;
+                    std::future<bool> r_fut;
+                    int64_t r_cpu_rows = 0;
+                    if (rmode) {   // [claude] the routed walk: this layer's stream (a layer without the help: every expert)
+                        if (fh_now) {
+                            if (!r_plan_layer(l, r_skip, r_cpu, r_cpu_rows, r_fut)) return false;
+                        } else {
+                            seq_start[(size_t) l] = seq.size();
+                            if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (rcode[(size_t) l * m.g->n_expert + e] == 2)
+                                    seq.push_back({(int32_t) l, e, m.src->blob_stable(l, e), -1});
+                            seq_start[(size_t) l + 1] = seq.size();
+                            if (ps_on) m.pp->pseq_start[(size_t) l + 1] = m.pp->pseq.size();
+                            issue_until(consumed + (size_t) m.ring);
+                        }
+                    }
                     int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
@@ -4266,18 +4581,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t pend = P.pseq_start[(size_t) l + 1];
                             // [claude] TP by id: the helper's resident experts of this layer (P.hres) join the
                             // batches from its own cache slots, nothing streamed for them
-                            const uint8_t* const* hr = P.hres.empty() ? nullptr : P.hres.data() + (size_t) l * NE;
+                            const uint8_t* const* hr_all = P.hres.empty() ? nullptr : P.hres.data() + (size_t) l * NE;
+                            // [claude] the routed walk's A run first (its own id-ordered entries), then the rest with the
+                            // helper's resident experts
+                            const bool a_run = rmode && (size_t) l < m.ra_have.size() && m.ra_have[(size_t) l];
+                            for (int run = a_run ? 0 : 1; run < 2; ++run) {
+                            const size_t pend_r = run == 0 ? std::min(pend, m.ra_pend[(size_t) l]) : pend;
+                            const uint8_t* const* hr = run == 0 ? nullptr : hr_all;
                             int32_t e_last = -1;
                             if (hr != nullptr)
                                 for (int32_t e = (int32_t) NE - 1; e >= 0; --e)
                                     if (hr[e] != nullptr) { e_last = e; break; }
-                            for (int32_t e = 0; e < m.g->n_expert && (pk < pend || e <= e_last);) {
+                            // run 0: a batch never spans an expert with rows here that is not in the A run (the kernel
+                            // computes every expert of [e0, e1) that has rows)
+                            // run 1: never spans the A run's experts (computed in run 0; they have rows here)
+                            auto rows_h = [&](int32_t e) { return P.ps_flag[(size_t) l * NE + e] != 0; };
+                            auto a_h = [&](int32_t e) { return a_run && m.ra_mark[(size_t) l * NE + e] && rows_h(e); };
+                            auto stop_h = [&](int32_t e) {
+                                return run == 0 ? (!(pk < pend_r && P.pseq[pk].e == e) && rows_h(e)) : a_h(e);
+                            };
+                            for (int32_t e = 0; e < m.g->n_expert && (pk < pend_r || e <= e_last);) {
+                                while (e < m.g->n_expert && stop_h(e)) ++e;
+                                if (e >= m.g->n_expert) break;
                                 fused::Batch b;
                                 b.e0 = e;
                                 const size_t k0 = pk;
                                 int n_res = 0;
                                 for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
-                                    if (pk < pend && P.pseq[pk].e == e) {
+                                    if (stop_h(e)) break;
+                                    if (pk < pend_r && P.pseq[pk].e == e) {
                                         if (pk - k0 == pper) break;
                                         b.blob[e - b.e0] = P.pstage[pk % RP];
                                         ++pk;
@@ -4301,6 +4633,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 P.ps_experts += (int64_t) (pk - k0);
                                 p_issue_until(P.pk + RP);
                             }
+                            }   // run
                             help_sum16(P.hDm, P.hslot, P.hw, P.ids_rh, (int) NE, P.hsum, T, ps);
                         }
                         // launches over the experts in id order, each at most kMaxBatch experts of which at most a
@@ -4312,17 +4645,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (m.stager) per = std::min(per, (size_t) std::max(1, m.stager->kRing));
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
-                        for (int32_t e = 0; e < m.g->n_expert;) {
+                        // [claude] the routed walk's A run (STRATA_FUSED_PREFETCH): its entries first, nothing else
+                        const bool a_run_p = rmode && (size_t) l < m.ra_have.size() && m.ra_have[(size_t) l];
+                        for (int run = a_run_p ? 0 : 1; run < 2; ++run) {
+                        const size_t kend_r = run == 0 ? std::min(kend, m.ra_end[(size_t) l]) : kend;
+                        // run 0: a batch never spans an expert with rows here outside the A run
+                        auto rows_p = [&](int32_t e) {
+                            return (r_skip.empty() || !r_skip[(size_t) e]) && !(fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]);
+                        };
+                        auto a_p = [&](int32_t e) {
+                            return a_run_p && m.ra_mark[(size_t) l * m.g->n_expert + e] &&
+                                   !(fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]);
+                        };
+                        auto stop_p = [&](int32_t e) {
+                            return run == 0 ? (!(k < kend_r && seq[k].e == e) && rows_p(e)) : a_p(e);
+                        };
+                        for (int32_t e = 0; e < m.g->n_expert && (run == 1 || k < kend_r);) {
+                            while (e < m.g->n_expert && stop_p(e)) ++e;
+                            if (e >= m.g->n_expert) break;
                             fused::Batch b;
                             b.e0 = e;
                             const size_t k0 = k;
                             for (; e < m.g->n_expert && e - b.e0 < fused::kMaxBatch; ++e) {
-                                if (k < kend && seq[k].e == e) {
+                                if (stop_p(e)) break;
+                                if (k < kend_r && seq[k].e == e) {
                                     if (k - k0 == per) break;
                                     b.blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
-                                } else if ((fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) ||
-                                           (ds_now && ds_flag[(size_t) l * m.g->n_expert + e] == 1)) {
+                                } else if (run == 0 || (fh_now && m.pp->ps_flag[(size_t) l * m.g->n_expert + e]) ||
+                                           (ds_now && ds_flag[(size_t) l * m.g->n_expert + e] == 1) ||
+                                           (!r_skip.empty() && r_skip[(size_t) e])) {
                                     b.blob[e - b.e0] = nullptr;   // [claude] the helper's / the other path's: no rows here
                                 } else {                  // not streamed: resident (the walk streams all others)
                                     b.blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
@@ -4332,6 +4684,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             b.e1 = e;
+                            if (run == 0 && k == k0) continue;
                             if (k > k0) {
                                 // one copy stream, in order: the batch's last blob covers the others
                                 pt.mark(kPfWaitCopy, cs);
@@ -4361,6 +4714,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 give_back(consumed);
                             }
                         }
+                        }   // run
                         if (ds_now) {
                             // [claude] DP share: this chunk's own experts are done (H is free for the sums); the
                             // request; the other chunk's share of this layer (waits for its request); then the layer's
@@ -5507,6 +5861,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
                         moe_combine_help16(m.Dm, m.slot_dev, m.w, m.pp->ids_rp, (int) NE, m.shared, m.sg,
                                            reinterpret_cast<const uint16_t*>(m.H), m.bo, T, m.cs);
+                        if (r_fut.valid() && r_async_on() && m.rsum_m != nullptr && m.rflag_m != nullptr && m.rsum_m_n >= (size_t) T * N) {
+                            // [claude] the device waits for the CPU's flag and adds its sums from mapped memory; the
+                            // thread is joined at the next layer's plan (or the chunk's end)
+                            m.cs_rows += r_cpu_rows;
+                            stats_.experts_cpu += (int64_t) r_cpu.size();
+                            add_f32_mapped_wait(m.bo, m.rsum_m, T * N, m.rflag_m, m.rseq, m.cs);
+                            m.r_pending = std::move(r_fut);
+                        } else if (r_fut.valid()) {   // [claude] the routed walk: the CPU's weighted sums of its experts
+                            const auto tw0 = Clock::now();
+                            if (!r_fut.get()) { err = "prefill: a CPU expert of the routed walk failed"; return false; }
+                            m.cs_wait_ms += ms_since(tw0);
+                            m.cs_rows += r_cpu_rows;
+                            stats_.experts_cpu += (int64_t) r_cpu.size();
+                            cudaMemcpyAsync(m.rsum_dev, m.rsum_h, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, m.cs);
+                            add_f32(m.bo, m.rsum_dev, T * N, m.cs);
+                        }
                     } else if (peer_now && m.pp->sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
@@ -5615,6 +5985,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
+        if (m.r_pending.valid()) {   // [claude] the routed walk's last CPU thread
+            const auto tw0 = Clock::now();
+            if (!m.r_pending.get()) { err = "prefill: a CPU expert of the routed walk failed"; return false; }
+            m.cs_wait_ms += ms_since(tw0);
+        }
         if (issuer.joinable()) {
             issuer.join();
             stats_.ms_experts_host += iss_ms;
