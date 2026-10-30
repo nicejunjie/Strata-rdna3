@@ -276,6 +276,8 @@ public:
     /// (each card holds half of every layer's hot experts), so a DP prompt reads every layer's resident experts from
     /// it instead of only its layer-split half's (32K: ~2,500 fewer experts streamed a card).
     void set_dp_full_residency(bool on) { dp_full_res_ = on; }
+    /// [claude] STRATA_TP_SHARE_DP: the foreign session's VRAM is the TP session's too; run_dp zeroes it before use
+    void set_dp_foreign_shared(bool on) { dp_foreign_shared_ = on; }
     /// [claude] TP by id: the layer split's stage helper (set_stage_helper) holds its own card's half of THIS stage's
     /// layers' hot experts in its cache (its table maps its own cache for every layer): a helped one-chunk prompt has
     /// the helper compute those experts from its cache instead of this card streaming them (STRATA_HELP_PEER_RES=0: off)
@@ -307,6 +309,7 @@ private:
     int64_t dp_own_lb_ = 0, dp_own_le_ = 0;
     bool dp_full_res_ = false;   // [claude] this card's table maps its own cache for every layer (TP by id)
     bool help_peer_res_ = false; // [claude] set_help_peer_residency
+    bool dp_foreign_shared_ = false;   // [claude] set_dp_foreign_shared
     std::shared_ptr<DpLink> dp_link_;
     int dp_index_ = 0;
     struct DpChunk { int64_t c0, T, k; int who; };

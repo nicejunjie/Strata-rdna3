@@ -6525,6 +6525,13 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         };
         const uint64_t floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+        // [claude] STRATA_TP_SHARE_DP: the TP session used this VRAM since the last DP read - every table (the page
+        // table, the K/V slot map) and pool back to a new sequence's, then the owners' state over it
+        if (X.dp_foreign_shared_) {
+            const int32_t pv0 = F->ple_prev[0], pv1 = F->ple_prev[1], pt = F->ple_token;
+            core::session_zero(*F, g, nullptr, X.impl_->cs);
+            F->ple_prev[0] = pv0; F->ple_prev[1] = pv1; F->ple_token = pt;
+        }
         if (F->gdn_alloc > 0)
             cp(F->gdn_state, O.gdn_state + (size_t) (F->gdn_ord0 - O.gdn_ord0) * floats, (size_t) (F->gdn_alloc * floats) * 4);
         const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();

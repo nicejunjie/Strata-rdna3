@@ -79,11 +79,13 @@ public:
                const std::vector<std::string>& shards, std::string& err);
     const WeightTable& table() const { return table_; }
     uint64_t bytes() const { return bytes_; }
+    uint64_t aliased() const { return aliased_; }   ///< [claude] slices that point into the full matrices (STRATA_TP_ALIAS)
 
 private:
     WeightTable table_;
     std::vector<void*> owned_;
     uint64_t bytes_ = 0;
+    uint64_t aliased_ = 0;
     void* take(uint64_t bytes, std::string& err);
 };
 

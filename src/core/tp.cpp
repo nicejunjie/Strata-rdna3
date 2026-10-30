@@ -390,6 +390,37 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 for (const Range& c : cols)
                     if (c.begin % (uint64_t) be || c.count % (uint64_t) be) { err = "tp: " + t.name + ": a reduction slice cuts a block"; return false; }
                 const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) t.type, (int) new_in, (int) new_out);
+                // [claude] STRATA_TP_ALIAS (default on; 0 = copy every slice): a slice that is ONE contiguous range of
+                // rows of a full matrix this card already holds natively (the DP prompt path keeps every layer's dense
+                // weights on both cards) points into that matrix instead of a copy - the same bytes, no VRAM
+                static const bool alias_env = [] { const char* v = std::getenv("STRATA_TP_ALIAS"); return v == nullptr || v[0] != '0'; }();
+                if (alias_env && cols.empty() && rows.size() == 1 && r.native_data != nullptr && r.native_type == (int) t.type &&
+                    strata::kernels::native_mmvq_weight_bytes((int) t.type, (int) n_in, (int) n_out) == n_out * row_bytes &&
+                    bytes == rows[0].count * row_bytes && rows[0].begin + rows[0].count <= n_out &&
+                    (rows[0].begin * row_bytes) % 256 == 0 && [&] {
+                        // the full matrix must hold the file's bytes as they are (no repacked layout): its slice's first
+                        // and last 64 KiB against the GGUF's
+                        const uint64_t off = rows[0].begin * row_bytes, n = std::min<uint64_t>(bytes, 65536);
+                        std::vector<uint8_t> a(n);
+                        for (const uint64_t at : {(uint64_t) 0, bytes - n}) {
+                            if (cudaMemcpy(a.data(), (const uint8_t*) r.native_data + off + at, n, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                return false;
+                            }
+                            if (std::memcmp(a.data(), src + off + at, n) != 0) return false;
+                        }
+                        return true;
+                    }()) {
+                    r.native_data = (const uint8_t*) r.native_data + rows[0].begin * row_bytes;
+                    r.ne0 = (int64_t) new_in;
+                    r.ne1 = (int64_t) new_out;
+                    r.elements = (int64_t) (new_in * new_out);
+                    r.data = nullptr;
+                    r.bytes = 0;
+                    aliased_ += bytes;
+                    if (new_in > max_in) max_in = new_in;
+                    continue;
+                }
                 void* dst = take(bytes, err);
                 if (dst == nullptr) return false;
                 cudaError_t st = cudaSuccess;
@@ -662,7 +693,20 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                 // the VRAM pools: every slot (streamed) or the used pages (resident)
                 const uint64_t vp = F.kv_mode == 1 ? (uint64_t) F.n_slots : pages_used;
                 if (host_only && F.kv_mode != 1) continue;
-                if (!host_only &&
+                // [claude] STRATA_TP_MOVE_NOPOOL=1: a streamed layer's VRAM pool is a cache of the host copy (every writer
+                // writes the host copy): the receiving side starts with nothing resident (its map reset, the first
+                // windows' resolve reads the blocks they select back) instead of copying every slot - 4 x 131 MiB
+                // of device copies a hand-over on IQ4 TP (~17 ms each way at 1K)
+                static const bool nopool = [] { const char* v = std::getenv("STRATA_TP_MOVE_NOPOOL"); return v != nullptr && v[0] == '1'; }();
+                const bool skip_pool = nopool && F.kv_mode == 1 && H.kv_mode == 1 && !check_only;
+                if (skip_pool && !host_only && (to_tp || r == 0)) {
+                    const int rd = to_tp ? tp_dev[r] : d0;
+                    const OnDevice on(rd);
+                    strata::kernels::kv_stream_reset(to_tp ? H.map : F.map, nullptr);
+                    if (cudaPeekAtLastError() != cudaSuccess) { err = "tp: the K/V map reset failed"; return false; }
+                    if (rd >= 0 && rd < 64) stg.used[rd] = true;
+                }
+                if (!host_only && !skip_pool &&
                     (!pool(F.k_pool, H.k_pool, HD * 2, vp) || !pool(F.v_pool, H.v_pool, HD * 2, vp) ||
                      !pool(F.k_q, H.k_q, HD, vp) || !pool(F.v_q, H.v_q, HD, vp) || !pool(F.k_scale, H.k_scale, scale_row, vp) ||
                      !pool(F.v_scale, H.v_scale, scale_row, vp) || !pool(F.k_q4, H.k_q4, q4_row, vp) || !pool(F.v_q4, H.v_q4, q4_row, vp)))
@@ -689,7 +733,8 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                         !hpool(F.host.k_scale, H.host.k_scale, scale_row, pages_used) || !hpool(F.host.v_scale, H.host.v_scale, scale_row, pages_used) ||
                         !hpool(F.host.k_q4, H.host.k_q4, q4_row, pages_used) || !hpool(F.host.v_q4, H.host.v_q4, q4_row, pages_used))
                         return false;
-                    if (host_only) continue;
+                    if (host_only || skip_pool) goto indexer;
+                    {
                     auto words = [&](const int32_t* f, const int32_t* h, uint64_t n) -> bool {
                         if (f == nullptr || h == nullptr || n == 0) return true;
                         if (to_tp) return copy2d(stg, tp_dev[r], (void*) h, n * 4, d0, f, n * 4, n * 4, 1, err);
@@ -700,7 +745,9 @@ bool tp_state_move(const ModelGeometry& g, const ModelGeometry* tg, SessionState
                         !words(F.map.miss_block, H.map.miss_block, (uint64_t) F.n_slots) || !words(F.map.miss_slot, H.map.miss_slot, (uint64_t) F.n_slots) ||
                         !words(F.map.ctl, H.map.ctl, (uint64_t) strata::kernels::kKvCtlInts))
                         return false;
+                    }
                 }
+            indexer:
                 if (host_only) continue;
                 // the indexer: replicated (both cards select identically)
                 const uint64_t ID = (uint64_t) g.idx_key_dim, TS = (uint64_t) (sf.idx_block - 1) * ID;

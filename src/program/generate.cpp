@@ -5467,6 +5467,17 @@ int main(int argc, char** argv) {
         if (g.n_qsa_layers() == 0 || S.qsa_states == nullptr || S.qsa_alloc == 0) return nullptr;
         return &S.qsa_states[S.qsa_primary()];
     };
+    // [claude] STRATA_TP_SHARE_DP=1: card r's TP session and its DP foreign session (below) share one VRAM arena - the TP
+    // session is live only between the hand-over and the move back (tp_to), the foreign session only inside a DP read
+    // (run_dp zeroes it and copies the owners' state in first: Prefill::set_dp_foreign_shared); each is rebuilt whole
+    // before it is read.  ~650 MiB a card back to the expert cache.
+    static const bool tp_share_dp = [] {
+        const char* v = std::getenv("STRATA_TP_SHARE_DP");
+        const char* d = std::getenv("STRATA_DP_PREFILL");
+        return v != nullptr && v[0] == '1' && d != nullptr && d[0] == '1';
+    }();
+    void* tp_arena[2] = {nullptr, nullptr};
+    uint64_t tp_arena_bytes[2] = {0, 0};
     if (tp_on) {
         tp_dev[1] = stages[0]->dev;
         for (int r = 0; r < 2; ++r) {
@@ -5477,8 +5488,14 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(tp_dev[r]);
             void* buf = nullptr;
             const strata::core::QsaState* rope = stage_rope(tp_dev[r]);
-            const uint64_t bytes = strata::core::session_bytes(tp_g[r], o.max_context, K, 0, g.n_layers, rope);
+            uint64_t bytes = strata::core::session_bytes(tp_g[r], o.max_context, K, 0, g.n_layers, rope);
+            if (tp_share_dp) {   // room for the DP foreign session of this card too (its layers: the other stage's)
+                const int64_t lo = r == 0 ? split_at[0] : 0, hi = r == 0 ? g.n_layers : split_at[0];
+                bytes = std::max(bytes, strata::core::session_bytes(g, o.max_context, K, lo, hi, rope));
+                tp_arena_bytes[r] = bytes;
+            }
             if (cudaMalloc(&buf, bytes) != cudaSuccess ||
+                (tp_arena[r] = buf, false) ||
                 strata::core::session_init(tp_g[r], o.max_context, K, buf, tp_ss[r], 0, g.n_layers, rope) == 0) {
                 std::fprintf(stderr, "strata generate: --tensor-parallel: CUDA%d's session (%llu MiB) failed%s\n", tp_dev[r],
                              (unsigned long long) (bytes >> 20), vram_free_note().c_str());
@@ -5545,8 +5562,9 @@ int main(int argc, char** argv) {
                          vram_free_note().c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d holds %.0f MiB of sliced dense weights\n", tp_dev[r],
-                     (double) tp_w[r].bytes() / 1048576.0);
+        std::fprintf(stderr, "strata generate: tensor parallel: CUDA%d holds %.0f MiB of sliced dense weights (%.0f MiB more "
+                             "read in place from the full matrices)\n", tp_dev[r],
+                     (double) tp_w[r].bytes() / 1048576.0, (double) tp_w[r].aliased() / 1048576.0);
     }
     // STRATA_TP_HEAD_SPLIT=1 (opt-in): vocabulary rows [V/2, V) of the head on the other card too - the head card
     // computes rows [0, V/2) and combines the two picks (greedy windows; Verifier::set_tp_head_split)
@@ -5574,6 +5592,7 @@ int main(int argc, char** argv) {
     // The streamed QSA layers' K/V host copy is the owner's (shared): both paths' appends land in it.  The foreign
     // session of the stage holds layer 1, so it gets its own PLE run (the stage's copy of the weights, its own buffers).
     strata::core::SessionState dp_ss[2];
+    bool dp_shared[2] = {false, false};   // [claude] STRATA_TP_SHARE_DP: the foreign session is in the TP session's arena
     bool dp_on = false;
     {
         const char* ev = std::getenv("STRATA_DP_PREFILL");
@@ -5593,7 +5612,14 @@ int main(int argc, char** argv) {
             void* buf = nullptr;
             const strata::core::QsaState* rope = tp_on ? stage_rope(dev) : nullptr;
             const uint64_t dbytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, rope);
-            if (cudaMalloc(&buf, dbytes) != cudaSuccess ||
+            const bool shared = tp_on && tp_share_dp && tp_arena[i] != nullptr && tp_arena_bytes[i] >= dbytes && tp_dev[i] == dev;
+            if (shared) {
+                buf = tp_arena[i];
+                dp_shared[i] = true;
+                std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's foreign session shares the TP session's %.0f MiB "
+                                     "(STRATA_TP_SHARE_DP)\n", dev, (double) tp_arena_bytes[i] / 1048576.0);
+            }
+            if ((!shared && cudaMalloc(&buf, dbytes) != cudaSuccess) ||
                 strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope) == 0) {
                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's session for layers [%lld, %lld) failed; "
                                      "DP off\n", dev, (long long) lo, (long long) hi);
@@ -9297,6 +9323,8 @@ int main(int argc, char** argv) {
             } else {
                 sp.set_dp(&stages[0]->sp, &dp_ss[0], 0, split_at[0], link, 0);
                 stages[0]->sp.set_dp(&sp, &dp_ss[1], split_at[0], g.n_layers, link, 1);
+                sp.set_dp_foreign_shared(dp_shared[0]);
+                stages[0]->sp.set_dp_foreign_shared(dp_shared[1]);
                 // TP by id: each card's table covers every layer of its own cache (STRATA_DP_FULL_RES=0: own half only)
                 static const bool full_res = [] { const char* v = std::getenv("STRATA_DP_FULL_RES"); return v == nullptr || v[0] != '0'; }();
                 if (tp2 && full_res) {
