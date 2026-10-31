@@ -605,6 +605,14 @@ private:
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    // [claude] STRATA_TOPK_SPLIT_MIN=P: windows starting at position >= P run graphs captured with the multi-CTA decode
+    // top-k (the same ids; captured on first use); below it the graphs above.  0 / unset: off (one set, as before)
+    cudaGraphExec_t exec_l_[9] = {}, exec_nr_l_[9] = {};
+    bool launched_l_[9] = {}, launched_nr_l_[9] = {};
+    bool long_ = false;
+    void refresh_long(int64_t pos0);
+    cudaGraphExec_t& ex(int T) { return long_ ? (ar_off_ ? exec_nr_l_[T] : exec_l_[T]) : (ar_off_ ? exec_nr_[T] : exec_[T]); }
+    bool& lau(int T) { return long_ ? (ar_off_ ? launched_nr_l_[T] : launched_l_[T]) : (ar_off_ ? launched_nr_[T] : launched_[T]); }
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;

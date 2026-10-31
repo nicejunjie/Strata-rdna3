@@ -668,6 +668,10 @@ Verifier::~Verifier() {
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
+    for (auto& e : exec_l_)
+        if (e) cudaGraphExecDestroy(e);
+    for (auto& e : exec_nr_l_)
+        if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -2766,9 +2770,25 @@ void Verifier::refresh_ar() {
     }
 }
 
+void Verifier::refresh_long(int64_t pos0) {
+    static const int64_t split_min = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT_MIN"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+    const bool l = split_min > 0 && pos0 >= split_min;
+    if (l != long_) {
+        static int said = 0;
+        if (said < 4) {
+            ++said;
+            std::fprintf(stderr, "strata verify: windows from position %lld run the %s decode top-k graphs (STRATA_TOPK_SPLIT_MIN %lld)\n",
+                         (long long) pos0, l ? "multi-CTA" : "one-CTA", (long long) split_min);
+        }
+    }
+    long_ = l;
+}
+
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    cudaGraphExec_t& exec_t = ex(T);
     if (exec_t != nullptr) return true;
+    strata::kernels::qsa_topk_split_capture(long_);   // the record below picks the top-k kernels by it
+    struct SplitReset { ~SplitReset() { strata::kernels::qsa_topk_split_capture(false); } } split_reset;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
@@ -3185,7 +3205,8 @@ bool Verifier::chain_overlap() const {
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     prelaunched_ = 0;
-    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
+    refresh_long(pos0);
+    cudaGraphExec_t exec_t = ex(T);   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -3233,11 +3254,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     prelaunched_ = 0;
     if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
     if (!pre) refresh_ar();
+    if (!pre) refresh_long(pos0);
     if (!capture(T, err) || !capture_commit(err)) return false;
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
         const OnDevice on_next(next_->device_);
         next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
+        next_->refresh_long(pos0);
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
     VDBG("captured; staging\n");
@@ -3260,7 +3283,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
-    bool& graph_launched = ar_off_ ? launched_nr_[T] : launched_[T];
+    bool& graph_launched = lau(T);
     if (!pre && ar_on() && !test_stall && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -3289,11 +3312,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
             return value != nullptr && value[0] == '1';
         }();
-        launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+        launch_o.emplace(ex(T), cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
 #else
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+        const cudaError_t le = cudaGraphLaunch(ex(T), cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
@@ -3847,6 +3870,7 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
     for (Verifier* x : v) {
         const OnDevice on(x->device_);
         x->refresh_ar();
+        x->refresh_long(pos0);
         if (!x->capture(T, err) || !x->capture_commit(err)) return false;
     }
     const Clock::time_point t0 = Clock::now();
@@ -3895,7 +3919,7 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
         const Clock::time_point tl = Clock::now();
         for (Verifier* x : v) {
             const OnDevice on(x->device_);
-            const cudaError_t le = cudaGraphLaunch(x->ar_off_ ? x->exec_nr_[T] : x->exec_[T], x->cs_);
+            const cudaError_t le = cudaGraphLaunch(x->ex(T), x->cs_);
             x->trace_ev("LAUNCHED", -1, -1, (int64_t) le);
             if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
             (void) cudaStreamQuery(x->cs_);
@@ -4972,6 +4996,14 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
     }
+    {   // [claude] STRATA_TOPK_SPLIT_MIN: the pipelined windows run exec_ (never the doorbell variant); its long twin on first use
+        const bool ar_was = ar_off_;
+        ar_off_ = false;
+        refresh_long(pos0);
+        const bool ok_l = !long_ || capture(T, err);
+        ar_off_ = ar_was;
+        if (!ok_l) return false;
+    }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     const Clock::time_point t0 = Clock::now();
     last_batch_ = false;
@@ -4990,7 +5022,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(long_ ? exec_l_[T] : exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);

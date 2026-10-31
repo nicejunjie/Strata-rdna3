@@ -240,6 +240,8 @@ __device__ __forceinline__ void signed8(uint32_t gx, uint32_t gy, uint32_t s, ui
 // bytes whose sign bit is set (bits 0-3 for .x, 4-7 for .y), c = m & 0x01010101.  q = (g ^ m) + c is -g where the sign
 // is set - the two's complement, byte-wise - and g elsewhere; no byte carries into the next, because no codebook entry
 // has a zero byte (256 - g with g in 1..127; the grids' bytes are 1..62), so it is the bytes signed8 gives.
+// [claude] a sign entry is the two byte masks (8 bytes; the +1 of the two's complement is mask & 0x01 per byte): half the
+// LDS of the 16-byte form, so IQ3_S's FP16 pair kernel fits three blocks a WGP (occupancy 4 -> 6); the same q
 __device__ __forceinline__ void signed8t(uint32_t gx, uint32_t gy, const uint4 sg, uint32_t& qx, uint32_t& qy) {
     qx = (gx ^ sg.x) + sg.y;
     qy = (gy ^ sg.z) + sg.w;
@@ -1291,8 +1293,14 @@ native_h11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _F
 // with their latency exposed, and prefetching them in registers spilled).  Weights and B are single-buffered (LDS:
 // 2 x 18 KB + the grid / sign tables); the two barriers a stage are the same as before.  Waves: 4 along the rows
 // (32 each) x 2 along the tokens (64 each, 4 WMMA columns).
-template <int WT, bool GU>
-__global__ void __launch_bounds__(NW_THREADS)
+// [claude] NT = 4 (STRATA_PF_F16_QUAD): 256-token work items on 512 threads - the 256 decode threads decode each stage
+// once for twice the tokens of NT = 2 (the decode does not overlap the WMMAs on RDNA3, so decode per FLOP is the lever
+// again), the other 256 threads only stage B; waves 4 along the rows x 4 along the tokens.  Per output the same WMMA
+// sequence as NT = 2: bitwise the same H / down rows.
+// the NT = 4 item's LDS: (128 + 256) rows x 72 halves + the grid and sign tables must stay under 64 KB (IQ2_S's 8 KB grid does not)
+__host__ __device__ constexpr bool quad_fits(int t) { return grid_bytes(t) <= 4096; }
+template <int WT, bool GU, int NT = 2>
+__global__ void __launch_bounds__(128 * NT)
 native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _Float16* __restrict__ act,
                    const int32_t* __restrict__ src, _Float16* __restrict__ out, float* __restrict__ dm) {
     constexpr int KD = GU ? GU_ROWS_K : D_ROWS_K;
@@ -1301,7 +1309,8 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
     constexpr int GB = grid_bytes(WT) > 0 ? grid_bytes(WT) : 16;
-    constexpr int TP = 2 * kTileRows;                     // tokens of a work item
+    constexpr int TP = NT * kTileRows;                    // tokens of a work item
+    constexpr int NTH = 128 * NT;                         // threads (NW_THREADS at NT = 2)
     __shared__ __align__(32) _Float16 smem[(NW_ROWS + TP) * HLD];
     _Float16(*wt)[HLD] = reinterpret_cast<_Float16(*)[HLD]>(smem);                   // the stage's weights [128][72]
     _Float16(*bt)[HLD] = reinterpret_cast<_Float16(*)[HLD]>(smem + NW_ROWS * HLD);   // the stage's B [128 tokens][72]
@@ -1315,13 +1324,13 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
     const int wm = wave & 3, wn = wave >> 2, l16 = lane & 15, hi = lane >> 4;
     if constexpr (grid_bytes(WT) > 0) {
         const uint32_t* gs = (const uint32_t*) grid_src<WT>();
-        for (int i = tid; i < grid_bytes(WT) / 4; i += NW_THREADS) ((uint32_t*) sgrid)[i] = gs[i];
+        for (int i = tid; i < grid_bytes(WT) / 4; i += NTH) ((uint32_t*) sgrid)[i] = gs[i];
     }
     if constexpr (SGN > 1) {
-        for (int i = tid; i < SGN; i += NW_THREADS) ssign[i] = sign_entry(i, SGN == 128);
+        for (int i = tid; i < SGN; i += NTH) ssign[i] = sign_entry(i, SGN == 128);
     }
     const int ne = b.e1 - b.e0;
-    if (tid < ne) spp[tid + 1] = (tb.ts[b.e0 + tid + 1] - tb.ts[b.e0 + tid] + 1) >> 1;   // pairs of expert tid
+    if (tid < ne) spp[tid + 1] = (tb.ts[b.e0 + tid + 1] - tb.ts[b.e0 + tid] + NT - 1) / NT;   // items of expert tid
     __syncthreads();
     if (tid == 0) {   // the prefix over at most kMaxBatch counts, in LDS
         spp[0] = 0;
@@ -1334,6 +1343,7 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
     }
     __syncthreads();
     const int ur = tid >> 1, uj = tid & 1;                // decode unit: row ur, values 32 uj ..; B: token ur, 32 uj ..
+    const bool dec = NT == 2 || tid < NW_THREADS;         // NT = 4: threads 256.. stage B only
     const int nwork = spp[ne] * NFB;
     for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
         const int p = w / NFB, fb = w % NFB;
@@ -1342,19 +1352,21 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
             const int mid = (lo + hi2 + 1) >> 1;
             if (spp[mid] <= p) lo = mid; else hi2 = mid - 1;
         }
-        const int t = tb.ts[b.e0 + lo] + 2 * (p - spp[lo]);
+        const int t = tb.ts[b.e0 + lo] + NT * (p - spp[lo]);
         const int2 tl = tb.tiles[t];
         const int e = tl.x, row0 = tl.y, nrows = min(TP, tb.off[e + 1] - row0);
         const uint8_t* blob = b.blob[e - b.e0];
         const int rbase = fb * NW_ROWS;
-        const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
-                                 : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
+        const int ud = dec ? ur : 0;                      // the decode row (B-only threads: any valid row, unused)
+        const uint8_t* wrow = GU ? blob + ((ud & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ud >> 1)) * geo.gu_row
+                                 : blob + geo.down_off + (size_t) (rbase + ud) * geo.d_row;
         auto unit = [&](int s) -> const uint8_t* {
             if (GU) return wrow + (s >> 2) * BS;
             return (WT == T_IQ4_NL || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
         auto sub = [&](int s) { return GU ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)]) {
+            if (!dec) return;
             uint32_t q[8];
             float s0, s1;
             convert<WT>(raw, sgrid, kv, q, s0, s1, ssign);
@@ -1387,7 +1399,7 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
             srow[tid] = GU ? src[r] : r;
         }
         uint32_t raw[raw_words(WT)] = {};
-        load_unit<WT>(unit(0), sub(0), raw);
+        if (dec) load_unit<WT>(unit(0), sub(0), raw);
         __syncthreads();                                  // srow
         const uint4* bsrc = reinterpret_cast<const uint4*>(act + (size_t) srow[ur] * KD + 32 * uj);
         uint4 b0 = bsrc[0], b1 = bsrc[1], b2 = bsrc[2], b3 = bsrc[3];
@@ -1395,7 +1407,7 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
         put(raw);
         bdst[0] = b0; bdst[1] = b1; bdst[2] = b2; bdst[3] = b3;
         if (NS > 1) {
-            load_unit<WT>(unit(1), sub(1), raw);
+            if (dec) load_unit<WT>(unit(1), sub(1), raw);
             b0 = bsrc[8]; b1 = bsrc[9]; b2 = bsrc[10]; b3 = bsrc[11];   // + 64 values
         }
         const bool on = 64 * wn < nrows;
@@ -1428,7 +1440,7 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
                 put(raw);
                 bdst[0] = b0; bdst[1] = b1; bdst[2] = b2; bdst[3] = b3;
                 if (s + 2 < NS) {
-                    load_unit<WT>(unit(s + 2), sub(s + 2), raw);
+                    if (dec) load_unit<WT>(unit(s + 2), sub(s + 2), raw);
                     b0 = bsrc[8 * (s + 2)]; b1 = bsrc[8 * (s + 2) + 1]; b2 = bsrc[8 * (s + 2) + 2]; b3 = bsrc[8 * (s + 2) + 3];
                 }
             }
@@ -2048,7 +2060,22 @@ void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, int64
     const bool pgu = pairs && (pair_mask & 1), pd = pairs && (pair_mask & 2);
     const unsigned gp_gu = (unsigned) std::min<int64_t>((tiles / 2 + (b.e1 - b.e0)) * (1280 / NW_ROWS), (int64_t) d.sms * occ);
     const unsigned gp_d = (unsigned) std::min<int64_t>((tiles / 2 + (b.e1 - b.e0)) * (2560 / NW_ROWS), (int64_t) d.sms * occ);
-#define STRATA_NH_GU(T) do { if (pgu) native_h11p_kernel<T, true><<<gp_gu, NW_THREADS, 0, s>>>(b, g, tb, x, src, h, nullptr); \
+    // [claude] STRATA_PF_F16_QUAD=M (with STRATA_PF_F16=2; unset or 0: off): 256-token items (native_h11p_kernel NT = 4,
+    // 512 threads, one block a WGP) when the batch averages at least M routed rows an expert
+    static const int64_t quad_min = [] {
+        const char* v = std::getenv("STRATA_PF_F16_QUAD");
+        return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 0;
+    }();
+    const bool quad = pairs && quad_min > 0 && n >= quad_min * (int64_t) std::max(1, b.e1 - b.e0);
+    static const int qocc = [] {   // blocks a WGP for the quad items (STRATA_PF_F16_QUAD_OCC, default 1)
+        const char* v = std::getenv("STRATA_PF_F16_QUAD_OCC");
+        return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 1;
+    }();
+    const unsigned gq_gu = (unsigned) std::min<int64_t>((tiles / 4 + (b.e1 - b.e0)) * (1280 / NW_ROWS), (int64_t) d.sms * qocc);
+    const unsigned gq_d = (unsigned) std::min<int64_t>((tiles / 4 + (b.e1 - b.e0)) * (2560 / NW_ROWS), (int64_t) d.sms * qocc);
+#define STRATA_NH_GU(T) do { bool qd_ = false; \
+                             if constexpr (quad_fits(T)) { if (quad && (pair_mask & 1)) { native_h11p_kernel<T, true, 4><<<gq_gu, 512, 0, s>>>(b, g, tb, x, src, h, nullptr); qd_ = true; } } \
+                             if (qd_) {} else if (pgu) native_h11p_kernel<T, true><<<gp_gu, NW_THREADS, 0, s>>>(b, g, tb, x, src, h, nullptr); \
                              else native_h11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, x, src, h, nullptr); } while (0)
     switch (g.gu_type) {
         case T_IQ2_XXS: STRATA_NH_GU(T_IQ2_XXS); break;
@@ -2062,7 +2089,9 @@ void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, int64
     }
 #undef STRATA_NH_GU
     if (g_mid_fn) g_mid_fn(g_mid_ctx);
-#define STRATA_NH_D(T) do { if (pd) native_h11p_kernel<T, false><<<gp_d, NW_THREADS, 0, s>>>(b, g, tb, h, src, nullptr, dm); \
+#define STRATA_NH_D(T) do { bool qd_ = false; \
+                            if constexpr (quad_fits(T)) { if (quad && (pair_mask & 2)) { native_h11p_kernel<T, false, 4><<<gq_d, 512, 0, s>>>(b, g, tb, h, src, nullptr, dm); qd_ = true; } } \
+                            if (qd_) {} else if (pd) native_h11p_kernel<T, false><<<gp_d, NW_THREADS, 0, s>>>(b, g, tb, h, src, nullptr, dm); \
                             else native_h11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, h, src, nullptr, dm); } while (0)
     if (g.d_type == T_Q2_0) STRATA_NH_D(T_Q2_0);
     else if (g.d_type == T_Q5_1) STRATA_NH_D(T_Q5_1);

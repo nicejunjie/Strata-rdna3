@@ -69,6 +69,9 @@ bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* 
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
+/// [claude] while true (set by the verifier around a long-context graph capture), decode top-k calls take the multi-CTA
+/// split kernels (the same ids); see STRATA_TOPK_SPLIT_MIN in verify.hpp
+void qsa_topk_split_capture(bool on);
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream,
                     int64_t active_blocks = -1);   ///< > 0: no query of the call has more than this many blocks (n_bid + 1;
