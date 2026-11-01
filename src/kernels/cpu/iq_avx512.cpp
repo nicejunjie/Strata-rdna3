@@ -252,11 +252,22 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 // signs by one word transpose.  The integer sums land in exactly ggml's 8 lanes (integer adds are exact in any
 // order) and the float FMA and horizontal sum are ggml's, so every result is ggml's to the bit.
 alignas(64) uint8_t iq3s_plane[4][512];
-const bool iq3s_planes_ready = [] {
-    for (int e = 0; e < 512; ++e)
-        for (int b = 0; b < 4; ++b) iq3s_plane[b][e] = (uint8_t) (iq3s_grid[e] >> (8 * b));
-    return true;
-}();
+#if defined(__GNUC__) && !defined(__clang__)
+// This translation unit is compiled with AVX-512 enabled.  Keep support probes and table builders AVX2-safe:
+// they can be called before dispatch, and a global table initializer is vectorized with ZMM moves on GCC.
+#define STRATA_AVX512_SAFE_INIT \
+    __attribute__((target("no-avx512f,no-avx512bw,no-avx512vl,no-avx512dq,no-avx512vnni,no-avx512vbmi"), noinline))
+#else
+#define STRATA_AVX512_SAFE_INIT
+#endif
+STRATA_AVX512_SAFE_INIT static bool iq3s_planes_ready() noexcept {
+    static const bool ready = [] {
+        for (int e = 0; e < 512; ++e)
+            for (int b = 0; b < 4; ++b) iq3s_plane[b][e] = (uint8_t) (iq3s_grid[e] >> (8 * b));
+        return true;
+    }();
+    return ready;
+}
 
 inline float hsum_float_8_ggml(const __m256 x) {   // ggml-cpu/arch/x86/quants.c hsum_float_8, verbatim
     __m128 res = _mm256_extractf128_ps(x, 1);
@@ -333,12 +344,15 @@ inline float iq3s_row_1t(const uint8_t* row, int nb, const block_q8_K* y, const 
 // FMA order and final 0.25 * hsum.
 alignas(64) uint8_t iq3xxs_plane[4][256];
 alignas(64) uint8_t ksigns_bits[128];   // ksigns_iq2xs: bit b = the sign of weight b (ggml-cpu's keven_signs_q2xs bytes)
-const bool iq3xxs_tables_ready = [] {
-    for (int e = 0; e < 256; ++e)
-        for (int b = 0; b < 4; ++b) iq3xxs_plane[b][e] = (uint8_t) (iq3xxs_grid[e] >> (8 * b));
-    for (int i = 0; i < 128; ++i) ksigns_bits[i] = ksigns_iq2xs[i];
-    return true;
-}();
+STRATA_AVX512_SAFE_INIT static bool iq3xxs_tables_ready() noexcept {
+    static const bool ready = [] {
+        for (int e = 0; e < 256; ++e)
+            for (int b = 0; b < 4; ++b) iq3xxs_plane[b][e] = (uint8_t) (iq3xxs_grid[e] >> (8 * b));
+        for (int i = 0; i < 128; ++i) ksigns_bits[i] = ksigns_iq2xs[i];
+        return true;
+    }();
+    return ready;
+}
 
 inline float iq3xxs_row_1t(const uint8_t* row, int nb, const block_q8_K* y, const int8_t* yp) {
     const __m512i zero = _mm512_setzero_si512();
@@ -403,7 +417,9 @@ inline float iq3xxs_row_1t(const uint8_t* row, int nb, const block_q8_K* y, cons
 
 }  // namespace
 
-bool iq3xxs_1t_supported() noexcept { return iq3xxs_tables_ready && iq3s_1t_supported(); }
+STRATA_AVX512_SAFE_INIT bool iq3xxs_1t_supported() noexcept {
+    return iq3s_1t_supported() && iq3xxs_tables_ready();
+}
 
 void iq3xxs_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
                        int r1) {
@@ -419,7 +435,7 @@ void iq3xxs_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n,
     }
 }
 
-bool iq3s_1t_supported() noexcept {
+STRATA_AVX512_SAFE_INIT bool iq3s_1t_supported() noexcept {
     static const bool ok = [] {
         unsigned a = 0, b = 0, c = 0, d = 0;
 #if defined(_MSC_VER)
@@ -429,9 +445,9 @@ bool iq3s_1t_supported() noexcept {
 #else
         __cpuid_count(7, 0, a, b, c, d);
 #endif
-        return iq3s_planes_ready && ((b >> 30) & 1u) && ((b >> 16) & 1u) && ((c >> 1) & 1u);   // AVX512BW, F, VBMI
+        return ((b >> 30) & 1u) && ((b >> 16) & 1u) && ((c >> 1) & 1u);   // AVX512BW, F, VBMI
     }();
-    return ok;
+    return ok && iq3s_planes_ready();
 }
 
 void iq3s_gu_rows_1t(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff, int r0,
