@@ -56,6 +56,16 @@ int main(int argc, char** argv) {
         upok = strata::prefill::gr_upmix(lo16, Wu, R, rs, wn, mixed, mixed16, mixedh, T, s);
         cudaEventRecord(e[4], s);
         cudaEventSynchronize(e[4]);
+        if (r == 0) {   // the outputs' checksum, to compare kernel variants bit for bit (STRATA_HC_UPMIX2=0 / 1)
+            std::vector<float> m((size_t) T * N);
+            std::vector<uint16_t> m16((size_t) T * N), mh((size_t) T * N);
+            cudaMemcpy(m.data(), mixed, m.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(m16.data(), mixed16, m16.size() * 2, cudaMemcpyDeviceToHost);
+            cudaMemcpy(mh.data(), mixedh, mh.size() * 2, cudaMemcpyDeviceToHost);
+            auto fnv = [](const void* p, size_t n) { const uint8_t* b = (const uint8_t*) p; uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; };
+            std::printf("checksum mixed %016llx mixed16 %016llx mixed_h %016llx\n", (unsigned long long) fnv(m.data(), m.size() * 4),
+                        (unsigned long long) fnv(m16.data(), m16.size() * 2), (unsigned long long) fnv(mh.data(), mh.size() * 2));
+        }
         if (r < 2) continue;
         for (int k = 0; k < 4; ++k) {
             float ms = 0;
