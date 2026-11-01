@@ -203,6 +203,59 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
     }
 }
+// [claude] 11-01: gr_write_norm_rs_kernel with 16-byte accesses (R and bo in, R out; the BF16 image as 4 values = 8
+// bytes a store instead of 2).  The written values are elementwise (the same expressions); the row's sum of squares is
+// rebuilt from an LDS copy of the row in the reference's per-thread order (d = tid + 256 k, k ascending, fmaf as the
+// reference compiles) and the same block_sum: R, rs and xn16 are the same bits.  10% faster (16K 3.36 -> 3.02 ms,
+// within 6% of the same bytes moved with no reduction).  Plain BF16 images only (no xn16_lo / FP16 image);
+// STRATA_HC_WN4=0 restores the scalar kernel.
+__global__ void __launch_bounds__(256) gr_write_norm_rs4_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                                const float* __restrict__ inj, int64_t inj_ld,
+                                                                const float* __restrict__ w, float eps,
+                                                                float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
+                                                                int64_t ldx) {
+    __shared__ float sh[32];
+    __shared__ __align__(16) float xs[N];
+    constexpr int F = N / 4;   // 640 float4 a row
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int64_t t = row / HC;
+    const int c = (int) (row % HC);
+    float4* r4 = reinterpret_cast<float4*>(R + row * N);
+    const float4* b4 = reinterpret_cast<const float4*>(bo + t * N);
+    const int64_t xo = t * ldx + (int64_t) c * N;
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float4 v[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int f = threadIdx.x + 256 * j;
+        if (f < F) {
+            const float4 a = r4[f], b = b4[f];
+            float4 x;
+            x.x = fmaf(b.x, sc, a.x); x.y = fmaf(b.y, sc, a.y); x.z = fmaf(b.z, sc, a.z); x.w = fmaf(b.w, sc, a.w);
+            r4[f] = x;
+            v[j] = x;
+            *reinterpret_cast<float4*>(&xs[4 * f]) = x;
+        }
+    }
+    __syncthreads();
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GRW_PER; ++k) { const float x = xs[threadIdx.x + 256 * k]; ss = fmaf(x, x, ss); }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rs_out[row] = rs;
+    const float4* w4 = reinterpret_cast<const float4*>(w + c * N);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int f = threadIdx.x + 256 * j;
+        if (f < F) {
+            const float4 g = w4[f];
+            const float4 x = v[j];
+            const uint32_t lo = (uint32_t) act16(x.x * rs * g.x) | ((uint32_t) act16(x.y * rs * g.y) << 16);
+            const uint32_t hi = (uint32_t) act16(x.z * rs * g.z) | ((uint32_t) act16(x.w * rs * g.w) << 16);
+            *reinterpret_cast<uint2*>(xn16 + xo + 4 * f) = make_uint2(lo, hi);
+        }
+    }
+}
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write, its control vector and the next half's norm in one
 // pass over R (was gr_write + cvec_apply + gr_norm_rs: three).  The write is gr_write_kernel's, the vector
 // cvec_kernel's (the same per-thread dot order over d = tid + 256 k, the same two-level xor reduction), the norm
@@ -2250,7 +2303,7 @@ __device__ __forceinline__ um_f8 um_wmma(um_b16 a, um_b16 b, um_f8 c) {
     (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
 #endif
 }
-constexpr int UM_T = 128, UM_D = 16, UM_LD = LR + 8;   // a block: 128 tokens x 16 columns x the 4 streams
+constexpr int UM_D = 16, UM_LD = LR + 8;   // a block: NT / 2 tokens (16 a wave) x 16 columns x the 4 streams
 __device__ __forceinline__ um_b16 um_frag(const uint16_t* p) {   // 16 BF16 (32 bytes, 16-byte aligned)
     const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
     const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
@@ -2258,7 +2311,13 @@ __device__ __forceinline__ um_b16 um_frag(const uint16_t* p) {   // 16 BF16 (32 
 }
 // The block's w_up rows (16 columns x 4 streams x all 320 k) are staged in LDS once; each wave streams its own 16
 // tokens' lo16 rows from global memory (every A fragment feeds the 4 streams' WMMAs) - one barrier per block.
-__global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ wu,
+// [claude] 11-01: 512 threads (256 tokens) a block by default - the same 42 KB of staged w_up serves 16 waves, and the
+// 512-thread bound holds the kernel to 127 VGPRs (at 256 threads the scheduler took 237: 6 waves a SIMD, the GEMM and
+// the epilogue of a wave serialized with little to hide them).  12 waves a SIMD, half the w_up staging: 16K 2.54 ->
+// 2.00 ms, 8K 1.40 -> 0.92 ms (hcx bench), the same bits (each element's arithmetic is unchanged).
+// STRATA_HC_UPMIX_NT=256 restores the 128-token blocks.
+template <int NT>
+__global__ void __launch_bounds__(NT) gr_upmix_kernel(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ wu,
                                                        const float* __restrict__ R, const float* __restrict__ rs,
                                                        const float* __restrict__ w, float* __restrict__ mixed,
                                                        uint16_t* __restrict__ mixed16, uint16_t* __restrict__ mixed_h,
@@ -2267,9 +2326,9 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     // blocks ordered column-tile fastest: the blocks in flight share a token tile, so the epilogue's R reads run
     // along rows (token-tile fastest scattered them over 512 rows x 40 KB per block: 28 ms instead of 3.7 at 8K)
-    const int64_t t0 = (int64_t) blockIdx.y * UM_T + 16 * wave;
+    const int64_t t0 = (int64_t) blockIdx.y * (NT / 2) + 16 * wave;
     const int d0 = blockIdx.x * UM_D;
-    for (int i = tid; i < HC * UM_D * (LR / 8); i += 256) {
+    for (int i = tid; i < HC * UM_D * (LR / 8); i += NT) {
         const int rr = i / (LR / 8), q = i % (LR / 8);
         const int c = rr / UM_D, dd = rr % UM_D;
         *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
@@ -2530,8 +2589,13 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
         return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
     }();
     if (!gfx11 || T <= 0) return false;
-    gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+    static const int nt = [] { const char* e = std::getenv("STRATA_HC_UPMIX_NT"); return e && std::atoi(e) == 256 ? 256 : 512; }();
+    if (nt == 256)
+        gr_upmix_kernel<256><<<dim3(N / UM_D, (unsigned) ((T + 127) / 128)), 256, 0, (cudaStream_t) stream>>>(
+            lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+    else
+        gr_upmix_kernel<512><<<dim3(N / UM_D, (unsigned) ((T + 255) / 256)), 512, 0, (cudaStream_t) stream>>>(
+            lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
     check("gr_upmix");
     return true;
 #else
@@ -2553,9 +2617,16 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+    static const bool wn4 = [] { const char* e = std::getenv("STRATA_HC_WN4"); return !(e && e[0] == '0'); }();
+    const int64_t ld = ldx > 0 ? ldx : D;
+    if (wn4 && !xn16_lo && !f16img && ld % 4 == 0 && ((uintptr_t) xn16 & 7) == 0 && ((uintptr_t) R & 15) == 0 &&
+        ((uintptr_t) bo & 15) == 0 && ((uintptr_t) w_norm_next & 15) == 0)
+        gr_write_norm_rs4_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next,
+                                                                                         eps, rs, xn16, ld);
+    else
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo,
-                                                                                      ldx > 0 ? ldx : D, f16img ? 1 : 0);
+                                                                                      ld, f16img ? 1 : 0);
     check("gr_write_norm_rs");
 }
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,

@@ -56,7 +56,16 @@ int main(int argc, char** argv) {
         upok = strata::prefill::gr_upmix(lo16, Wu, R, rs, wn, mixed, mixed16, mixedh, T, s);
         cudaEventRecord(e[4], s);
         cudaEventSynchronize(e[4]);
-        if (r == 0) {   // the outputs' checksum, to compare kernel variants bit for bit (STRATA_HC_UPMIX2=0 / 1)
+        if (r == 0) {   // the outputs' checksum, to compare kernel variants bit for bit (STRATA_HC_UPMIX_NT, STRATA_HC_WN4)
+            std::vector<float> rr((size_t) T * D), rsh((size_t) T * HC);
+            std::vector<uint16_t> xh((size_t) T * ldx);
+            cudaMemcpy(rr.data(), R, rr.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(rsh.data(), rs, rsh.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(xh.data(), xn16, xh.size() * 2, cudaMemcpyDeviceToHost);
+            auto fnv0 = [](const void* p, size_t n) { const uint8_t* b = (const uint8_t*) p; uint64_t h = 1469598103934665603ull; for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } return h; };
+            for (int64_t t = 0; t < T; ++t) std::memset(&xh[(size_t) t * ldx + D], 0, PAD * 2);   // the pad is never written
+            std::printf("checksum R %016llx rs %016llx xn16 %016llx\n", (unsigned long long) fnv0(rr.data(), rr.size() * 4),
+                        (unsigned long long) fnv0(rsh.data(), rsh.size() * 4), (unsigned long long) fnv0(xh.data(), xh.size() * 2));
             std::vector<float> m((size_t) T * N);
             std::vector<uint16_t> m16((size_t) T * N), mh((size_t) T * N);
             cudaMemcpy(m.data(), mixed, m.size() * 4, cudaMemcpyDeviceToHost);
