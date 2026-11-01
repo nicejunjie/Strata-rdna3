@@ -163,14 +163,24 @@ inline int64_t tp_min_tokens() {
     static const int64_t v = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MIN"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 4096; }();
     return v;
 }
-inline bool tp_layout(size_t T) { return tp_prefill_on() && (int64_t) T >= tp_min_tokens(); }
+std::atomic<bool> g_tp_layout_next{false};   // Prefill::set_tp_layout: the layouts made from here are for TP reads
+inline bool tp_layout(size_t T) { return tp_prefill_on() && g_tp_layout_next.load() && (int64_t) T >= tp_min_tokens(); }
 // the exchange buffers of a layout for chunks of T tokens (rows of the larger half): incoming a/b gates (96 f32), GDN
 // half outputs (3072 f16), K/V/indexer keys (1152 f32), expert inputs (2560 f16 + 10 ids + 10 weights), partial sums
 // (2560 f16); one outgoing block (the larger of the GDN half and the sums); the routing with the dummy expert (T x 10)
-inline size_t tp_half_rows(size_t T) { return T / 2 + 32; }
+inline double tp_split_frac();
+inline size_t tp_half_rows(size_t T) { return (size_t) ((double) T * std::max(tp_split_frac(), 1.0 - tp_split_frac())) + 64; }   // (the larger share)
 // [claude] TP prefill: a chunk of T tokens is split [0, a) on the first path, [a, T) on the second (a on the 32-token
 // grid of the GDN chunk kernels, so the recurrence run in two token ranges keeps its chunks)
-inline int64_t tp_split(int64_t T) { return std::max<int64_t>(std::min<int64_t>(32, T), std::min<int64_t>((T / 2) / 32 * 32, T)); }
+// (STRATA_TP_PREFILL_SPLIT: the first path's share, default 0.53 - the second path's queries attend to more cells)
+inline double tp_split_frac() {
+    static const double f = [] { const char* v = std::getenv("STRATA_TP_PREFILL_SPLIT"); return v ? std::clamp(std::atof(v), 0.3, 0.7) : 0.53; }();
+    return f;
+}
+inline int64_t tp_split(int64_t T) {
+    static const double f = tp_split_frac();
+    return std::max<int64_t>(std::min<int64_t>(32, T), std::min<int64_t>((int64_t) ((double) T * f) / 32 * 32, T - 32));
+}
 // [claude] TP prefill: the exchanges of a layer (DpLink::tev / tseq slots)
 enum TpX { kXGin = 0, kXGout, kXQkv, kXMin, kXMsum, kXPle, kXPle2, kXEnd };
 inline bool dp_share_env() {
@@ -3170,7 +3180,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pv[0] = pv[1];
             pv[1] = tok;
         }
-        return PR.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        const auto tg0 = Clock::now();
+        const bool gok = PR.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        if (static const bool dbg = std::getenv("STRATA_PLE_TIMING") != nullptr; dbg)   // [claude] debug: the gather's own time
+            std::fprintf(stderr, "strata ple gather: path %d, %lld rows from %lld in %.1f ms\n", tp ? dp_index_ : -1, (long long) T,
+                         (long long) c0, ms_since(tg0));
+        return gok;
     };
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
@@ -4269,20 +4284,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill TP: the a/b rows"; return false;
                         }
                         if (!inproj(po0, Tp)) return false;
-                        if (static const bool tpdbg = std::getenv("STRATA_TP_DEBUG") != nullptr; tpdbg && l < 1) {
-                            cudaStreamSynchronize(m.cs);
-                            auto bad32 = [&](const float* d, int64_t rows, int64_t cols, int64_t ld) {
-                                std::vector<float> h((size_t) (rows * ld));
-                                cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost);
-                                int64_t c = 0;
-                                for (int64_t i = 0; i < rows; ++i) for (int64_t j = 0; j < cols; ++j) c += !std::isfinite(h[(size_t) (i * ld + j)]);
-                                return c;
-                            };
-                            const int64_t vc = (32 + r * 8) * 128, zc = r * 8 * 128;
-                            std::fprintf(stderr, "strata TP dbg inproj: card %d split %lld: qkv v [0,a) %lld [a,T) %lld | z [0,a) %lld [a,T) %lld\n", r,
-                                         (long long) tsplit, (long long) bad32(m.qkv + vc, tsplit, 1024, CQ), (long long) bad32(m.qkv + tsplit * CQ + vc, T - tsplit, 1024, CQ),
-                                         (long long) bad32(m.z + zc, tsplit, 1024, ZV), (long long) bad32(m.z + tsplit * ZV + zc, T - tsplit, 1024, ZV));
-                        }
                         pt.mark(kPfGdnConv, cs);
                         gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                         if (!gdn_conv_tp(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, r, m.cs)) {
@@ -4298,97 +4299,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill TP: the GDN recurrence's head half did not run";
                             return false;
                         };
-                        auto send_half = [&](int64_t t0, int64_t nt) -> bool {
-                            tp_y16_pack(m.y_h + t0 * ly, ly, nt, r, m.tp_out, m.cs);
-                            return tp_send(l, kXGout, pm.tp_in_y, m.tp_out, (size_t) (nt * (ZV / 2)) * 2, err) && tp_post(l, kXGout, err);
-                        };
-                        if (const char* dd = std::getenv("STRATA_TP_DUMP_GDN"); dd != nullptr && l == 0 && r == 0 && tp_chunk_ == 0) {
-                            cudaStreamSynchronize(m.cs);
-                            auto dumpf = [&](const char* nm, const void* d, size_t bytes) {
-                                std::vector<char> h(bytes);
-                                cudaMemcpy(h.data(), d, bytes, cudaMemcpyDeviceToHost);
-                                if (std::FILE* f = std::fopen((std::string(dd) + "/" + nm).c_str(), "wb")) { std::fwrite(h.data(), 1, bytes, f); std::fclose(f); }
-                            };
-                            dumpf("hbuf", m.hbuf, (size_t) T * CQ * 4); dumpf("gate", m.gate, (size_t) T * HV * 4); dumpf("beta", m.beta, (size_t) T * HV * 4);
-                            dumpf("z", m.z, (size_t) T * ZV * 4); dumpf("state", state, (size_t) 128 * HV * 128 * 4); dumpf("gamma", wnm->data, 128 * 4);
-                            std::fprintf(stderr, "strata TP dbg: dumped the GDN inputs of layer 0 (T %lld, split %lld) to %s\n", (long long) T, (long long) tsplit, dd);
-                        }
-                        if (!rec(0, tsplit)) return false;
-                        if (r == 1 && !send_half(0, tsplit)) return false;
-                        if (!rec(tsplit, T - tsplit)) return false;
-                        if (static const bool tpdbg = std::getenv("STRATA_TP_DEBUG") != nullptr; tpdbg && l < 1) {
-                            cudaStreamSynchronize(m.cs);
-                            auto bad32 = [&](const float* d, int64_t rows, int64_t cols, int64_t ld) {
-                                std::vector<float> h((size_t) (rows * ld));
-                                cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost);
-                                int64_t c = 0;
-                                for (int64_t i = 0; i < rows; ++i) for (int64_t j = 0; j < cols; ++j) c += !std::isfinite(h[(size_t) (i * ld + j)]);
-                                return c;
-                            };
-                            const int64_t vh0 = r * 8;   // the first own v-head range
-                            std::fprintf(stderr, "strata TP dbg rec: card %d: gate [0,a) %lld [a,T) %lld | beta %lld %lld | hbuf v %lld %lld | oc %lld %lld | state %lld\n", r,
-                                         (long long) bad32(m.gate + vh0, tsplit, 8, HV), (long long) bad32(m.gate + tsplit * HV + vh0, T - tsplit, 8, HV),
-                                         (long long) bad32(m.beta + vh0, tsplit, 8, HV), (long long) bad32(m.beta + tsplit * HV + vh0, T - tsplit, 8, HV),
-                                         (long long) bad32(m.hbuf + (32 + vh0) * 128, tsplit, 1024, CQ), (long long) bad32(m.hbuf + tsplit * CQ + (32 + vh0) * 128, T - tsplit, 1024, CQ),
-                                         (long long) bad32(m.y + vh0 * 128, tsplit, 1024, ZV), (long long) bad32(m.y + tsplit * ZV + vh0 * 128, T - tsplit, 1024, ZV),
-                                         (long long) bad32(state, 128, HV * 128, HV * 128));
-                            std::vector<float> h((size_t) (T * ZV));
-                            cudaMemcpy(h.data(), m.y, h.size() * 4, cudaMemcpyDeviceToHost);
-                            int64_t f = -1, la = -1, nb = 0;
-                            for (int64_t t = 0; t < T; ++t) {
-                                bool b = false;
-                                for (int64_t j = 0; j < 1024; ++j) b |= !std::isfinite(h[(size_t) (t * ZV + vh0 * 128 + j)]);
-                                if (b) { if (f < 0) f = t; la = t; ++nb; }
-                            }
-                            std::vector<float> st((size_t) 128 * HV * 128);
-                            cudaMemcpy(st.data(), state, st.size() * 4, cudaMemcpyDeviceToHost);
-                            int64_t sown = 0, soth = 0;
-                            for (int64_t k = 0; k < 128; ++k) for (int64_t vh = 0; vh < HV; ++vh) for (int64_t c = 0; c < 128; ++c)
-                                if (!std::isfinite(st[(size_t) ((k * HV + vh) * 128 + c)])) (((vh % 16) / 8) == r ? sown : soth)++;
-                            std::fprintf(stderr, "strata TP dbg rec2: card %d: oc bad rows %lld first %lld last %lld; state own %lld other %lld\n", r,
-                                         (long long) nb, (long long) f, (long long) la, (long long) sown, (long long) soth);
-                            std::vector<float> hb((size_t) (T * CQ)), qk((size_t) (T * CQ));
-                            cudaMemcpy(hb.data(), m.hbuf, hb.size() * 4, cudaMemcpyDeviceToHost);
-                            cudaMemcpy(qk.data(), m.qkv, qk.size() * 4, cudaMemcpyDeviceToHost);
-                            for (int part = 0; part < 3; ++part) {
-                                const int64_t c0 = part == 0 ? r * 1024 : part == 1 ? 2048 + r * 1024 : (32 + r * 8) * 128;
-                                double m1 = 0, m2 = 0, q1 = 0, q2 = 0; int64_t nbad = 0;
-                                for (int64_t t = 0; t < T; ++t) for (int64_t j = 0; j < 1024; ++j) {
-                                    const float x = hb[(size_t) (t * CQ + c0 + j)], y = qk[(size_t) (t * CQ + c0 + j)];
-                                    if (!std::isfinite(x) || !std::isfinite(y)) { ++nbad; continue; }
-                                    (t < 7300 ? m1 : m2) = std::max(t < 7300 ? m1 : m2, (double) std::fabs(x));
-                                    (t < 7300 ? q1 : q2) = std::max(t < 7300 ? q1 : q2, (double) std::fabs(y));
+                        // the half's outputs of one token range for the other GPU, in sub-ranges of STRATA_TP_PREFILL_PIPE
+                        // tokens (default 1024, on the 32-token grid): each is packed and sent as soon as the recurrence
+                        // has it, so only the last one's copy is exposed (the recurrence in more calls: the same chunks, bits)
+                        static const int64_t pipe_t = [] { const char* v = std::getenv("STRATA_TP_PREFILL_PIPE"); return std::max<int64_t>(256, v ? std::atoll(v) : 1024) / 32 * 32; }();
+                        auto rec_send = [&](int64_t t0, int64_t nt, bool send) -> bool {
+                            for (int64_t s0 = 0; s0 < nt;) {
+                                const int64_t sn = (nt - s0 <= pipe_t + pipe_t / 2) ? nt - s0 : pipe_t;
+                                if (!rec(t0 + s0, sn)) return false;
+                                if (send) {
+                                    tp_y16_pack(m.y_h + (t0 + s0) * ly, ly, sn, r, m.tp_out + s0 * (ZV / 2), m.cs);
+                                    if (!tp_send(l, kXGout, pm.tp_in_y + s0 * (ZV / 2), m.tp_out + s0 * (ZV / 2), (size_t) (sn * (ZV / 2)) * 2, err)) return false;
                                 }
-                                std::fprintf(stderr, "strata TP dbg cols: card %d part %d (q/k/v0): bad %lld | hbuf max <7300 %.3g >=7300 %.3g | qkv max %.3g %.3g\n",
-                                             r, part, (long long) nbad, m1, m2, q1, q2);
+                                s0 += sn;
                             }
-                        }
-                        if (r == 0 && !send_half(tsplit, T - tsplit)) return false;
+                            return !send || tp_post(l, kXGout, err);
+                        };
+                        if (!rec_send(0, tsplit, r == 1)) return false;
+                        if (!rec_send(tsplit, T - tsplit, r == 0)) return false;
                         if (!tp_take(l, kXGout, m.cs, err)) return false;
                         tp_y16_unpack(m.tp_in_y, To, 1 - r, m.y_h + o0 * ly, ly, m.cs);
-                        if (static const bool tpdbg = std::getenv("STRATA_TP_DEBUG") != nullptr; tpdbg && l < 2) {
-                            cudaStreamSynchronize(m.cs);
-                            auto bad16 = [&](const uint16_t* d, int64_t rows, int64_t cols, int64_t ld) {
-                                std::vector<uint16_t> h((size_t) (rows * ld));
-                                cudaMemcpy(h.data(), d, h.size() * 2, cudaMemcpyDeviceToHost);
-                                int64_t c = 0;
-                                for (int64_t i = 0; i < rows; ++i) for (int64_t j = 0; j < cols; ++j) c += (h[(size_t) (i * ld + j)] & 0x7c00) == 0x7c00;
-                                return c;
-                            };
-                            auto bad32 = [&](const float* d, int64_t rows, int64_t cols, int64_t ld) {
-                                std::vector<float> h((size_t) (rows * ld));
-                                cudaMemcpy(h.data(), d, h.size() * 4, cudaMemcpyDeviceToHost);
-                                int64_t c = 0;
-                                for (int64_t i = 0; i < rows; ++i) for (int64_t j = 0; j < cols; ++j) c += !std::isfinite(h[(size_t) (i * ld + j)]);
-                                return c;
-                            };
-                            std::fprintf(stderr, "strata TP dbg gdn: card %d layer %lld: mixed_h own %lld peer %lld | ab own %lld peer %lld | qkv own-rows %lld peer-rows %lld (q cols of own heads) | hbuf %lld | y_h own rows %lld | in_y %lld\n",
-                                         r, (long long) l, (long long) bad16(m.mixed_h + o0 * N, To, N, N), (long long) bad16(m.mixed_h + po0 * N, Tp, N, N),
-                                         (long long) bad32(m.ab + o0 * 2 * HV, To, 2 * HV, 2 * HV), (long long) bad32(m.ab + po0 * 2 * HV, Tp, 2 * HV, 2 * HV),
-                                         (long long) bad32(m.qkv + o0 * CQ + r * 1024, To, 1024, CQ), (long long) bad32(m.qkv + po0 * CQ + r * 1024, Tp, 1024, CQ),
-                                         (long long) bad32(m.hbuf + r * 1024, T, 1024, CQ), (long long) bad16(m.y_h + o0 * ly, To, ZV, ly),
-                                         (long long) bad16(m.tp_in_y, To, ZV / 2, ZV / 2));
-                        }
                         pt.mark(kPfGdnOut, cs);
                         if (!native_proj(m.gemm, wo, m.y_h + o0 * ly, m.bo + o0 * N, To, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                         ++gdn_index;
@@ -4894,13 +4824,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
                             }
                             pt.mark(kPfGemmGU, cs);
-                            struct MidCtx { PfTimer* pt; cudaStream_t cs; } mid{&pt, cs};
-                            if (pt.on) fused::set_mid_hook([](void* c) { auto* x = (MidCtx*) c; x->pt->mark(kPfGemmD, x->cs); }, &mid);
+                            // (no mid-point hook here: fused::set_mid_hook is process-wide, and both GPUs' threads launch
+                            // experts at once - one card's timing event recorded on the other's stream: invalid handle)
                             if (fused::f16_on())
                                 fused::experts_native_f16(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             else
                                 fused::experts_native(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
-                            if (pt.on) fused::set_mid_hook(nullptr, nullptr);
                             for (size_t kk = k0; kk < k; ++kk) {
                                 cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
                                 m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
@@ -7198,6 +7127,8 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
 
 // ---- [claude] TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt)
 bool Prefill::tp_prefill_env() { return tp_prefill_on(); }
+void Prefill::set_tp_layout(bool on) { g_tp_layout_next.store(on); }
+bool Prefill::tp_layout_now() const { return impl_->tp_ids != nullptr; }
 
 bool Prefill::tp_send(int64_t l, int x, void* dst, const void* src, size_t bytes, std::string& err) {
     (void) l; (void) x;
@@ -7351,7 +7282,7 @@ bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
     {
         // an expert in card 0's cache is card 0's, else in card 1's card 1's; the others (in neither) are split per
         // layer: STRATA_TP_PREFILL_NR of them (default 0.5: every other one) to the card that holds fewer of the layer
-        static const double nr = [] { const char* v = std::getenv("STRATA_TP_PREFILL_NR"); return v ? std::clamp(std::atof(v), 0.0, 1.0) : 0.5; }();
+        static const double nr = [] { const char* v = std::getenv("STRATA_TP_PREFILL_NR"); return v ? std::min(std::atof(v), 1.0) : 0.5; }();
         const int64_t E = a.impl_->g->n_expert, NL = a.impl_->g->n_layers;
         a.tp_mine_.assign((size_t) (NL * E), 0);
         b.tp_mine_.assign((size_t) (NL * E), 0);
@@ -7360,6 +7291,10 @@ bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
             int64_t ca = 0, cb = 0;
             for (int64_t e = 0; e < E; ++e) { ca += a.dp_res_[(size_t) (l * E + e)] >= 0; cb += b.dp_res_[(size_t) (l * E + e)] >= 0; }
             const int light = ca <= cb ? 0 : 1;
+            // STRATA_TP_PREFILL_NR < 0 (default -1): the split that evens the two cards' expert counts of the layer
+            // (the card holding fewer takes the difference first, then every other one); >= 0: that fraction to it
+            const int64_t neither = E - ca - cb, diff = std::abs(ca - cb);
+            const double frac = nr >= 0.0 ? nr : neither > 0 ? std::clamp(0.5 + 0.5 * (double) diff / (double) neither, 0.5, 1.0) : 0.5;
             double acc = 0.0;
             for (int64_t e = 0; e < E; ++e) {
                 const size_t i = (size_t) (l * E + e);
@@ -7367,7 +7302,7 @@ bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
                 if (a.dp_res_[i] >= 0) who = 0;
                 else if (b.dp_res_[i] >= 0) who = 1;
                 else {
-                    acc += nr;
+                    acc += frac;
                     if (acc >= 1.0) { acc -= 1.0; who = light; } else who = 1 - light;
                     ++share[who];
                 }

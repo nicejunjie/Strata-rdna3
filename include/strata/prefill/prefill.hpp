@@ -303,6 +303,10 @@ public:
                        int64_t min_last, std::string& err);
     /// STRATA_TP_PREFILL=1 (default off)
     static bool tp_prefill_env();
+    /// The layouts init / relayout / bytes_needed make from here on carve the TP exchange buffers (a TP read's loan) or
+    /// not (every other read's: no TP bytes in their loans); tp_layout_now: this path's current layout has them
+    static void set_tp_layout(bool on);
+    bool tp_layout_now() const;
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,

@@ -14416,12 +14416,13 @@ int main(int argc, char** argv) {
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
                 int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                bool tp_read = false;   // [claude] TP prefill: this segment's loan carves the exchange buffers
                 if (dp_on) {   // [claude] DP: a long segment lends the DP plan's step; the layer pipeline keeps its chunk
                     // the part DP reads: read_part takes the head to the next K/V block boundary on the pipeline first
                     // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
                     // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
                     const int64_t dp_n = tokens - dp_head(a0);
-                    if (tpp_takes(dp_n)) want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk));   // [claude] TP prefill
+                    if (tpp_takes(dp_n)) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
                     else if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
                     else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
@@ -14436,10 +14437,13 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 bool any = false;
+                if (strata::prefill::Prefill::tp_prefill_env()) strata::prefill::Prefill::set_tp_layout(tp_read);
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
+                    // [claude] TP prefill: a loan laid out for the other kind of read is laid out again
+                    const bool tp_mismatch = strata::prefill::Prefill::tp_prefill_env() && p.sp->tp_layout_now() != tp_read;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        if (want <= p.lent_chunk && !tp_mismatch) continue;            // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -14474,7 +14478,7 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                    if (want_p != p.sp->chunk() || first != p.first_now || tp_mismatch) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
