@@ -4938,6 +4938,24 @@ bool Verifier::capture_all(std::string& err) {
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
+    // [claude] N2: STRATA_TOPK_SPLIT_MIN's long twins (exec_l_, the ones pl_launch runs past the threshold) are captured
+    // here too, while nothing is in flight - captured on first use inside the pipelined loop (the other stage's window
+    // and this verifier's previous work in flight) the capture failed now and then ("operation failed due to a previous
+    // error during capture") and the request with it.  STRATA_TOPK_SPLIT_EAGER=0: on first use as before
+    {
+        static const int64_t split_min = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT_MIN"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
+        static const bool eager = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT_EAGER"); return v == nullptr || std::atoi(v) != 0; }();
+        if (split_min > 0 && eager) {
+            const bool long_was = long_, ar_was = ar_off_;
+            long_ = true;
+            ar_off_ = false;
+            bool ok = true;
+            for (int T = 1; ok && T <= max_t_; ++T) ok = capture(T, err);
+            long_ = long_was;
+            ar_off_ = ar_was;
+            if (!ok) return false;
+        }
+    }
     if (!capture_commit(err)) return false;
     if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
         (ev_commit_ == nullptr && cudaEventCreateWithFlags(&ev_commit_, cudaEventDisableTiming) != cudaSuccess)) {

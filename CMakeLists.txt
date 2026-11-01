@@ -1010,6 +1010,8 @@ endif()
     # the HC write-back kernel timed at the prompt path's shapes with an output checksum (not a ctest; STRATA_GRW_V picks a variant)
     add_executable(hip_prefill_gr_write_bench tests/hip/prefill_gr_write_bench.cpp)
     target_link_libraries(hip_prefill_gr_write_bench PRIVATE strata_prefill strata_hip_runtime)
+    add_executable(hip_prefill_hc_bench tests/hip/prefill_hc_bench.cpp)   # [claude] the prompt HC kernels one by one
+    target_link_libraries(hip_prefill_hc_bench PRIVATE strata_prefill strata_hip_runtime)
     # S6: the AMD fast router against the portable kernel, bitwise
     add_executable(hip_router_fast tests/hip/router_fast.cpp)
     target_link_libraries(hip_router_fast PRIVATE strata_kernels strata_hip_runtime)
