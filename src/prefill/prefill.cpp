@@ -3679,8 +3679,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 strata::platform::name_this_thread("strata-issue");
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
+                // [claude] STRATA_TP_PREFILL_AHEAD (experiment, TP reads only): stream at most this share of the ring ahead
+                // of the compute, leaving the receive link room for the exchanges (1 = the whole ring, as before)
+                static const double ahead = [] { const char* v = std::getenv("STRATA_TP_PREFILL_AHEAD"); return v ? std::clamp(std::atof(v), 0.1, 1.0) : 1.0; }();
+                const size_t ring_ahead = tp ? std::max<size_t>(8, (size_t) ((double) m.ring * ahead)) : (size_t) m.ring;
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
-                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
+                    while (idx >= a_consumed.load(std::memory_order_acquire) + ring_ahead) {
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
@@ -7325,7 +7329,15 @@ bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
             ok = cudaMalloc((void**) &xm.tp_keep, nf) == cudaSuccess;
             xm.tp_keep_n = ok ? nf : 0;
         }
-        if (ok && xm.tp_cs == nullptr) ok = cudaStreamCreateWithFlags(&xm.tp_cs, cudaStreamNonBlocking) == cudaSuccess;
+        // STRATA_TP_PREFILL_XPRIO=1 (experiment): the exchange stream at the device's highest priority
+        static const bool xprio = [] { const char* v = std::getenv("STRATA_TP_PREFILL_XPRIO"); return v && std::atoi(v) != 0; }();
+        if (ok && xm.tp_cs == nullptr) {
+            int lo = 0, hi = 0;
+            if (xprio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+                ok = hipStreamCreateWithPriority(&xm.tp_cs, hipStreamNonBlocking, hi) == hipSuccess;
+            else
+                ok = cudaStreamCreateWithFlags(&xm.tp_cs, cudaStreamNonBlocking) == cudaSuccess;
+        }
         if (ok && xm.tp_rdy == nullptr) ok = cudaEventCreateWithFlags(&xm.tp_rdy, cudaEventDisableTiming) == cudaSuccess;
         if (ok && xm.tp_done == nullptr) ok = cudaEventCreateWithFlags(&xm.tp_done, cudaEventDisableTiming) == cudaSuccess;
         if (ok) ok = cudaMemcpy(xm.tp_keep, X.tp_mine_.data(), nf, cudaMemcpyHostToDevice) == cudaSuccess &&
