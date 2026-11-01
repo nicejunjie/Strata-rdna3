@@ -66,6 +66,23 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                     int64_t ld16 = 0);   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+/// [claude] TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt): the same kernels on card `rank`'s GDN head half -
+/// k-heads [8 rank, 8 rank + 8) and the v-heads whose head % 16 falls there - in the full-layout buffers and state; only
+/// that half's channels / heads / y16 columns are read and written, each with the one-card kernel's arithmetic.  Only
+/// the production variants (STRATA_GDN_CONVL2, chunks over 64 tokens; STRATA_GDN_HEAD + STRATA_GDN_CHUNKED with the WMMA
+/// scan, STRATA_GDN_CHUNK_GDV=0, T >= 128): false, nothing launched, otherwise (gdn_recurrence_tp_ok asks first).
+/// [claude] TP prefill: rank's GDN head-half columns of y16 (rows x ld halves; 24 heads x 128) to a dense
+/// [rows][3072] block and back; and a head half's recurrent + conv state (src, `layers` x `per_layer` floats, the
+/// session layout) written into the owner's full state (dst) - only that half's elements
+void tp_y16_pack(const uint16_t* y16, int64_t ld, int64_t rows, int rank, uint16_t* out, void* stream);
+void tp_y16_unpack(const uint16_t* in, int64_t rows, int rank, uint16_t* y16, int64_t ld, void* stream);
+void tp_gdn_merge(float* dst, const float* src, int64_t layers, int64_t per_layer, int rank, void* stream);
+bool gdn_conv_tp(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, int rank,
+                 void* stream);
+bool gdn_recurrence_tp_ok(int64_t T);
+bool gdn_recurrence_tp(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                       const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16,
+                       int rank);
 /// Allocate the chunked recurrence's scratch and load its kernels now (STRATA_GDN_CHUNKED=1 + STRATA_GDN_CHUNK_GDV=0;
 /// the current device), not on the first prompt.
 void gdn_recurrence_warm();

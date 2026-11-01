@@ -210,6 +210,21 @@ bool dp_takes(int64_t n, int64_t cap) {
     const int64_t full = (n + step - 1) / step;
     return full >= 2 && n - (full - 1) * step >= kDpMinLast;
 }
+// [claude] TP prefill (STRATA_TP_PREFILL=1, Prefill::run_tp): segments of STRATA_TP_PREFILL_MIN (4096) ..
+// STRATA_TP_PREFILL_MAX (32768) tokens read on both GPUs, every layer, in balanced chunks of at most
+// STRATA_TP_PREFILL_CHUNK (16384) tokens; it needs the DP path's link and sessions (STRATA_DP_PREFILL=1)
+bool tpp_takes(int64_t n) {
+    static const bool on = strata::prefill::Prefill::tp_prefill_env();
+    static const int64_t lo = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MIN"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 4096; }();
+    static const int64_t hi = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MAX"); return e ? std::atoll(e) : (int64_t) 32768; }();
+    return on && n >= lo && n <= hi;
+}
+int64_t tpp_chunk_for(int64_t n, int64_t cap) {
+    static const int64_t c = [] { const char* e = std::getenv("STRATA_TP_PREFILL_CHUNK"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 16384; }();
+    const int64_t C = std::min(cap, c);
+    const int64_t k = std::max<int64_t>(1, (n + C - 1) / C);
+    return std::min(C, ((n + k - 1) / k + 255) / 256 * 256);
+}
 // the head read_part reads on the layer pipeline before DP: up to the next K/V block boundary from a0
 int64_t dp_head(int64_t a0) {
     const int64_t blk = strata::kernels::qsa_real_shapes().idx_block;
@@ -14406,7 +14421,8 @@ int main(int argc, char** argv) {
                     // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
                     // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
                     const int64_t dp_n = tokens - dp_head(a0);
-                    if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
+                    if (tpp_takes(dp_n)) want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk));   // [claude] TP prefill
+                    else if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
                     else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
@@ -14565,6 +14581,32 @@ int main(int argc, char** argv) {
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk
                                           : std::max<int64_t>(sp.chunk(), 1);
                 const int64_t C_read = planned ? plan.chunk : C;   // what the yield test calls a chunk
+                if (!planned && dp_on && tpp_takes(b0 - a0 - dp_head(a0))) {
+                    // [claude] TP prefill: both GPUs read every layer of the same chunks (Prefill::run_tp); a head to the
+                    // next K/V block boundary first (the pipeline, as DP); a prompt it cannot take goes on below
+                    const int64_t head = dp_head(a0);
+                    if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
+                    std::string te;
+                    const int64_t tn = b0 - a0 - head;
+                    if (strata::prefill::Prefill::run_tp(sp, stages[0]->sp, ids.data() + a0 + head, tn, a0 + head,
+                                                         std::min(o.prefill_chunk, tpp_chunk_for(tn, o.prefill_chunk)),
+                                                         kDpMinLast, te)) {
+                        dp_read_req = true;
+                        return true;
+                    }
+                    if (te.rfind("prefill TP: ", 0) != 0) { e = te; return false; }   // it ran: the state is not usable
+                    std::fprintf(stderr, "strata serve: %s - the usual prompt path reads it\n", te.c_str());
+                    if (dp_takes(tn, o.prefill_chunk)) {
+                        std::string de;
+                        if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, tn, a0 + head,
+                                                             o.prefill_chunk, kDpMinLast, de)) {
+                            dp_read_req = true;
+                            return true;
+                        }
+                        if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
+                    }
+                    return sp.run(ids.data() + a0 + head, tn, a0 + head, e);
+                }
                 if (!planned && dp_on && dp_takes(b0 - a0 - dp_head(a0), o.prefill_chunk)) {
                     // [claude] DP: both GPUs on alternating chunks; a head to the next K/V block boundary first (the
                     // pipeline), and the pipeline for a prompt the plan cannot take

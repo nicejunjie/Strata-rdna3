@@ -364,6 +364,21 @@ __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restri
 }
 
 // ---------------------------------------------------------------- GDN
+// [claude] TP prefill (STRATA_TP_PREFILL, docs/STRATA_TP_PREFILL_DESIGN_20261101.txt): card r runs the GDN k-heads
+// [r HK/2, (r+1) HK/2) and the value heads whose head % HK falls there (core/tp.cpp's split) over every token of the
+// chunk.  Its kernels take tpr = r and launch half grids: local index -> global head / channel block below; tpr < 0 is
+// the whole layer (the one-card launch, unchanged).  The buffers and the state keep the full layout: a half touches
+// only its own heads' columns, so each head's arithmetic is exactly the one-card kernel's.
+__device__ __forceinline__ int tp_vh(int j, int r) { return r < 0 ? j : (j / (HK / 2)) * HK + r * (HK / 2) + j % (HK / 2); }
+__device__ __forceinline__ int tp_kh(int m, int r) { return r < 0 ? m : r * (HK / 2) + m; }
+// a 128-channel conv block (one head): q heads [0, HK), k heads [HK, 2 HK), v heads [2 HK, 2 HK + HV)
+__device__ __forceinline__ int tp_cblk(int b, int r) {
+    if (r < 0) return b;
+    constexpr int hk = HK / 2;
+    if (b < hk) return r * hk + b;
+    if (b < 2 * hk) return HK + r * hk + (b - hk);
+    return 2 * HK + tp_vh(b - 2 * hk, r);
+}
 __global__ void gdn_gates_kernel(const float* __restrict__ ab, const float* __restrict__ dt,
                                  const float* __restrict__ ssm_a, float* __restrict__ gate, float* __restrict__ beta,
                                  int64_t T) {
@@ -415,8 +430,9 @@ __global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const floa
 // the same warp_sum, the same four partials added in the same order, the same v * rsqrtf(ss + eps) on the same
 // stored value - the same bits, without writing h and reading it back (16 tokens per round).
 __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
-                                   const float* __restrict__ w, float* __restrict__ h, int64_t T, float eps) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+                                   const float* __restrict__ w, float* __restrict__ h, int64_t T, float eps, int tpr = -1) {
+    const int blk = tp_cblk((int) blockIdx.x, tpr);   // [claude] TP prefill: the half's block (tpr < 0: blockIdx.x)
+    const int c = blk * blockDim.x + threadIdx.x;
     const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
     if (t0 >= T) return;
     const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
@@ -429,7 +445,7 @@ __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* 
         h[t * C + c] = s / (1.0f + __expf(-s));
         v0 = v1; v1 = v2; v2 = x;
     }
-    if (blockIdx.x >= 2 * HK) return;   // v channels: no norm
+    if (blk >= 2 * HK) return;   // v channels: no norm
     __shared__ float part[16][4];
     for (int64_t tb = t0; tb < t1; tb += 16) {
         const int n = (int) (t1 - tb < 16 ? t1 - tb : 16);
@@ -451,8 +467,8 @@ __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* 
     }
 }
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
-__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T, int tpr = -1) {
+    const int c = tp_cblk((int) blockIdx.x, tpr) * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float v[3];
     for (int k = 0; k < 3; ++k) {
@@ -1644,10 +1660,12 @@ __global__ void __launch_bounds__(QTH) gdn_rec_quad2c_kernel(float* __restrict__
 template <bool WY>
 __global__ void __launch_bounds__(S) gdn_out_norm_loop_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                               float eps, float* __restrict__ y, uint16_t* __restrict__ y16,
-                                                              int64_t rows, int64_t ld16) {
+                                                              int64_t rows, int64_t ld16, int tpr = -1) {
     __shared__ float wsum[4];
     const int col = threadIdx.x;
-    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+    for (int64_t rl = blockIdx.x; rl < rows; rl += gridDim.x) {
+        // [claude] TP prefill: rows walks the half's (token, own head) pairs; row is the full layout's (tpr < 0: rl)
+        const int64_t row = tpr < 0 ? rl : (rl / (HV / 2)) * HV + tp_vh((int) (rl % (HV / 2)), tpr);
         const size_t at = (size_t) row * S + col;
         const float oc = y[at];
         // (warp_sum as the compiler built it: the first xor step adds the partner's rounded square to an unrounded own
@@ -3055,9 +3073,9 @@ struct GpSmem {
 __global__ void __launch_bounds__(128) gdn_chunk_prep_wmma(const float* __restrict__ h, const float* __restrict__ gate,
                                                            const float* __restrict__ beta, uint16_t* __restrict__ tp16,
                                                            float* __restrict__ gm, uint16_t* __restrict__ kq16,
-                                                           int64_t t0, int64_t T) {
+                                                           int64_t t0, int64_t T, int tpr = -1) {
     __shared__ GpSmem sm;
-    const int qh = blockIdx.y, ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int qh = tp_kh((int) blockIdx.y, tpr), ch = blockIdx.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     int64_t tb = t0 + (int64_t) ch * GW_L;
     asm volatile("" : "+s"(tb));
     const int n = (int) min((int64_t) GW_L, T - tb);
@@ -3181,9 +3199,9 @@ __global__ void __launch_bounds__(GW_NT) gdn_chunk_scan_wmma(float* __restrict__
                                                               const float* __restrict__ gm,
                                                               const uint16_t* __restrict__ kq16,
                                                               float* __restrict__ oc_out, float* __restrict__ sink,
-                                                              int64_t t0, int nch, int64_t T) {
+                                                              int64_t t0, int nch, int64_t T, int tpr = -1) {
     __shared__ GwSmem sm;
-    const int vh = blockIdx.x, qh = vh % HK, wv = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
+    const int vh = tp_vh((int) blockIdx.x, tpr), qh = vh % HK, wv = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
     const int col = wv * 16 + (lane & 15);
     const bool half = lane >= 16;
     // addresses: a wave-uniform base + a 32-bit lane offset (64-bit lane addresses of every load stay live otherwise)
@@ -3406,7 +3424,8 @@ float* gdn_chunk_scratch_hip() {
 // [claude] the WMMA recurrence (STRATA_GDN_CHUNK_GDV=0): a prep and a scan launch per GW_SBT tokens; the scratch holds
 // T / P (FP16) and gamma of a super-block's chunks, then a sink line for the scan's past-the-end rows
 void gdn_chunk_wmma(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T, cudaStream_t s,
-                    int skip) {
+                    int skip, int tpr = -1) {
+    const unsigned hk_n = tpr < 0 ? HK : HK / 2, hv_n = tpr < 0 ? HV : HV / 2;   // [claude] TP prefill: a head half
     uint16_t* kq16 = gdn_kq16_scratch();
     const int nb = GW_SBT / GW_L;
     uint16_t* tp16 = reinterpret_cast<uint16_t*>(kq16 + (size_t) nb * HK * 3 * GW_L * S);   // after k / q / k^T
@@ -3417,10 +3436,10 @@ void gdn_chunk_wmma(float* state, const float* h, const float* gate, const float
     static const bool split = [] { const char* v = std::getenv("STRATA_GDN_WMMA_SPLIT"); return v && std::atoi(v) != 0; }();
     for (int64_t t0 = 0; t0 < T; t0 += GW_SBT) {
         const int nch = (int) ((std::min<int64_t>(GW_SBT, T - t0) + GW_L - 1) / GW_L);
-        if (skip != 1) gdn_chunk_prep_wmma<<<dim3((unsigned) nch, HK), 128, 0, s>>>(h, gate, beta, tp16, gm, kq16, t0, T);
+        if (skip != 1) gdn_chunk_prep_wmma<<<dim3((unsigned) nch, hk_n), 128, 0, s>>>(h, gate, beta, tp16, gm, kq16, t0, T, tpr);
         if (skip == 2) continue;
-        if (split) gdn_chunk_scan_wmma<true><<<HV, GW_NT, 0, s>>>(state, h, beta, tp16, gm, kq16, y, sink, t0, nch, T);
-        else gdn_chunk_scan_wmma<false><<<HV, GW_NT, 0, s>>>(state, h, beta, tp16, gm, kq16, y, sink, t0, nch, T);
+        if (split) gdn_chunk_scan_wmma<true><<<hv_n, GW_NT, 0, s>>>(state, h, beta, tp16, gm, kq16, y, sink, t0, nch, T, tpr);
+        else gdn_chunk_scan_wmma<false><<<hv_n, GW_NT, 0, s>>>(state, h, beta, tp16, gm, kq16, y, sink, t0, nch, T, tpr);
     }
 }
 
@@ -3610,6 +3629,55 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     gdn_recurrence_variant(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+}
+// [claude] TP prefill (kernels.hpp): the production prompt kernels on a GDN head half - STRATA_GDN_CONVL2's conv,
+// STRATA_GDN_CHUNKED's WMMA scan (STRATA_GDN_CHUNK_GDV=0) and the grid-stride out norm; false (nothing launched) where
+// this build or run takes another variant, so the caller keeps the one-card read
+bool gdn_conv_tp(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, int rank, void* stream) {
+    static const bool fused = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) != 0; }();
+    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;
+    if (!fused || serial || T <= CONV_TILE || rank < 0 || rank > 1) return false;
+    gdn_conv_l2_kernel<<<dim3(C / 128 / 2, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0, (cudaStream_t) stream>>>(
+        history, qkv, conv_w, h, T, eps, rank);
+    gdn_conv_hist_kernel<<<C / 128 / 2, 128, 0, (cudaStream_t) stream>>>(history, qkv, T, rank);
+    check("gdn_conv_tp");
+    return true;
+}
+bool gdn_recurrence_tp_ok(int64_t T) {
+#if defined(__HIPCC__)
+    static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool rheads = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
+    static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+    static const int shape = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_GDV"); return v ? std::atoi(v) : 1664; }();
+    return head && !rheads && chunked && shape == 0 && T >= 128 && gdn_kq16_scratch() != nullptr;
+#else
+    (void) T;
+    return false;
+#endif
+}
+bool gdn_recurrence_tp(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                       const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16,
+                       int rank) {
+#if defined(__HIPCC__)
+    if (rank < 0 || rank > 1 || !gdn_recurrence_tp_ok(T)) return false;
+    if (ld16 <= 0) ld16 = (int64_t) HV * S;
+    static const int skip = [] { const char* v = std::getenv("STRATA_GDN_CHUNK_SKIP"); return v ? std::atoi(v) : 0; }();
+    gdn_chunk_wmma(state, h, gate, beta, y, T, (cudaStream_t) stream, skip, rank);
+    static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
+    const int64_t rows = T * (HV / 2);
+    if (noy)
+        gdn_out_norm_loop_kernel<false><<<(unsigned) std::min<int64_t>(rows, 4096), S, 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, y16, rows, ld16, rank);
+    else
+        gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(rows, 4096), S, 0, (cudaStream_t) stream>>>(
+            z, gamma, eps, y, y16, rows, ld16, rank);
+    check("gdn_recurrence_tp");
+    return true;
+#else
+    (void) state; (void) h; (void) gate; (void) beta; (void) z; (void) gamma; (void) eps; (void) y; (void) y16; (void) T;
+    (void) stream; (void) ld16; (void) rank;
+    return false;
+#endif
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
@@ -3914,6 +3982,55 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
+}
+// [claude] TP prefill: a GDN head half's y16 columns (24 local heads x 128) of `rows` rows <-> a dense [rows][3072] block,
+// and the hand-back of a head half's recurrent + conv state into the owner's full state
+namespace {
+__global__ void tp_y16_pack_kernel(const uint16_t* __restrict__ y16, int64_t ld, int64_t rows, int rank,
+                                   uint16_t* __restrict__ out, int unpack) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // 8 halves a thread
+    constexpr int W = (HV / 2) * S;
+    if (i >= rows * (W / 8)) return;
+    const int64_t r = i / (W / 8);
+    const int j = (int) (i % (W / 8)) * 8, lh = j / S;
+    const int col = tp_vh(lh, rank) * S + j % S;
+    uint4* a = reinterpret_cast<uint4*>(out + r * W + j);
+    uint4* b = reinterpret_cast<uint4*>(const_cast<uint16_t*>(y16) + r * ld + col);
+    if (unpack) *b = *a; else *a = *b;
+}
+__global__ void tp_gdn_merge_kernel(float* __restrict__ dst, const float* __restrict__ src, int64_t layers,
+                                    int64_t per_layer, int rank) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= layers * per_layer) return;
+    const int64_t e = i % per_layer;
+    constexpr int64_t ST = (int64_t) S * HV * S;   // the recurrent state [S][HV][S], then the conv history [C][3]
+    bool mine;
+    if (e < ST) {
+        const int vh = (int) ((e / S) % HV);
+        mine = ((vh % HK) / (HK / 2)) == rank;
+    } else {
+        const int c = (int) ((e - ST) / 3), blk = c / S;   // a 128-channel block is one head
+        const int hk = blk < 2 * HK ? blk % HK : (blk - 2 * HK) % HK;
+        mine = (hk / (HK / 2)) == rank;
+    }
+    if (mine) dst[i] = src[i];
+}
+}  // namespace
+void tp_y16_pack(const uint16_t* y16, int64_t ld, int64_t rows, int rank, uint16_t* out, void* stream) {
+    if (rows <= 0) return;
+    tp_y16_pack_kernel<<<blocks_for(rows * (HV / 2) * S / 8), 256, 0, (cudaStream_t) stream>>>(y16, ld > 0 ? ld : (int64_t) HV * S, rows, rank, out, 0);
+    check("tp_y16_pack");
+}
+void tp_y16_unpack(const uint16_t* in, int64_t rows, int rank, uint16_t* y16, int64_t ld, void* stream) {
+    if (rows <= 0) return;
+    tp_y16_pack_kernel<<<blocks_for(rows * (HV / 2) * S / 8), 256, 0, (cudaStream_t) stream>>>(y16, ld > 0 ? ld : (int64_t) HV * S, rows, rank,
+                                                                                               const_cast<uint16_t*>(in), 1);
+    check("tp_y16_unpack");
+}
+void tp_gdn_merge(float* dst, const float* src, int64_t layers, int64_t per_layer, int rank, void* stream) {
+    if (layers <= 0) return;
+    tp_gdn_merge_kernel<<<blocks_for(layers * per_layer), 256, 0, (cudaStream_t) stream>>>(dst, src, layers, per_layer, rank);
+    check("tp_gdn_merge");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,

@@ -291,6 +291,19 @@ public:
                        int64_t min_last, std::string& err);
     static std::shared_ptr<DpLink> make_dp_link(int n_layers, int dev_a, int dev_b, std::string& err);
 
+    /// [claude] TENSOR-PARALLEL prompt path (STRATA_TP_PREFILL=1, docs/STRATA_TP_PREFILL_DESIGN_20261101.txt).  The two DP
+    /// paths (set_dp, the same link and foreign sessions) read the SAME chunks together, every layer on both GPUs: each
+    /// owns half of a chunk's tokens (a: the first) for the per-token work, the GDN layers run by head half over all the
+    /// chunk's tokens, the QSA layers by query half (both append every K/V cell), the routed experts by id (each GPU the
+    /// experts its cache holds and its share of the others, for every token; FP16 partial sums back to the owners).
+    /// Chunks of up to `chunk` tokens (and the layouts').  The drafter's GPU (b) reports at least the prompt's last
+    /// `min_last` positions through its on_chunk.  false with err "prefill TP: ..." before anything ran: not applicable
+    /// (the caller reads the prompt another way).
+    static bool run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
+                       int64_t min_last, std::string& err);
+    /// STRATA_TP_PREFILL=1 (default off)
+    static bool tp_prefill_env();
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
@@ -323,6 +336,17 @@ private:
     std::vector<int32_t> dp_res_;       ///< this GPU's residency view for one prompt (foreign layers -1)
     bool dp_active_ = false;
     bool dp_wait(int64_t l, int64_t k, std::string& err);
+    // [claude] TP prefill (run_tp): this run's mode, the chunk counter the exchanges are numbered by, the drafter's tail,
+    // which experts this GPU computes ([l * n_expert + e] = 1), the GDN head halves' hand-back
+    bool tp_active_ = false;
+    int64_t tp_chunk_ = 0;
+    int64_t tp_report_from_ = 0;            // the first prompt position the drafter's path reports (n - min_last)
+    std::vector<uint8_t> tp_mine_;
+    bool tp_post(int64_t l, int x, std::string& err);                    // this GPU's exchange x of layer l is sent
+    bool tp_take(int64_t l, int x, void* stream, std::string& err, int64_t want = -1);   // the other GPU's has landed
+                                                                                          // (for chunk `want`, -1: this one)
+    bool tp_send(int64_t l, int x, void* dst, const void* src, size_t bytes, std::string& err);
+    bool tp_gdn_back(std::string& err);                                  // each GDN layer's other head half to its owner
     bool dp_publish(int64_t l, int64_t k, int64_t p0, int64_t T, std::string& err);
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0;

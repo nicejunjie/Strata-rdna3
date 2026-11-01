@@ -988,6 +988,8 @@ endif()
     target_link_libraries(hip_gdn_rec_head PRIVATE strata_prefill strata_hip_runtime)
     add_test(NAME hip_gdn_rec_head COMMAND hip_gdn_rec_head)
     list(APPEND _strata_hip_tests hip_gdn_rec_head)
+    add_executable(hip_gdn_tp_half tests/hip/gdn_tp_half.cpp)   # [claude] TP prefill: the GDN head halves bit for bit
+    target_link_libraries(hip_gdn_tp_half PRIVATE strata_prefill strata_hip_runtime)
     add_executable(hip_gdn_chunked tests/hip/gdn_chunked.cpp)
     target_link_libraries(hip_gdn_chunked PRIVATE strata_prefill strata_hip_runtime)
     add_test(NAME hip_gdn_chunked COMMAND hip_gdn_chunked)
