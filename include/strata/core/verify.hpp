@@ -162,6 +162,9 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// [claude] N2: capture_all also captures the long-context twins (STRATA_TOPK_SPLIT_MIN) - the pipelined decode's
+    /// verifiers; off where the stage verifiers never decode past the threshold pipelined (tensor parallel)
+    void set_eager_long(bool on) { eager_long_ = on; }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -610,6 +613,7 @@ private:
     cudaGraphExec_t exec_l_[9] = {}, exec_nr_l_[9] = {};
     bool launched_l_[9] = {}, launched_nr_l_[9] = {};
     bool long_ = false;
+    bool eager_long_ = true;
     void refresh_long(int64_t pos0);
     cudaGraphExec_t& ex(int T) { return long_ ? (ar_off_ ? exec_nr_l_[T] : exec_l_[T]) : (ar_off_ ? exec_nr_[T] : exec_[T]); }
     bool& lau(int T) { return long_ ? (ar_off_ ? launched_nr_l_[T] : launched_l_[T]) : (ar_off_ ? launched_nr_[T] : launched_[T]); }

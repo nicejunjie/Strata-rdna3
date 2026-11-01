@@ -9885,6 +9885,7 @@ int main(int argc, char** argv) {
                 for (int par = 0; par < 2; ++par) {
                     strata::core::Verifier& v = stage_ver_p(st, par);
                     const strata::core::OnDevice on(v.device());
+                    v.set_eager_long(!tp_on);   // [claude] N2: the long twins up front only where the decode runs pipelined
                     if (!v.capture_all(e)) return false;
                 }
             if (!mtp.prepare_prefill(e)) return false;

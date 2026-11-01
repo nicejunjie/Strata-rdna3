@@ -4945,7 +4945,7 @@ bool Verifier::capture_all(std::string& err) {
     {
         static const int64_t split_min = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT_MIN"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
         static const bool eager = [] { const char* v = std::getenv("STRATA_TOPK_SPLIT_EAGER"); return v == nullptr || std::atoi(v) != 0; }();
-        if (split_min > 0 && eager) {
+        if (split_min > 0 && eager && eager_long_) {
             const bool long_was = long_, ar_was = ar_off_;
             long_ = true;
             ar_off_ = false;
