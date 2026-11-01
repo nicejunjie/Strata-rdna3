@@ -23,13 +23,16 @@ static int block_bytes(int t) {
         case 13: return 176;   // Q5_K / 256
         case 18: return 98;    // IQ3_XXS / 256
         case 22: return 82;    // IQ2_S / 256
+        case 16: return 66;    // IQ2_XXS / 256
+        case 17: return 74;    // IQ2_XS / 256
+        case 42: return 18;    // Q2_0 / 64
         case 20: return 18;    // IQ4_NL / 32
         case 7: return 24;     // Q5_1 / 32
         case 8: return 34;     // Q8_0 / 32
         default: return 0;
     }
 }
-static int block_vals(int t) { return (t == 20 || t == 7 || t == 8) ? 32 : 256; }
+static int block_vals(int t) { return (t == 20 || t == 7 || t == 8) ? 32 : t == 42 ? 64 : 256; }
 
 static cudaEvent_t g_mid;
 static void mid_hook(void* s) { cudaEventRecord(g_mid, (cudaStream_t) s); }
@@ -56,6 +59,26 @@ int main(int argc, char** argv) {
     uint8_t* blobs = nullptr;
     CK(cudaMalloc(&blobs, blob * E));
     CK(cudaMemset(blobs, 0x11, blob * E));
+    if (getenv("PF_BENCH_RANDOM")) {   // random codes (every codebook entry / sign pattern), the block's halves small
+        std::vector<uint8_t> hb(blob * E);
+        std::mt19937 rb(11);
+        for (auto& v : hb) v = (uint8_t) rb();
+        auto fix = [&](size_t off, size_t rows, size_t row_bytes, int t) {
+            const int bb = block_bytes(t), nh = (t == 12 || t == 13 || t == 7) ? 2 : 1;
+            for (int e = 0; e < E; ++e)
+                for (size_t r = 0; r < rows; ++r)
+                    for (size_t o = 0; o + bb <= row_bytes; o += bb) {
+                        uint8_t* p = hb.data() + (size_t) e * blob + off + r * row_bytes + o;
+                        for (int k = 0; k < nh; ++k) {   // a half in [2^-9, 2^-6): exponent 6..8, any sign / mantissa
+                            const uint16_t h = (uint16_t) (((6 + rb() % 3) << 10) | (rb() & 0x3FF) | ((rb() & 1) << 15));
+                            p[2 * k] = (uint8_t) h; p[2 * k + 1] = (uint8_t) (h >> 8);
+                        }
+                    }
+        };
+        fix(0, 1280, g.gu_row, gu);
+        fix(g.down_off, 2560, g.d_row, dt);
+        CK(cudaMemcpy(blobs, hb.data(), hb.size(), cudaMemcpyHostToDevice));
+    }
     f::Batch b;
     b.e0 = 0; b.e1 = E;
     for (int e = 0; e < E; ++e) b.blob[e] = blobs + (size_t) e * blob;
@@ -114,11 +137,11 @@ int main(int argc, char** argv) {
     // a hash of the down rows (the whole chain's output), to compare builds bit for bit
     std::vector<uint32_t> hd((size_t) n * 2560);
     CK(cudaMemcpy(hd.data(), dm, hd.size() * 4, cudaMemcpyDeviceToHost));
-    unsigned long long hh = 0;   // XOR of per-row hashes: the grouping's slot order (atomics) does not change it
+    unsigned long long hh = 0;   // sum of per-row hashes: the grouping's slot order (atomics) does not change it
     for (int64_t r = 0; r < n; ++r) {
         unsigned long long hr = 1469598103934665603ull;
         for (int c = 0; c < 2560; ++c) hr = (hr ^ hd[(size_t) r * 2560 + c]) * 1099511628211ull;
-        hh ^= hr;
+        hh += hr;
     }
     std::printf("gu %d d %d N %lld E %d K %d rows/expert %.0f | gate/up %.3f ms (%.1f TFLOPS) | down %.3f ms (%.1f TFLOPS) | hash %016llx\n",
                 gu, dt, (long long) N, E, K, (double) n / E, gu_ms, fl_gu / gu_ms / 1e9, d_ms, fl_d / d_ms / 1e9, hh);
