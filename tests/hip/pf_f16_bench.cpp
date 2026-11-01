@@ -114,8 +114,12 @@ int main(int argc, char** argv) {
     // a hash of the down rows (the whole chain's output), to compare builds bit for bit
     std::vector<uint32_t> hd((size_t) n * 2560);
     CK(cudaMemcpy(hd.data(), dm, hd.size() * 4, cudaMemcpyDeviceToHost));
-    unsigned long long hh = 1469598103934665603ull;
-    for (uint32_t v : hd) hh = (hh ^ v) * 1099511628211ull;
+    unsigned long long hh = 0;   // XOR of per-row hashes: the grouping's slot order (atomics) does not change it
+    for (int64_t r = 0; r < n; ++r) {
+        unsigned long long hr = 1469598103934665603ull;
+        for (int c = 0; c < 2560; ++c) hr = (hr ^ hd[(size_t) r * 2560 + c]) * 1099511628211ull;
+        hh ^= hr;
+    }
     std::printf("gu %d d %d N %lld E %d K %d rows/expert %.0f | gate/up %.3f ms (%.1f TFLOPS) | down %.3f ms (%.1f TFLOPS) | hash %016llx\n",
                 gu, dt, (long long) N, E, K, (double) n / E, gu_ms, fl_gu / gu_ms / 1e9, d_ms, fl_d / d_ms / 1e9, hh);
     return 0;

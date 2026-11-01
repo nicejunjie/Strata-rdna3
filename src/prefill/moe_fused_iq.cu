@@ -1068,6 +1068,9 @@ typedef float nh_f8 __attribute__((ext_vector_type(8)));
 #ifndef STRATA_NH_NOPF
 #define STRATA_NH_NOPF 1   // B fetched at its stage (no register prefetch: -64 VGPRs)
 #endif
+#ifndef STRATA_NH_COLSKIP
+#define STRATA_NH_COLSKIP 1   // [claude] pair kernel: skip the matrix work of empty 16-token columns
+#endif
 constexpr int HLD = 72;
 // STRATA_PF_F16_CHECK=1 (debug): the largest |value| the FP16 rows see (activations and H, as float bits; FP16 saturates
 // at 65504), reported after each prompt chunk's experts
@@ -1420,6 +1423,12 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
         for (int s = 0; s < NS; ++s) {
             __syncthreads();                              // stage s's weights and B are in LDS
             if (on) {
+#if STRATA_NH_COLSKIP
+                // [claude] the wave's 16-token columns past the item's rows do no matrix work (wave-uniform: the same rows
+                // for the whole item); their accumulators stay 0 and are never stored - the stored rows are unchanged
+                const int ncol = min(4, (nrows - 64 * wn + 15) >> 4);
+                if (ncol == 4) {
+#endif
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {   // (an explicit LDS ping-pong forced with sched_barrier: 215 VGPRs, slower)
                     const nh_h16 B0 = nh_ld(&bt[64 * wn + l16][16 * q]), B1 = nh_ld(&bt[64 * wn + 16 + l16][16 * q]);
@@ -1434,6 +1443,22 @@ native_h11p_kernel(const Batch b, const NativeGeom geo, const Tables tb, const _
                     acc[1][2] = nh_wmma(A1, B2, acc[1][2]);
                     acc[1][3] = nh_wmma(A1, B3, acc[1][3]);
                 }
+#if STRATA_NH_COLSKIP
+                } else {
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const nh_h16 A0 = nh_ld(&wt[32 * wm + l16][16 * q]), A1 = nh_ld(&wt[32 * wm + 16 + l16][16 * q]);
+#pragma unroll
+                        for (int nt = 0; nt < 3; ++nt) {
+                            if (nt < ncol) {
+                                const nh_h16 Bn = nh_ld(&bt[64 * wn + 16 * nt + l16][16 * q]);
+                                acc[0][nt] = nh_wmma(A0, Bn, acc[0][nt]);
+                                acc[1][nt] = nh_wmma(A1, Bn, acc[1][nt]);
+                            }
+                        }
+                    }
+                }
+#endif
             }
             if (s + 1 < NS) {
                 __syncthreads();                          // every wave is done with stage s's buffers
