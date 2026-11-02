@@ -14208,6 +14208,7 @@ int main(int argc, char** argv) {
             static const int64_t late_w = [] { const char* v = std::getenv("STRATA_REFILL_OVERLAP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
             static const int64_t late_nt = [] { const char* v = std::getenv("STRATA_REFILL_TRANCHES"); return v ? (int64_t) std::max(1, std::atoi(v)) : (int64_t) 4; }();
             bool dp_read_req = false;   // [claude] this request's prompt was read by the DP path (STRATA_REFILL_HEAD_DP)
+            bool tpp_read_req = false;  // [claude] this request's prompt was read by the TP prompt path (STRATA_REFILL_HEAD_TP_KEEP)
             int64_t req_prompt_n = 0;   // [claude] this request's prompt tokens (STRATA_REFILL_HEAD_MIN)
             auto late_stream_of = [&](const PfPart& p) -> cudaStream_t {
                 if (p.dev < 0) return adapt_stream;
@@ -14289,8 +14290,19 @@ int main(int argc, char** argv) {
                 static const int64_t late_head2 = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
                 static const int64_t late_head2_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) INT64_MAX; }();
                 const int64_t head_want = late_head2 >= 0 && req_prompt_n >= late_head2_min ? late_head2 : late_head;
-                const size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
-                                          ? std::min(rows.size(), (size_t) head_want) : 0;
+                // [claude] STRATA_REFILL_HEAD_TP_KEEP=<n slots> (P16K): after a prompt the TP prompt path read (both cards
+                // busy to its last layer, so neither card's loan went back during it), every lent row of a part but its
+                // n coldest joins before the first token; a part of at most n rows keeps the late refill as before.
+                // Only after TP reads: a DP read's first card refilled beside the second's last chunk, and its TTFT keeps.
+                static const int64_t late_head_tp_keep = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_KEEP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
+                size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
+                                    ? std::min(rows.size(), (size_t) head_want) : 0;
+                // STRATA_REFILL_HEAD_TP_MIN=<tokens> (default 0): only after a prompt of at least that many tokens (an 8K
+                // TP read's loan is refilled beside the first windows at no measured decode cost; a head there costs TTFT)
+                static const int64_t late_head_tp_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                if (paced && tpp_read_req && late_head_tp_keep >= 0 && req_prompt_n >= late_head_tp_min &&
+                    rows.size() > (size_t) late_head_tp_keep)
+                    head_n = std::max(head_n, rows.size() - (size_t) late_head_tp_keep);
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
@@ -14598,6 +14610,7 @@ int main(int argc, char** argv) {
                                                          std::min(o.prefill_chunk, tpp_chunk_for(tn, o.prefill_chunk)),
                                                          kDpMinLast, te)) {
                         dp_read_req = true;
+                        tpp_read_req = true;
                         return true;
                     }
                     if (te.rfind("prefill TP: ", 0) != 0) { e = te; return false; }   // it ran: the state is not usable
@@ -15157,6 +15170,7 @@ int main(int argc, char** argv) {
             bool cancelled = false;
             tr("prompt start", n - 1);
             req_prompt_n = n;
+            tpp_read_req = false;   // [claude] (set by this request's TP read)
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
