@@ -27,38 +27,56 @@
 
 ## RDNA3 / RX 7900 XTX fork
 
-Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, with
-every expert computed (no expert skipping). Lines are the median of 3 trials (the faint band is the trial range); every
-request was checked for exact input length, 256 output tokens and correct retrieval.
+Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, release
+`claude-20261101-rg23`, with every expert computed (no expert skipping). Lines are the median of 3 trials (the faint band
+is the trial range); every request was checked for exact input length, 256 output tokens and correct retrieval, with no
+prompt cache.
 
-<p align="center"><img src="docs/media/rdna3/decode.png" width="49%" alt="Flash-Next decode speed, 1 and 2 RX 7900 XTX"> <img src="docs/media/rdna3/prefill.png" width="49%" alt="Flash-Next prefill speed, 1 and 2 RX 7900 XTX"></p>
-<p align="center"><img src="docs/media/rdna3/at-32k.png" width="49%" alt="Flash-Next at 32K context"> <img src="docs/media/rdna3/stock-to-tuned.png" width="49%" alt="Stock Strata to this fork on the RX 7900 XTX"></p>
-<p align="center"><img src="docs/media/rdna3/vs-rtx4090.png" width="49%" alt="Two RX 7900 XTX against a public RTX 4090 run on the same requests"></p>
+**What the prompts are.** Each prompt is N tokens of synthetic warehouse records with 3 hidden codes. The model returns
+the codes, then writes either an inventory-auditing guide (**English prose**) or a Python inventory-auditing module
+(**Python code**). Decode speed depends on the text: the model's MTP head drafts ahead, and code drafts are accepted more
+often (about 78 % vs 61 %), so code decodes 19-37 % faster on the same hardware. Compare tok/s only on the same kind
+of text.
 
-| Flash-Next, tokens/s (prefill / decode) | 32K | 128K | ≈256K |
+<p align="center"><img src="docs/media/rdna3/prefill.png" width="49%" alt="Flash-Next prefill speed, 1 and 2 RX 7900 XTX"> <img src="docs/media/rdna3/vs-rtx4090.png" width="49%" alt="1 and 2 RX 7900 XTX against a public RTX 4090 run on the same requests"></p>
+<p align="center"><img src="docs/media/rdna3/decode-acceptance-english.png" width="49%" alt="English prose: decode speed and MTP acceptance"> <img src="docs/media/rdna3/decode-acceptance-code.png" width="49%" alt="Python code: decode speed and MTP acceptance"></p>
+
+| Flash-Next, tokens/s | prefill 32K / 128K / ≈256K | decode, English prose 32K / 128K / ≈256K | decode, Python code 32K / 128K / ≈256K |
 |---|---|---|---|
-| IQ3_S, 2 GPUs | 6,020 / 124.3 | 6,426 / 122.9 | 5,909 / 118.2 |
-| IQ3_S, 1 GPU | 3,432 / 100.0 | 3,436 / 100.4 | 3,091 / 93.6 |
-| UD-IQ4_XS, 2 GPUs | 5,550 / 110.8 | 6,193 / 112.0 | 5,728 / 108.4 |
-| UD-IQ4_XS, 1 GPU | 3,140 / 77.7 | 3,201 / 82.5 | 2,903 / 77.5 |
-| UD-Q4_K_XL, 2 GPUs | 4,711 / 97.5 | 5,724 / 101.7 | 5,309 / 92.7 |
-| UD-Q4_K_XL, 1 GPU | 3,511 / 67.5 | 3,556 / 67.0 | 3,127 / 56.2 |
+| IQ3_S, 2 GPUs | 6,780 / 6,781 / 6,402 | 132.7 / 137.2 / 129.6 | 169.9 / 162.7 / 161.8 |
+| IQ3_S, 1 GPU | 3,541 / 3,553 / 3,311 | 114.1 / 112.9 / 111.8 | 139.3 / 142.7 / 138.1 |
+| UD-IQ4_XS, 2 GPUs | 7,075 / 7,086 / 6,580 | 127.8 / 123.6 / 121.6 | 167.1 / 159.1 / 158.4 |
+| UD-IQ4_XS, 1 GPU | 3,455 / 3,480 / 3,251 | 94.2 / 91.9 / 89.0 | 122.3 / 120.6 / 117.3 |
+| UD-Q4_K_XL, 2 GPUs | 5,381 / 6,878 / 6,560 | 109.5 / 105.6 / 102.9 | 139.4 / 135.6 / 134.1 |
+| UD-Q4_K_XL, 1 GPU | 3,613 / 3,676 / 3,429 | 78.3 / 80.9 / 72.1 | 95.6 / 98.3 / 95.6 |
 
-Against stock Strata on the same card (UD-IQ4_XS, 32K): prefill 1,151 -> 3,140 tok/s on one GPU and 1,727 -> 5,550 on
-two; decode 55.7 -> 77.7 and 51.2 -> 110.8 tok/s.
+Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). 2 GPUs: tensor parallel for IQ3_S and
+UD-IQ4_XS, pipeline (layer split) for UD-Q4_K_XL.
+
+**Against an RTX 4090** (IQ3_S, the exact requests of the public
+[nvidia-4090-flash-next-inference](https://github.com/AnnoyingTechnology/nvidia-4090-flash-next-inference) run of
+2026-10-04 on a 24 GB RTX 4090, replayed here): decode at 32K / 128K is 119 / 108 tok/s on the 4090, 117 / 117 on one
+7900 XTX and 142 / 140 on two; fresh 32K prefill 4,672 vs 3,541 and 6,780 tok/s. Against stock Strata on the same card
+(UD-IQ4_XS, 32K): prefill 1,151 -> 3,455 tok/s on one GPU and 1,727 -> 7,075 on two.
 
 **What the fork adds** (all gfx1100 HIP; most are opt-in environment switches, so stock behaviour is unchanged):
-- Decode: RDNA hyper-connection reads (int8 / int8-activation, fused down+up with a grid barrier), multi-column
-  Q4_K/Q5_K/Q6_K/IQ4_XS GEMVs, fused router publish, fused waits and CPU-row combine, a register top-k for QSA at
-  262K capacity, `--pcie-frac 0` for layer split.
+- Decode: tensor-parallel decode on two cards for IQ3_S / UD-IQ4_XS; RDNA hyper-connection reads (int8 /
+  int8-activation, fused down+up with a grid barrier); multi-column Q4_K/Q5_K/Q6_K/IQ4_XS GEMVs; fused router publish,
+  fused waits and CPU-row combine; a register top-k for QSA at 262K capacity, split across many CTAs past 96K
+  (`STRATA_TOPK_SPLIT_MIN=98304`, 256K decode 5-9 % faster per window); adaptive expert cache swaps every window;
+  `--pcie-frac 0` for layer split; long-context verify graphs captured at start on the pipelined layer split.
 - Prefill: matrix-core (WMMA) prompt attention and QSA selection (imported from
-  [xyzzing/Strata](https://github.com/xyzzing/Strata)), the chunked GDN recurrence on FP16 matrix cores, FP16-operand
-  expert kernels, K-quant MMQ, a dual-GPU data-parallel prompt path (`STRATA_DP_PREFILL=1`), LDS-staged attention.
+  [xyzzing/Strata](https://github.com/xyzzing/Strata)); the chunked GDN recurrence on FP16 matrix cores; FP16 pair
+  expert kernels (empty-column skip, 3 blocks a WGP, FP16 IQ codebooks); prompt hyper-connection kernels (upmix at 512
+  threads, vectorised write+norm); K-quant MMQ; a dual-GPU data-parallel prompt path (`STRATA_DP_PREFILL=1`, chunk
+  8448 on IQ3_S); a routed CPU+GPU expert walk for short prompts on the Q4 layer split; LDS-staged attention.
 - Loading: on Linux the expert arena is read with O_DIRECT when the page cache could not keep it (a 72 GB Q4 arena
   loads at ~1.9 instead of ~1.0 GiB/s).
-- Fixes: MTP top-2 accounting, a one-token-window commit, a host deadlock in fused prefill batches.
+- CPU: IQ AVX-512 init stays safe on AVX2-only hosts (PR #1).
+- Fixes: MTP top-2 accounting, a one-token-window commit, a host deadlock in fused prefill batches, a graph-capture
+  failure on the first decode past 98K on the Q4 layer split.
 
-**Reproduce it:** [`rdna3/README.md`](rdna3/README.md) goes from a clean Linux install to the table above: pinned
+**Reproduce it:** [`rdna3/README.md`](rdna3/README.md) goes from a clean Linux install to these six setups: pinned
 toolchain (`./setup.sh --build` installs ROCm, rocWMMA and llama.cpp at fixed versions and compiles the engine with
 the fork's options), the six measured setups as ready configs (`rdna3/run.py`), and the benchmark that produced the
 numbers (`rdna3/bench.py`, compared against `rdna3/reference.json`).
