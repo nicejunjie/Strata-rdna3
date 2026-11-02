@@ -1,6 +1,7 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/artifact/gguf_reader.hpp"   // [claude] TP prefill: block_geometry (native_rows)
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -151,6 +152,37 @@ constexpr int kHelpEvents = 512;
 // [claude] DP share (STRATA_DP_SHARE=1, opt-in): on the DP prompt path each expert both cards would stream is
 // streamed by one of them, which computes it for both chunks (docs/STRATA_DP_SHARE_DESIGN_20261021.txt); the other
 // chunk's tokens go through it in pieces of STRATA_DP_SHARE_TOK (default 2048) tokens
+// [claude] TP prefill (Prefill::run_tp, docs/STRATA_TP_PREFILL_DESIGN_20261101.txt): STRATA_TP_PREFILL=1
+inline bool tp_prefill_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_TP_PREFILL"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+// [claude] TP prefill: prompts of STRATA_TP_PREFILL_MIN (default 4096) .. STRATA_TP_PREFILL_MAX (default 32768) tokens;
+// a layout for chunks of at least the minimum carves the exchange buffers (tp_bytes) outside the shared region
+inline int64_t tp_min_tokens() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MIN"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 4096; }();
+    return v;
+}
+std::atomic<bool> g_tp_layout_next{false};   // Prefill::set_tp_layout: the layouts made from here are for TP reads
+inline bool tp_layout(size_t T) { return tp_prefill_on() && g_tp_layout_next.load() && (int64_t) T >= tp_min_tokens(); }
+// the exchange buffers of a layout for chunks of T tokens (rows of the larger half): incoming a/b gates (96 f32), GDN
+// half outputs (3072 f16), K/V/indexer keys (1152 f32), expert inputs (2560 f16 + 10 ids + 10 weights), partial sums
+// (2560 f16); one outgoing block (the larger of the GDN half and the sums); the routing with the dummy expert (T x 10)
+inline double tp_split_frac();
+inline size_t tp_half_rows(size_t T) { return (size_t) ((double) T * std::max(tp_split_frac(), 1.0 - tp_split_frac())) + 64; }   // (the larger share)
+// [claude] TP prefill: a chunk of T tokens is split [0, a) on the first path, [a, T) on the second (a on the 32-token
+// grid of the GDN chunk kernels, so the recurrence run in two token ranges keeps its chunks)
+// (STRATA_TP_PREFILL_SPLIT: the first path's share, default 0.53 - the second path's queries attend to more cells)
+inline double tp_split_frac() {
+    static const double f = [] { const char* v = std::getenv("STRATA_TP_PREFILL_SPLIT"); return v ? std::clamp(std::atof(v), 0.3, 0.7) : 0.53; }();
+    return f;
+}
+inline int64_t tp_split(int64_t T) {
+    static const double f = tp_split_frac();
+    return std::max<int64_t>(std::min<int64_t>(32, T), std::min<int64_t>((int64_t) ((double) T * f) / 32 * 32, T - 32));
+}
+// [claude] TP prefill: the exchanges of a layer (DpLink::tev / tseq slots)
+enum TpX { kXGin = 0, kXGout, kXQkv, kXMin, kXMsum, kXPle, kXPle2, kXEnd };
 inline bool dp_share_env() {
     static const bool v = [] { const char* e = std::getenv("STRATA_DP_SHARE"); return e != nullptr && std::atoi(e) != 0; }();
     return v;
@@ -1112,6 +1144,17 @@ struct Prefill::Impl {
     int64_t ds_th = 0;
     cudaStream_t ds_hs = nullptr;
     bool ds_on = false;                    // this prompt runs the DP share (set by run_dp)
+    // [claude] TP prefill (run_tp): the stream of this GPU's copies to the other one, "the compute stream reached the
+    // copies' data" / "this GPU's copies are done" (its buffers may be written again), which experts it computes per
+    // layer (device flags for help_remap) and the routing with the other GPU's experts on the dummy expert
+    cudaStream_t tp_cs = nullptr;
+    cudaEvent_t tp_rdy = nullptr, tp_done = nullptr;
+    uint8_t* tp_keep = nullptr;
+    size_t tp_keep_n = 0;
+    int32_t* tp_ids = nullptr;   // carved (tp_layout): the routing, the other GPU's experts on the dummy
+    float *tp_in_ab = nullptr, *tp_in_qkv = nullptr;
+    uint16_t *tp_in_y = nullptr, *tp_in_sum = nullptr, *tp_out = nullptr;
+    uint8_t* tp_in_min = nullptr;
 };
 
 // [claude] defined before run_impl, which reads the DP share mailbox
@@ -1129,10 +1172,16 @@ struct Prefill::DpLink {
     std::vector<DsReq> req[2];
     std::vector<int64_t> sum_k[2];
     std::vector<cudaEvent_t> ev_in[2], ev_pdone[2], ev_sum[2];
+    // [claude] TP prefill: per (layer, exchange) the event path i recorded on its copy stream after that exchange's
+    // copies, and the chunk (Prefill::tp_chunk_) it was for (-1: none yet)
+    static constexpr int kTpX = 8;
+    std::vector<cudaEvent_t> tev[2];
+    std::vector<int64_t> tseq[2];
     ~DpLink() {
         for (int i = 0; i < 2; ++i) {
             const core::OnDevice on(dev[i]);
             for (cudaEvent_t e : ev[i]) if (e) cudaEventDestroy(e);
+            for (cudaEvent_t e : tev[i]) if (e) cudaEventDestroy(e);
             for (auto* v : {&ev_in[i], &ev_pdone[i], &ev_sum[i]})
                 for (cudaEvent_t e : *v) if (e) cudaEventDestroy(e);
         }
@@ -1208,6 +1257,10 @@ void Prefill::release() {
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
     if (impl_->hist_dev) { cudaFree(impl_->hist_dev); impl_->hist_dev = nullptr; }   // [claude] route_hist
+    if (impl_->tp_cs) { cudaStreamSynchronize(impl_->tp_cs); cudaStreamDestroy(impl_->tp_cs); impl_->tp_cs = nullptr; }   // [claude] TP prefill
+    for (cudaEvent_t* e : {&impl_->tp_rdy, &impl_->tp_done}) if (*e) { cudaEventDestroy(*e); *e = nullptr; }
+    if (impl_->tp_keep) { cudaFree(impl_->tp_keep); impl_->tp_keep = nullptr; impl_->tp_keep_n = 0; }
+
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1793,6 +1846,20 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ds_gu = o.take<uint8_t>(fused::group_bytes((int64_t) (th * K), (int) m.g->n_expert + 1), ok);
         m.ds_h = o.take<uint16_t>(th * K * 640, ok); m.ds_dm = o.take<float>(th * K * N, ok);
         m.ds_sum = o.take<uint16_t>(th * N, ok); m.ds_own = o.take<int32_t>(T * K, ok);
+    }
+    m.tp_ids = nullptr;   // [claude] TP prefill's exchange buffers (bytes_needed_impl takes the same)
+    m.tp_in_ab = m.tp_in_qkv = nullptr;
+    m.tp_in_y = m.tp_in_sum = m.tp_out = nullptr;
+    m.tp_in_min = nullptr;
+    if (tp_layout(T)) {
+        const size_t th = tp_half_rows(T);
+        m.tp_ids = o.take<int32_t>(T * K, ok);
+        m.tp_in_ab = o.take<float>(th * 2 * HV, ok);
+        m.tp_in_y = o.take<uint16_t>(th * (ZV / 2), ok);
+        m.tp_in_qkv = o.take<float>(th * (512 + 512 + 128), ok);
+        m.tp_in_min = o.take<uint8_t>(th * (N * 2 + K * 8), ok);
+        m.tp_in_sum = o.take<uint16_t>(th * N, ok);
+        m.tp_out = o.take<uint16_t>(th * std::max<size_t>(ZV / 2, N), ok);
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
@@ -2698,6 +2765,12 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<uint16_t>(th * K * 640, ok); o.take<float>(th * K * N, ok);
         o.take<uint16_t>(th * N, ok); o.take<int32_t>(T * K, ok);
     }
+    if (tp_layout(T)) {   // [claude] TP prefill: carve's takes
+        const size_t th = tp_half_rows(T);
+        o.take<int32_t>(T * K, ok); o.take<float>(th * 2 * HV, ok); o.take<uint16_t>(th * (ZV / 2), ok);
+        o.take<float>(th * (512 + 512 + 128), ok); o.take<uint8_t>(th * (N * 2 + K * 8), ok); o.take<uint16_t>(th * N, ok);
+        o.take<uint16_t>(th * std::max<size_t>(ZV / 2, N), ok);
+    }
     if (owned_pages) {
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
     } else {
@@ -2786,6 +2859,21 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
     const bool ct = g_cold.begin();
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
+    return true;
+}
+// [claude] TP prefill: output rows [r0, r0 + nr) of a native matrix (columns [r0, r0 + nr) of Y, row stride ldy) - the same
+// GGUF rows the whole product dequantizes, so the same products per element
+bool native_rows(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, int64_t r0, int64_t nr,
+                 int64_t ldy, const std::string& name, std::string& err) {
+    if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    int be = 0, bb = 0;
+    if (!strata::block_geometry((uint32_t) w->native_type, be, bb) || be <= 0 || w->ne0 % be || r0 + nr > w->ne1) {
+        err = "prefill TP: " + name + ": no row slice";
+        return false;
+    }
+    const size_t row_bytes = (size_t) (w->ne0 / be) * (size_t) bb;
+    if (T <= 0) return true;
+    gm.native(X, w->native_type, (const uint8_t*) w->native_data + (size_t) r0 * row_bytes, Y + r0, T, nr, w->ne0, ldy, 0.0f, 0);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2965,9 +3053,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // [claude] DP (run_dp): every layer here, every other chunk; the state of a layer this GPU does not own lives in
     // the foreign session, and the PLE run is the one of the session holding layer 1
     const bool dp = dp_active_;
+    // [claude] TP prefill (run_tp): every layer and every chunk on both GPUs; the per-token work on this GPU's rows of
+    // each chunk, the states of the layers it does not own in the foreign session (as DP)
+    const bool tp = tp_active_;
     auto owns_gdn = [](const core::SessionState& S, int64_t gi) { return gi >= S.gdn_ord0 && gi < S.gdn_ord0 + S.gdn_alloc; };
     auto owns_qsa = [](const core::SessionState& S, int64_t qi) { return qi >= S.qsa_ord0 && qi < S.qsa_ord0 + S.qsa_alloc; };
-    core::PleRun& PR = (dp && dp_foreign_ != nullptr && !ss.ple.ready() && dp_foreign_->ple.ready()) ? dp_foreign_->ple : ss.ple;
+    core::PleRun& PR = ((dp || tp) && dp_foreign_ != nullptr && !ss.ple.ready() && dp_foreign_->ple.ready()) ? dp_foreign_->ple : ss.ple;
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
@@ -3015,8 +3106,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
     const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
                                                   : pipe_chunked_;
-    const bool helped = !dp && single_chunk && bind_stage_helper(n);
-    if (!helped && !dp && std::getenv("STRATA_PREFILL_TIMING") != nullptr && helper_ != nullptr)   // [claude]
+    const bool helped = !dp && !tp && single_chunk && bind_stage_helper(n);
+    if (!helped && !dp && !tp && std::getenv("STRATA_PREFILL_TIMING") != nullptr && helper_ != nullptr)   // [claude]
         std::fprintf(stderr, "strata prefill: not helped: %lld tokens (one chunk %d, layout %lld)\n", (long long) n,
                      (int) single_chunk, (long long) m.T);
     if (helped) std::swap(m.pp, m.help_pp);
@@ -3076,8 +3167,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         return n;
     };
-    auto ple_gather = [&m, &PR, tokens, n, prev0, step_at](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(step_at(c0), n - c0);
+    auto ple_gather = [&m, &PR, tokens, n, prev0, step_at, tp, this](int64_t c0, int buf, std::string& e) -> bool {
+        int64_t T = std::min(step_at(c0), n - c0);
+        int64_t o = 0;   // [claude] TP prefill: this path's rows of the chunk only
+        if (tp) { const int64_t a = tp_split(T); o = dp_index_ == 0 ? 0 : a; T = dp_index_ == 0 ? a : T - a; c0 += o; }
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -3087,7 +3180,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pv[0] = pv[1];
             pv[1] = tok;
         }
-        return PR.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        const auto tg0 = Clock::now();
+        const bool gok = PR.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        if (static const bool dbg = std::getenv("STRATA_PLE_TIMING") != nullptr; dbg)   // [claude] debug: the gather's own time
+            std::fprintf(stderr, "strata ple gather: path %d, %lld rows from %lld in %.1f ms\n", tp ? dp_index_ : -1, (long long) T,
+                         (long long) c0, ms_since(tg0));
+        return gok;
     };
     std::string ple_next_err;
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
@@ -3118,6 +3216,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(step_at(c0), n - c0), p0 = pos0 + c0;
+        // [claude] TP prefill: this path's rows of the chunk [o0, o0 + To) for the per-token work, the other's [po0, po0 + Tp)
+        const int64_t tsplit = tp ? tp_split(T) : 0;
+        const int64_t o0 = tp && dp_index_ == 1 ? tsplit : 0, To = tp ? (dp_index_ == 0 ? tsplit : T - tsplit) : T;
+        const int64_t po0 = tp ? (dp_index_ == 0 ? tsplit : 0) : 0, Tp = T - To;
+        (void) Tp; (void) po0;
         int64_t dp_k = 0;   // [claude] DP: this chunk's index in the plan; the other path's chunks are skipped
         if (dp) {
             while (dp_k + 1 < (int64_t) dp_plan_.size() && dp_plan_[(size_t) dp_k].c0 != c0) ++dp_k;
@@ -3133,6 +3236,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const int64_t tap_t0 = 0, tap_rows = 0;
 #endif
         ++stats_.chunks;
+        if (tp) cudaStreamWaitEvent(m.cs, m.tp_done, 0);   // [claude] TP prefill: the last chunk's copies have read R
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
@@ -3227,7 +3331,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 ++t;
             }
         }
-        if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
+        if (hand_in_ == nullptr) gr_broadcast(m.emb + o0 * N, m.R + o0 * D, To, m.cs);   // [claude] TP prefill: its own rows
         // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
         // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
         // layer 1 on, and gathering them here first left the GPU idle for the whole read (~0.4 s of a 32K prompt)
@@ -3241,15 +3345,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         auto ple_land = [&]() -> bool {
             if (!ple_pending) return true;
             ple_pending = false;
-            const auto tp = Clock::now();
+            const auto t_ple = Clock::now();
             if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
             // #1996: the pageable fallback (no RAM to pin) goes up through a pinned slot; the pinned buffers as before
             if ((m.ple_pageable[ple_buf].empty()
-                     ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs)
-                     : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs)) !=
+                     ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) To * N * 4, cudaMemcpyHostToDevice, m.cs)
+                     : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) To * N * 4, m.cs)) !=
                     cudaSuccess ||
                 cudaEventRecord(m.ple_copied[ple_buf], m.cs) != cudaSuccess) {
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
@@ -3267,7 +3371,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 });
             }
             ple_buf ^= 1;
-            stats_.ms_ple += ms_since(tp);
+            stats_.ms_ple += ms_since(t_ple);
             return true;
         };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
@@ -3286,7 +3390,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (kv_pending >= 0) return true;   // one staging pool: the pending prefetch has not been consumed yet
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
-                const core::QsaState& state = (dp && dp_foreign_ != nullptr && !owns_qsa(ss, ordinal))
+                const core::QsaState& state = ((dp || tp) && dp_foreign_ != nullptr && !owns_qsa(ss, ordinal))
                                                       ? dp_foreign_->qsa_states[ordinal] : ss.qsa_states[ordinal];
                 if (state.kv_mode != 1) { ++ordinal; continue; }
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
@@ -3373,7 +3477,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         {
             static const bool r_env = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED"); return v != nullptr && std::atoi(v) != 0; }();
             static const int64_t r_max = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 2048; }();
-            rmode = r_env && stream_all && ps_on && m.pp->fused && !ds_chunk && !dp && T <= r_max && T == n && m.stager;
+            rmode = r_env && stream_all && ps_on && m.pp->fused && !ds_chunk && !dp && !tp && T <= r_max && T == n && m.stager;
             int r_why = 0;
             for (int64_t l = LB; rmode && l < LE; ++l) {
                 for (int32_t e = 0; rmode && e < m.g->n_expert; ++e) {
@@ -3469,6 +3573,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const bool hres_l = hres_on && (size_t) l < m.pp->fh_layer.size() && m.pp->fh_layer[(size_t) l];
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    if (tp && !tp_mine_[(size_t) l * m.g->n_expert + e]) continue;   // [claude] TP prefill: the other GPU's
                     if (hres_l) {
                         const size_t i = (size_t) l * m.g->n_expert + e;
                         const int32_t hs = helper_->impl_->host_res[i];
@@ -3574,8 +3679,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 strata::platform::name_this_thread("strata-issue");
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
+                // [claude] STRATA_TP_PREFILL_AHEAD (experiment, TP reads only): stream at most this share of the ring ahead
+                // of the compute, leaving the receive link room for the exchanges (1 = the whole ring, as before)
+                static const double ahead = [] { const char* v = std::getenv("STRATA_TP_PREFILL_AHEAD"); return v ? std::clamp(std::atof(v), 0.1, 1.0) : 1.0; }();
+                const size_t ring_ahead = tp ? std::max<size_t>(8, (size_t) ((double) m.ring * ahead)) : (size_t) m.ring;
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
-                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
+                    while (idx >= a_consumed.load(std::memory_order_acquire) + ring_ahead) {
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
@@ -3964,13 +4073,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // projections as GEMMs (a token at a time they re-read ~52 MB of BF16 key per token on the IQ
                 // files), the rest with the per-token kernels' arithmetic (native_ple_postops_batch)
                 pt.mark(kPfPle, cs);
-                const auto tp = Clock::now();
+                const auto t_ple = Clock::now();
                 const strata::kernels::PleWeights& pw = PR.w;
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
-                const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                for (int64_t s0 = 0; s0 < T; s0 += SB) {
-                    const int64_t nb = std::min(SB, T - s0);
+                const int64_t SB = std::min<int64_t>(To, (int64_t) (m.region_bytes / per_token));
+                // [claude] TP prefill: this path's rows; the history conv runs in token order, so the second path's waits
+                // for the first's history after its rows, and the first's next chunk for the second's
+                for (int64_t s0 = 0; s0 < To; s0 += SB) {
+                    const int64_t nb = std::min(SB, To - s0);
                     uint8_t* q = m.region;
                     auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
@@ -3992,15 +4103,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                    if (tp && s0 == 0) {
+                        if (dp_index_ == 1 && !tp_take(1, kXPle, m.cs, err)) return false;
+                        if (dp_index_ == 0 && tp_chunk_ > 0 && !tp_take(1, kXPle2, m.cs, err, tp_chunk_ - 1)) return false;
+                    }
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, PR.hist, pw, qn, gated,
+                        strata::kernels::native_ple_postops_batch(key, m.R + (o0 + s0) * D, val, PR.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
-                stats_.ms_ple += ms_since(tp);
+                if (tp) {   // [claude] TP prefill: the history after this path's rows to the other path's PLE run
+                    Prefill& Q = *dp_peer_;
+                    core::PleRun& PRq = (!Q.impl_->ss->ple.ready() && Q.dp_foreign_ != nullptr && Q.dp_foreign_->ple.ready())
+                                            ? Q.dp_foreign_->ple : Q.impl_->ss->ple;
+                    const int x = dp_index_ == 0 ? kXPle : kXPle2;
+                    if (!tp_send(1, x, PRq.hist, PR.hist, (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4, err) ||
+                        !tp_post(1, x, err))
+                        return false;
+                }
+                stats_.ms_ple += ms_since(t_ple);
             } else if (l == 1 && ple_on) {
                 pt.mark(kPfPle, cs);
-                const auto tp = Clock::now();
+                const auto t_ple = Clock::now();
                 for (int64_t t = 0; t < T; ++t) {
                     strata::kernels::PleOut po;
                     po.normalized = m.ple_norm;
@@ -4011,7 +4135,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                     strata::kernels::ple_history_advance(PR.hist, m.ple_norm, m.cs);
                 }
-                stats_.ms_ple += ms_since(tp);
+                stats_.ms_ple += ms_since(t_ple);
             }
             for (int half = 0; half < 2; ++half) {
                 // ---- the hyper-connection read of this half
@@ -4037,36 +4161,51 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!wd_q8.data || !wu_q8.data) { err = "prefill: the Q8_0 hyper-connection projections could not be dequantized"; return false; }
                     wd = &wd_q8; wu = &wu_q8;
                 }
+                if (tp) cudaStreamWaitEvent(cs, m.tp_done, 0);   // [claude] TP prefill: this GPU's last copies have read their buffers
                 pt.mark(kPfHc, cs);
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
                 const bool xf16 = m.xn_f16 && !m.xn16_lo && ldx == D;   // xn16 holds FP16 (its writers and readers below)
+                // [claude] TP prefill: the hyper-connection read on this path's rows only (o0, To; the whole chunk otherwise)
+                float* const R_o = m.R + o0 * D;
+                float* const grs_o = m.grs + o0 * HC;
+                uint16_t* const xn16_o = m.xn16 + o0 * ldx;
+                uint16_t* const xn16lo_o = m.xn16_lo ? m.xn16_lo + o0 * ldx : nullptr;
+                float* const lo_o = m.lo + o0 * LR;
+                uint16_t* const lo16_o = m.lo16 + o0 * LR;
+                uint16_t* const lo16lo_o = m.lo16_lo ? m.lo16_lo + o0 * LR : nullptr;
+                float* const inj_o = m.inj + o0 * HC;
+                float* const gated_o = m.gated + o0 * N;
+                float* const mixed_o = m.mixed + o0 * N;
+                uint16_t* const mixedbf_o = m.mixed_bf + o0 * N;
+                uint16_t* const mixedh_o = m.mixed_h ? m.mixed_h + o0 * N : nullptr;
+                uint16_t* const mixedbflo_o = m.mixed_bf_lo ? m.mixed_bf_lo + o0 * N : nullptr;
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
-                else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
+                else if (!normed) gr_norm_rs(R_o, (const float*) wn->data, EPS, grs_o, xn16_o, To, m.cs, xn16lo_o, ldx, xf16);
                 normed = false;
                 bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
                     hdown = wd->kind == core::WeightKind::Bf16InF32 && wd->data && wd->ne0 == D && wd->ne1 == LR &&
-                            m.gemm.bf16_hcd_exact(m.xn16, ldx, (const uint16_t*) wd->data, m.lo, T, LR, D);
+                            m.gemm.bf16_hcd_exact(xn16_o, ldx, (const uint16_t*) wd->data, lo_o, To, LR, D);
                 } else if (wd->q8_scale == nullptr && ldx != D) {
                     if (wd->kind != core::WeightKind::Bf16InF32 || !wd->data || wd->ne0 != D || wd->ne1 != LR ||
                         wi->kind != core::WeightKind::Bf16InF32 || !wi->data || wi->ne0 != D || wi->ne1 != HC ||
-                        !strata_pf_hcdown_bf16(m.xn16, ldx, (const uint16_t*) wd->data, (const uint16_t*) wi->data, LR,
-                                               HC, m.lo, m.inj, T, D, m.cs)) {
+                        !strata_pf_hcdown_bf16(xn16_o, ldx, (const uint16_t*) wd->data, (const uint16_t*) wi->data, LR,
+                                               HC, lo_o, inj_o, To, D, m.cs)) {
                         err = "prefill: STRATA_PF_HCDOWN could not run the hyper-connection projections";
                         return false;
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, xn16_o, lo_o, To, sd, err, 0, xn16lo_o, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                gr_silu(lo_o, lo16_o, To, m.cs, lo16lo_o);
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
-                    if (checks > 0) {   // the default pair first, kept for the comparison
+                    if (checks > 0 && !tp) {   // the default pair first, kept for the comparison
                         --checks;
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                         gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
@@ -4085,18 +4224,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      "max |diff| %.3e (%s)\n", (long long) l, half, (long long) T,
                                      std::sqrt(e2 / std::max(r2, 1e-30)), emax, upmixed ? "upmix" : "upmix refused");
                     } else {
-                        upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
-                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                        upmixed = gr_upmix(lo16_o, (const uint16_t*) wu->data, R_o, grs_o, (const float*) wn->data,
+                                           mixed_o, mixedbf_o, mixedh_o, To, m.cs);
                     }
                 }
-                if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!upmixed && !bf16_proj(m.gemm, wu, lo16_o, gated_o, To, su, err, 0, lo16lo_o, 0, m.cs)) return false;
+                if (!hcd && !bf16_proj(m.gemm, wi, xn16_o, inj_o, To, si, err, 0, xn16lo_o, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
-                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
-                             m.mixed_bf_lo);
+                    gr_mix_r(R_o, grs_o, (const float*) wn->data, gated_o, mixed_o, mixedbf_o, To, m.cs, mixedh_o,
+                             mixedbflo_o);
                 }
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
@@ -4112,9 +4251,82 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
-                    core::SessionState& gs = (dp && dp_foreign_ != nullptr && !owns_gdn(ss, gdn_index)) ? *dp_foreign_ : ss;
+                    core::SessionState& gs = ((dp || tp) && dp_foreign_ != nullptr && !owns_gdn(ss, gdn_index)) ? *dp_foreign_ : ss;
                     float* state = gs.gdn_state + (size_t) (gdn_index - gs.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    if (tp) {
+                        // [claude] TP prefill: this GPU's GDN head half over every token of the chunk.  Its rows' a/b gates
+                        // (every head) and FP16 input go to the other GPU while its rows' in-projection runs, then the
+                        // other's rows; the conv, the recurrence and the out norm of the half; the half's outputs for the
+                        // other GPU's rows go there (the recurrence in two token ranges: the first is the first GPU's rows,
+                        // which the second GPU sends while it runs the rest), the other half's for this GPU's rows come
+                        // here, and the out-projection runs on this GPU's rows with every head's input (one card's GEMM)
+                        const int r = dp_index_;
+                        Impl& pm = *dp_peer_->impl_;
+                        constexpr int64_t SH = 128, HKH = 8, CQ = 10240;   // head size, k-heads a half, the qkv channels (run_impl's C is the chunk)
+                        if (!bf16_proj(m.gemm, wa, mixedbf_o, m.ab + o0 * 2 * HV, To, v.name("ssm_alpha.weight"), err, 2 * HV, mixedbflo_o)) return false;
+                        if (!bf16_proj(m.gemm, wb, mixedbf_o, m.ab + o0 * 2 * HV + HV, To, v.name("ssm_beta.weight"), err, 2 * HV, mixedbflo_o)) return false;
+                        if (!tp_send(l, kXGin, pm.mixed_h + o0 * N, mixedh_o, (size_t) (To * N) * 2, err) ||
+                            !tp_send(l, kXGin, pm.tp_in_ab, m.ab + o0 * 2 * HV, (size_t) (To * 2 * HV) * 4, err) ||
+                            !tp_post(l, kXGin, err))
+                            return false;
+                        auto inproj = [&](int64_t t0, int64_t nt) -> bool {
+                            const uint16_t* X = m.mixed_h + t0 * N;
+                            // qkv channels: q heads [8r, 8r + 8), k heads 16 + the same, v heads 32 + [16 j + 8 r, + 8) (j < 3)
+                            const int64_t qr[5] = {r * HKH * SH, (16 + r * HKH) * SH, (32 + r * HKH) * SH, (48 + r * HKH) * SH,
+                                                   (64 + r * HKH) * SH};
+                            for (const int64_t r0 : qr)
+                                if (!native_rows(m.gemm, wqkv, X, m.qkv + t0 * CQ, nt, r0, HKH * SH, CQ, v.name("attn_qkv.weight"), err)) return false;
+                            const int64_t zr[3] = {(r * HKH) * SH, (16 + r * HKH) * SH, (32 + r * HKH) * SH};
+                            for (const int64_t r0 : zr)
+                                if (!native_rows(m.gemm, wg, X, m.z + t0 * ZV, nt, r0, HKH * SH, ZV, v.name("attn_gate.weight"), err)) return false;
+                            return true;
+                        };
+                        if (!inproj(o0, To)) return false;
+                        if (!tp_take(l, kXGin, m.cs, err)) return false;
+                        if (cudaMemcpyAsync(m.ab + po0 * 2 * HV, m.tp_in_ab, (size_t) (Tp * 2 * HV) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
+                            err = "prefill TP: the a/b rows"; return false;
+                        }
+                        if (!inproj(po0, Tp)) return false;
+                        pt.mark(kPfGdnConv, cs);
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        if (!gdn_conv_tp(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, r, m.cs)) {
+                            err = "prefill TP: the GDN conv's head half did not run"; return false;
+                        }
+                        pt.mark(kPfGdnRec, cs);
+                        const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
+                        const int64_t ly = ld_y > 0 ? ld_y : ZV;
+                        auto rec = [&](int64_t t0, int64_t nt) -> bool {
+                            if (gdn_recurrence_tp(state, m.hbuf + t0 * CQ, m.gate + t0 * HV, m.beta + t0 * HV, m.z + t0 * ZV,
+                                                  (const float*) wnm->data, EPS, m.y + t0 * ZV, m.y_h + t0 * ly, nt, m.cs, ld_y, r))
+                                return true;
+                            err = "prefill TP: the GDN recurrence's head half did not run";
+                            return false;
+                        };
+                        // the half's outputs of one token range for the other GPU, in sub-ranges of STRATA_TP_PREFILL_PIPE
+                        // tokens (default 1024, on the 32-token grid): each is packed and sent as soon as the recurrence
+                        // has it, so only the last one's copy is exposed (the recurrence in more calls: the same chunks, bits)
+                        static const int64_t pipe_t = [] { const char* v = std::getenv("STRATA_TP_PREFILL_PIPE"); return std::max<int64_t>(256, v ? std::atoll(v) : 1024) / 32 * 32; }();
+                        auto rec_send = [&](int64_t t0, int64_t nt, bool send) -> bool {
+                            for (int64_t s0 = 0; s0 < nt;) {
+                                const int64_t sn = (nt - s0 <= pipe_t + pipe_t / 2) ? nt - s0 : pipe_t;
+                                if (!rec(t0 + s0, sn)) return false;
+                                if (send) {
+                                    tp_y16_pack(m.y_h + (t0 + s0) * ly, ly, sn, r, m.tp_out + s0 * (ZV / 2), m.cs);
+                                    if (!tp_send(l, kXGout, pm.tp_in_y + s0 * (ZV / 2), m.tp_out + s0 * (ZV / 2), (size_t) (sn * (ZV / 2)) * 2, err)) return false;
+                                }
+                                s0 += sn;
+                            }
+                            return !send || tp_post(l, kXGout, err);
+                        };
+                        if (!rec_send(0, tsplit, r == 1)) return false;
+                        if (!rec_send(tsplit, T - tsplit, r == 0)) return false;
+                        if (!tp_take(l, kXGout, m.cs, err)) return false;
+                        tp_y16_unpack(m.tp_in_y, To, 1 - r, m.y_h + o0 * ly, ly, m.cs);
+                        pt.mark(kPfGdnOut, cs);
+                        if (!native_proj(m.gemm, wo, m.y_h + o0 * ly, m.bo + o0 * N, To, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                        ++gdn_index;
+                    } else {
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
@@ -4129,9 +4341,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
+                    }   // [claude] (TP prefill: else)
                 } else if (half == 0) {
                     // ======================= QSA =======================
-                    const core::QsaState& st = (dp && dp_foreign_ != nullptr && !owns_qsa(ss, qsa_index))
+                    const core::QsaState& st = ((dp || tp) && dp_foreign_ != nullptr && !owns_qsa(ss, qsa_index))
                                                    ? dp_foreign_->qsa_states[qsa_index] : ss.qsa_states[qsa_index];
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
@@ -4142,6 +4355,164 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
+                    if (tp) {
+                    // [claude] TP prefill: this GPU's rows' K, V and indexer keys first - they go to the other GPU while
+                    // its queries are projected and prepared - then the other GPU's rows of them land here
+                    const bool own_l = owns_qsa(ss, qsa_index);
+                    Impl& pm = *dp_peer_->impl_;
+                    const size_t thp = tp_half_rows((size_t) pm.T), thm = tp_half_rows((size_t) m.T);
+                    if (!native_proj(m.gemm, wk, mixedh_o, m.Kc + o0 * 512, To, v.name("attn_k.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wv, mixedh_o, m.Vc + o0 * 512, To, v.name("attn_v.weight"), err)) return false;
+                    pt.mark(kPfQsaIdxProj, cs);
+                    if (!bf16_proj(m.gemm, wik, mixedbf_o, m.idx_raw + o0 * 128, To, v.name("indexer.k_proj.weight"), err, 0, mixedbflo_o)) return false;
+                    pt.mark(kPfQsaNorm, cs);
+                    rms_rows(m.Kc + o0 * 512, (const float*) wkn->data, To * 2, 256, 256, EPS, m.cs);
+                    rope(m.Kc + o0 * 512, To, 2, 256, 512, p0 + o0, strata::kernels::rope_scaling(), m.cs);
+                    if (!tp_send(l, kXQkv, pm.tp_in_qkv, m.Kc + o0 * 512, (size_t) (To * 512) * 4, err) ||
+                        !tp_send(l, kXQkv, pm.tp_in_qkv + thp * 512, m.Vc + o0 * 512, (size_t) (To * 512) * 4, err) ||
+                        !tp_send(l, kXQkv, pm.tp_in_qkv + thp * 1024, m.idx_raw + o0 * 128, (size_t) (To * 128) * 4, err) ||
+                        !tp_post(l, kXQkv, err))
+                        return false;
+                    pt.mark(kPfQsaQ, cs);
+                    if (!native_proj(m.gemm, wq, mixedh_o, m.Qf + o0 * 12288, To, v.name("attn_q.weight"), err)) return false;
+                    if (!bf16_proj(m.gemm, wiq, mixedbf_o, m.q_idx + o0 * 512, To, v.name("indexer.q_proj.weight"), err, 0, mixedbflo_o)) return false;
+                    split_q(m.Qf + o0 * 12288, m.q + o0 * ZV, To, m.cs);
+                    rms_rows(m.q + o0 * ZV, (const float*) wqn->data, To * 24, 256, 256, EPS, m.cs);
+                    rope(m.q + o0 * ZV, To, 24, 256, 6144, p0 + o0, strata::kernels::rope_scaling(), m.cs);
+                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q + o0 * ZV, To * 24, m.cs);
+                    rms_rows(m.q_idx + o0 * 512, (const float*) wiqn->data, To * 4, 128, 128, EPS, m.cs);
+                    rope(m.q_idx + o0 * 512, To, 4, 128, 512, p0 + o0, strata::kernels::rope_scaling(), m.cs);
+                    if (!tp_take(l, kXQkv, m.cs, err)) return false;
+                    if (cudaMemcpyAsync(m.Kc + po0 * 512, m.tp_in_qkv, (size_t) (Tp * 512) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess ||
+                        cudaMemcpyAsync(m.Vc + po0 * 512, m.tp_in_qkv + thm * 512, (size_t) (Tp * 512) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess ||
+                        cudaMemcpyAsync(m.idx_raw + po0 * 128, m.tp_in_qkv + thm * 1024, (size_t) (Tp * 128) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
+                        err = "prefill TP: the K/V rows"; return false;
+                    }
+                    // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
+                    const bool staged = st.kv_mode == 1;
+                    if (staged) {
+                        pt.mark(kPfKvStage, cs);
+                        if (kv_pending == qsa_index) {
+                            if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                                err = "prefill: waiting for KV prefetch";
+                                return false;
+                            }
+                            kv_pending = -1;
+                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                            core::qsa_kv_format(st),
+                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                        pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
+                    }
+                    pt.mark(kPfQsaAppend, cs);   // [claude] the append (+ host copy) and the queries' split / norm / rope
+                    // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
+                    // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
+                    // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
+                    // first block is complete; past the chunk's last cell nothing is read until a later append writes
+                    // it).  CUDA: never.
+#if defined(STRATA_USE_HIP)
+                    static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
+#else
+                    constexpr bool kv_host_dma = false;
+#endif
+                    const bool host_by_dma = staged && kv_host_dma && own_l;   // [claude] TP: the layer's owner writes the host copy
+                    const strata::kernels::KvHostPools* host_w = host_by_dma || !own_l ? nullptr : &st.host;
+                    if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
+                        // streamed: each half writes its part of the host copy and of the staging pool
+                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
+                                                           hv = strata::kernels::kv_hybrid_v_half(st.host),
+                                                           sk = strata::kernels::kv_hybrid_k_half(m.stage),
+                                                           sv = strata::kernels::kv_hybrid_v_half(m.stage);
+                        const bool mirror = st.host.present() && own_l;
+                        kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
+                                  st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
+                                  staged ? &sk : nullptr);
+                        strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
+                                                      mirror ? &hv : nullptr, staged ? &sv : nullptr);
+                    } else {
+                        if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
+                            strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
+                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                        }
+                        if (st.kv_q4)
+                            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                          host_w, staged ? &m.stage : nullptr);
+                        else
+                            kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                      host_w, staged ? &m.stage : nullptr);
+                        if (host_by_dma)
+                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                core::qsa_kv_format(st), p0 / s.page_size,
+                                                                (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
+                    }
+                    if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+
+                    // the indexer appends, token by token; then scores + selection for many queries at once:
+                    // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    pt.mark(kPfQsaIdx, cs);
+                    // C-2: the chunk's appends in three launches instead of one per token (the same end state:
+                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                    try {
+                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                        if (!per_token) {
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             strata::kernels::rope_scaling(), m.cs);
+                        }
+                        for (int64_t t = 0; per_token && t < T; ++t) {
+                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
+                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                       strata::kernels::rope_scaling(), m.cs);
+                        }
+                    } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                    pt.mark(kPfQsaSel, cs);
+                    for (int64_t t0 = o0; t0 < o0 + To; t0 += m.sel_batch) {   // [claude] TP: this GPU's queries
+                        const int64_t nb = std::min(m.sel_batch, o0 + To - t0);
+                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                        // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
+                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                strata::kernels::kStepNBid)] + 1;
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
+                        // STRATA_SELECT_OLD=1: the warp kernel
+                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                             m.cs, active))
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
+                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                        m.sel_ids + t0 * m.cap, m.cs, active);
+                    }
+                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                       : core::qsa_attn_pools(st);
+                    pt.mark(kPfQsaAttn, cs);
+                    // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
+                    // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
+                    // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
+                    // V dequantized from its q4_0 blocks to fp16 at gather)
+                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q + o0 * ZV, pools, m.sel_ids + o0 * m.cap,
+                                                                            m.steps_dev + o0 * strata::kernels::kStepCount, m.cap, s,
+                                                                            m.attn + o0 * ZV, To, m.cs))
+                        for (int64_t t0 = o0; t0 < o0 + To; t0 += m.attn_batch) {
+                            const int64_t nb = std::min(m.attn_batch, o0 + To - t0);
+                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
+                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
+                        }
+                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn + o0 * ZV, To * 24, m.cs);
+                    pt.mark(kPfQsaOut, cs);
+                    const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
+                    const int64_t la = ld_a > 0 ? ld_a : ZV;
+                    gate_attn(m.attn + o0 * ZV, m.Qf + o0 * 12288, m.attn_h + o0 * la, To, m.cs, ld_a);
+                    if (!native_proj(m.gemm, wo, m.attn_h + o0 * la, m.bo + o0 * N, To, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    ++qsa_index;
+                    if (!kv_prefetch_after(l + 1, qsa_index)) return false;
+                    } else {   // [claude] (TP prefill: the one-card read below)
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     pt.mark(kPfQsaQ, cs);
@@ -4372,6 +4743,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
+                    }
                 } else {
                     // ======================= MoE =======================
                     const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
@@ -4381,6 +4753,104 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
+                    if (tp) {
+                        // [claude] TP prefill: this GPU's rows are routed here; their expert input, ids and weights go to the
+                        // other GPU while this GPU's rows' shared expert runs.  Then every token's pairs are grouped with the
+                        // other GPU's experts on the dummy expert, this GPU computes its experts (its cache's, and its share
+                        // of the rest streamed into its ring) for every token, sends its FP16 sums of the other GPU's tokens
+                        // there, and combines its own tokens with the other GPU's sums (the stage help's pair of kernels)
+                        Impl& pm = *dp_peer_->impl_;
+                        const int64_t NEx = m.g->n_expert;
+                        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                        const auto& f = lay.fmt[(size_t) l];
+                        if (!bf16_proj(m.gemm, wr, mixedbf_o, m.logits + o0 * NEx, To, v.name("ffn_gate_inp.weight"), err, 0, mixedbflo_o)) return false;
+                        route(m.logits + o0 * NEx, m.ids + o0 * K, m.w + o0 * K, To, NEx, m.cs);
+                        if (m.hist_dev != nullptr) strata::prefill::route_hist(m.ids + o0 * K, To * K, m.hist_dev + l * NE, NE, m.cs);
+                        pt.mark(kPfGather, cs);
+                        const size_t rb = fused::f16_on() ? (size_t) N * 2 : fused::act_bytes(1, N);   // one token's input
+                        uint8_t* const Xq8 = static_cast<uint8_t*>(m.Xq);
+                        if (fused::f16_on()) fused::act_f16(mixed_o, To, N, Xq8 + o0 * rb, m.cs);
+                        else fused::quantize_act_native(mixed_o, To, N, Xq8 + o0 * rb, m.cs);
+                        const size_t thp = tp_half_rows((size_t) pm.T), thm = tp_half_rows((size_t) m.T);
+                        if (!tp_send(l, kXMin, pm.tp_in_min, Xq8 + o0 * rb, (size_t) To * rb, err) ||
+                            !tp_send(l, kXMin, pm.tp_in_min + thp * rb, m.ids + o0 * K, (size_t) (To * K) * 4, err) ||
+                            !tp_send(l, kXMin, pm.tp_in_min + thp * rb + thp * K * 4, m.w + o0 * K, (size_t) (To * K) * 4, err) ||
+                            !tp_post(l, kXMin, err))
+                            return false;
+                        pt.mark(kPfRouter, cs);
+                        if (!native_proj(m.gemm, wsg, mixedh_o, m.sgate + o0 * 640, To, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        if (!native_proj(m.gemm, wsu, mixedh_o, m.sup + o0 * 640, To, v.name("ffn_up_shexp.weight"), err)) return false;
+                        swiglu_pair(m.sgate + o0 * 640, m.sup + o0 * 640, m.sh_h + o0 * 640, To, m.cs);
+                        if (!native_proj(m.gemm, wsd, m.sh_h + o0 * 640, m.shared + o0 * N, To, v.name("ffn_down_shexp.weight"), err)) return false;
+                        if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
+                        m.gemm.bf16(mixedbf_o, (const uint16_t*) wgi->data, m.sg + o0, To, 1, N);
+                        if (mixedbflo_o) m.gemm.bf16(mixedbflo_o, (const uint16_t*) wgi->data, m.sg + o0, To, 1, N, 0, 1.0f);
+                        if (!tp_take(l, kXMin, m.cs, err)) return false;
+                        pt.mark(kPfGather, cs);
+                        if (cudaMemcpyAsync(Xq8 + po0 * rb, m.tp_in_min, (size_t) Tp * rb, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess ||
+                            cudaMemcpyAsync(m.ids + po0 * K, m.tp_in_min + thm * rb, (size_t) (Tp * K) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess ||
+                            cudaMemcpyAsync(m.w + po0 * K, m.tp_in_min + thm * rb + thm * K * 4, (size_t) (Tp * K) * 4, cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
+                            err = "prefill TP: the expert input rows"; return false;
+                        }
+                        help_remap(m.ids, m.tp_keep + (size_t) l * NE, 1, m.tp_ids, T * K, (int) NE, m.cs);
+                        fused::group(m.tp_ids, T * K, (int) K, (int) NE + 1, m.GU, m.slot_dev, m.src_dev, m.cs);
+                        // this GPU's experts in id order, in batches of at most kMaxBatch experts of which at most a third of the
+                        // ring is streamed (as the one-card walk); the other GPU's are not here (no rows: the dummy expert)
+                        const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                        size_t per = (size_t) std::max(1, m.ring / 3);
+                        if (m.stager) per = std::min(per, (size_t) std::max(1, m.stager->kRing));
+                        size_t k = seq_start[(size_t) l];
+                        const size_t kend = seq_start[(size_t) l + 1];
+                        const uint8_t* const mine = tp_mine_.data() + (size_t) l * NE;
+                        for (int32_t e = 0; e < (int32_t) NE;) {
+                            while (e < (int32_t) NE && !mine[e]) ++e;
+                            if (e >= (int32_t) NE) break;
+                            fused::Batch bt;
+                            bt.e0 = e;
+                            const size_t k0 = k;
+                            for (; e < (int32_t) NE && e - bt.e0 < fused::kMaxBatch; ++e) {
+                                if (!mine[e]) { bt.blob[e - bt.e0] = nullptr; continue; }
+                                if (k < kend && seq[k].e == e) {
+                                    if (k - k0 == per) break;
+                                    bt.blob[e - bt.e0] = m.stage_dev[k % (size_t) m.ring];
+                                    ++k;
+                                } else {
+                                    const int32_t sl = m.host_res != nullptr ? m.host_res[(size_t) l * NE + e] : -1;
+                                    if (sl < 0 || m.cache == nullptr) { err = "prefill TP: an expert of this GPU is neither resident nor streamed"; return false; }
+                                    bt.blob[e - bt.e0] = m.cache->device_slot(sl);
+                                    ++stats_.experts_resident;
+                                }
+                            }
+                            bt.e1 = e;
+                            if (k > k0) {
+                                pt.mark(kPfWaitCopy, cs);
+                                wait_issued(k - 1);
+                                cudaStreamWaitEvent(m.cs, m.copied[(k - 1) % (size_t) m.ring], 0);
+                            }
+                            pt.mark(kPfGemmGU, cs);
+                            // (no mid-point hook here: fused::set_mid_hook is process-wide, and both GPUs' threads launch
+                            // experts at once - one card's timing event recorded on the other's stream: invalid handle)
+                            if (fused::f16_on())
+                                fused::experts_native_f16(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            else
+                                fused::experts_native(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            for (size_t kk = k0; kk < k; ++kk) {
+                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
+                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                            }
+                            if (k > k0) {
+                                consumed = k;
+                                give_back(consumed);
+                            }
+                        }
+                        if (k != kend) { err = "prefill TP: the layer's streamed experts were not all used"; return false; }
+                        pt.mark(kPfCombine, cs);
+                        help_sum16(m.Dm, m.slot_dev + po0 * K, m.w + po0 * K, m.tp_ids + po0 * K, (int) NE, m.tp_out, Tp, m.cs);
+                        if (!tp_send(l, kXMsum, pm.tp_in_sum, m.tp_out, (size_t) (Tp * N) * 2, err) || !tp_post(l, kXMsum, err)) return false;
+                        if (!tp_take(l, kXMsum, m.cs, err)) return false;
+                        moe_combine_help16(m.Dm, m.slot_dev + o0 * K, m.w + o0 * K, m.tp_ids + o0 * K, (int) NE, m.shared + o0 * N,
+                                           m.sg + o0, m.tp_in_sum, m.bo + o0 * N, To, m.cs);
+                    } else {   // [claude] (TP prefill: the one-card read below)
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     if (m.hist_dev != nullptr) strata::prefill::route_hist(m.ids, T * K, m.hist_dev + l * NE, NE, m.cs);   // [claude] route_hist
@@ -5910,6 +6380,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          (long long) T);
                         }
                     }
+                    }   // [claude] (TP prefill: else)
+                }
+                // [claude] STRATA_TP_DEBUG=1 (debug): the first non-finite value of this path's rows, per chunk
+                if (static const bool tpdbg = std::getenv("STRATA_TP_DEBUG") != nullptr; tpdbg) {
+                    cudaStreamSynchronize(m.cs);
+                    auto bad = [&](const float* d, int64_t cnt) {
+                        std::vector<float> h((size_t) cnt);
+                        cudaMemcpy(h.data(), d, (size_t) cnt * 4, cudaMemcpyDeviceToHost);
+                        int64_t c = 0; double mx = 0;
+                        for (float x : h) { if (!std::isfinite(x)) ++c; else mx = std::max(mx, (double) std::fabs(x)); }
+                        return std::make_pair(c, mx);
+                    };
+                    static int64_t said_chunk = -1;
+                    const auto b1 = bad(m.bo + o0 * N, To * N), b2 = bad(m.R + o0 * D, To * D), b3 = bad(m.mixed + o0 * N, To * N);
+                    if ((b1.first || b2.first || b3.first || l < 3) && said_chunk != stats_.chunks * 2 + dp_index_)
+                        std::fprintf(stderr, "strata TP dbg: card %d chunk %lld layer %lld half %d: bo %lld (max %.3g) R %lld (max %.3g) mixed %lld (max %.3g)\n",
+                                     dp_index_, (long long) stats_.chunks, (long long) l, half, (long long) b1.first, b1.second,
+                                     (long long) b2.first, b2.second, (long long) b3.first, b3.second);
+                    if (b1.first || b2.first || b3.first) said_chunk = stats_.chunks * 2 + dp_index_;
                 }
                 pt.mark(kPfHcWrite, cs);   // the write-back (and the next half's norm) on its own line; it used to be charged to the phase before
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
@@ -5966,12 +6455,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs, m.xn16,
                                           T, m.cs, m.xn16_lo, ldx, xf16);
                     normed = true;
-                } else if (wnn) {
-                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx, xf16);
+                } else if (wnn) {   // [claude] TP prefill: this GPU's rows (o0, To; the whole chunk otherwise)
+                    gr_write_norm_rs(R_o, m.bo + o0 * N, inj_o, HC, (const float*) wnn->data, EPS, grs_o, xn16_o, To, m.cs,
+                                     xn16lo_o, ldx, xf16);
                     normed = true;
                 } else {
-                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                    gr_write(R_o, m.bo + o0 * N, inj_o, HC, To, m.cs);
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
@@ -6060,9 +6549,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
-            if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
+            // [claude] TP prefill: each path its own rows, into <file>.tp0 / .tp1
+            const std::string dpath = tp ? std::string(dump) + ".tp" + std::to_string(dp_index_) : std::string(dump);
+            if (std::FILE* f = std::fopen(dpath.c_str(), c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
-                for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                for (int64_t t = o0 + (64 - (p0 + o0) % 64) % 64; t < o0 + To; t += 64) {
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
                     const int64_t pos = p0 + t;
                     std::fwrite(&pos, sizeof pos, 1, f);
@@ -6099,6 +6590,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
         }
 #endif
+        // [claude] TP prefill: the drafter's GPU (the second path) reports its rows of the chunk, and the first path's rows
+        // too where they are among the prompt's last `min_last` positions (sent here first)
+        int64_t rep0 = 0;
+        if (tp) {
+            const int64_t want = std::clamp<int64_t>(tp_report_from_ - p0, 0, T);
+            rep0 = std::min(want, tsplit);
+            if (want < tsplit) {
+                if (dp_index_ == 0) {
+                    Impl& pm = *dp_peer_->impl_;
+                    if (!tp_send(0, kXEnd, pm.R + want * D, m.R + want * D, (size_t) ((tsplit - want) * D) * 4, err) ||
+                        !tp_post(0, kXEnd, err))
+                        return false;
+                } else if (!tp_take(0, kXEnd, m.cs, err)) return false;
+            }
+            if (dp_index_ == 1 && rep0 >= T) rep0 = tsplit;   // (nothing of the tail here: its own rows, as DP reports)
+        }
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
@@ -6107,10 +6614,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            if (on_chunk && !on_chunk(m.R + rep0 * D, T - rep0, p0 + rep0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
+        if (tp) ++tp_chunk_;   // [claude] TP prefill: the exchanges of the next chunk
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
@@ -6307,6 +6815,12 @@ std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, int dev_a, 
                 err = "prefill DP: events";
                 return nullptr;
             }
+        if (tp_prefill_env()) {   // [claude] TP prefill: the exchanges' events
+            L->tseq[i].assign((size_t) n_layers * DpLink::kTpX, -1);
+            L->tev[i].assign((size_t) n_layers * DpLink::kTpX, nullptr);
+            for (cudaEvent_t& e : L->tev[i])
+                if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { err = "prefill TP: events"; return nullptr; }
+        }
         if (dp_share_env()) {   // [claude] DP share: the mailbox and its events
             L->req[i].assign((size_t) n_layers, DpLink::DsReq{});
             L->sum_k[i].assign((size_t) n_layers, -1);
@@ -6611,6 +7125,334 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         err = !ok_b && !err_b.empty() && err_b.find("other GPU") == std::string::npos ? err_b : (!err_a.empty() ? err_a : err_b);
         return false;
     }
+    return true;
+}
+
+
+// ---- [claude] TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt)
+bool Prefill::tp_prefill_env() { return tp_prefill_on(); }
+void Prefill::set_tp_layout(bool on) { g_tp_layout_next.store(on); }
+bool Prefill::tp_layout_now() const { return impl_->tp_ids != nullptr; }
+
+bool Prefill::tp_send(int64_t l, int x, void* dst, const void* src, size_t bytes, std::string& err) {
+    (void) l; (void) x;
+    Impl& m = *impl_;
+    if (bytes == 0) return true;
+    if (cudaEventRecord(m.tp_rdy, m.cs) != cudaSuccess || cudaStreamWaitEvent(m.tp_cs, m.tp_rdy, 0) != cudaSuccess ||
+        cudaMemcpyPeerAsync(dst, dp_peer_->impl_->device, src, m.device, bytes, m.tp_cs) != cudaSuccess) {
+        err = std::string("prefill TP: a copy to the other GPU: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool Prefill::tp_post(int64_t l, int x, std::string& err) {
+    Impl& m = *impl_;
+    DpLink& L = *dp_link_;
+    const size_t i = (size_t) l * DpLink::kTpX + (size_t) x;
+    if (cudaEventRecord(m.tp_rdy, m.cs) != cudaSuccess || cudaStreamWaitEvent(m.tp_cs, m.tp_rdy, 0) != cudaSuccess ||
+        cudaEventRecord(L.tev[dp_index_][i], m.tp_cs) != cudaSuccess || cudaEventRecord(m.tp_done, m.tp_cs) != cudaSuccess) {
+        err = std::string("prefill TP: an exchange event: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(L.mu);
+        L.tseq[dp_index_][i] = tp_chunk_;
+    }
+    L.cv.notify_all();
+    return true;
+}
+
+bool Prefill::tp_take(int64_t l, int x, void* stream, std::string& err, int64_t want) {
+    DpLink& L = *dp_link_;
+    const int peer = 1 - dp_index_;
+    const size_t i = (size_t) l * DpLink::kTpX + (size_t) x;
+    if (want < 0) want = tp_chunk_;
+    {
+        std::unique_lock<std::mutex> lk(L.mu);
+        L.cv.wait(lk, [&] { return L.abort || L.tseq[peer][i] >= want; });
+        if (L.abort) { err = "prefill TP: the other GPU's path stopped"; return false; }
+    }
+    if (cudaStreamWaitEvent((cudaStream_t) stream, L.tev[peer][i], 0) != cudaSuccess) {
+        err = std::string("prefill TP: a cross-device wait: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+// the GDN layers of this path's foreign session: its head half goes back to the owner (the other path's own session),
+// through the owner's prompt buffers (idle now) and a merge that writes only that half
+bool Prefill::tp_gdn_back(std::string& err) {
+    Impl& m = *impl_;
+    Prefill& Y = *dp_peer_;
+    Impl& ym = *Y.impl_;
+    core::SessionState* F = dp_foreign_;
+    if (F == nullptr || F->gdn_alloc <= 0) return true;
+    core::SessionState& O = *ym.ss;
+    const core::ModelGeometry& g = *m.g;
+    const uint64_t floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                            (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const size_t bytes = (size_t) (F->gdn_alloc * floats) * 4;
+    if (bytes > (size_t) ym.T * K * N * 4) { err = "prefill TP: no room for the GDN hand-back"; return false; }
+    {
+        const core::OnDevice on(m.device);
+        if (cudaMemcpyPeerAsync(ym.Dm, ym.device, F->gdn_state, m.device, bytes, m.cs) != cudaSuccess ||
+            cudaStreamSynchronize(m.cs) != cudaSuccess) {
+            err = std::string("prefill TP: the GDN hand-back copy: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    const core::OnDevice on(ym.device);
+    if (F->gdn_ord0 < O.gdn_ord0 || F->gdn_ord0 + F->gdn_alloc > O.gdn_ord0 + O.gdn_alloc) {
+        err = "prefill TP: the foreign GDN layers are not the owner's";
+        return false;
+    }
+    tp_gdn_merge(O.gdn_state + (size_t) (F->gdn_ord0 - O.gdn_ord0) * floats, ym.Dm, F->gdn_alloc, (int64_t) floats, dp_index_, ym.cs);
+    if (cudaStreamSynchronize(ym.cs) != cudaSuccess) {
+        err = std::string("prefill TP: the GDN hand-back: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
+                     int64_t min_last, std::string& err) {
+    // ---- applicability (nothing has run when one of these fails: the caller reads the prompt another way)
+    if (!tp_prefill_on()) { err = "prefill TP: off"; return false; }
+    if (!a.dp_link_ || a.dp_link_ != b.dp_link_ || a.dp_peer_ != &b || b.dp_peer_ != &a || a.dp_link_->tev[0].empty() ||
+        a.dp_index_ != 0 || b.dp_index_ != 1) {
+        err = "prefill TP: the two paths are not linked";
+        return false;
+    }
+    if (pos0 % strata::kernels::qsa_real_shapes().idx_block != 0) { err = "prefill TP: the prompt starts inside a K/V block"; return false; }
+    Prefill* P[2] = {&a, &b};
+    int64_t C = std::min({chunk, a.impl_->T, b.impl_->T});
+    for (Prefill* X : P) {
+        Impl& xm = *X->impl_;
+        if (xm.src == nullptr || xm.cache == nullptr || xm.host_res == nullptr || xm.tp_ids == nullptr || X->embd_rows != nullptr ||
+            X->dp_foreign_ == nullptr || xm.stager == nullptr) {
+            err = "prefill TP: a path lacks its expert source, cache, exchange buffers or foreign session";
+            return false;
+        }
+    }
+    {
+        int64_t k = std::max<int64_t>(1, (n + C - 1) / C);
+        C = std::min(C, ((n + k - 1) / k + 255) / 256 * 256);
+    }
+    if (n < 1024 || C < 1024 || C < stream_all_min() || a.impl_->ring <= STAGE || b.impl_->ring <= STAGE) {
+        err = "prefill TP: the prompt or the chunk is too short";
+        return false;
+    }
+    static const bool conv_l2 = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) != 0; }();
+    if (!conv_l2 || !gdn_recurrence_tp_ok(256) || gr_unfused() || !strata::kernels::ple_native_postops_enabled()) {
+        err = "prefill TP: the GDN / hyper-connection / PLE prompt kernels are not the variants it splits";
+        return false;
+    }
+    {
+        const core::ModelGeometry& g = *a.impl_->g;
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        const MmqPlan& mp = mmq_plan();
+        if (g.ssm_k_heads != 16 || g.ssm_v_heads != 48 || g.n_embd != N || g.n_expert != NE || core::peer_portable() || !lay.native || !mp.any) {
+            err = "prefill TP: not this model's geometry / the native fused expert kernels";
+            return false;
+        }
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            if (!(mp.layer[(size_t) l] || mp.fo[(size_t) l]) || f.had_gu || f.had_d || !fused::native_supported(f.gu_type, f.d_type) ||
+                strata::kernels::cvec().covers(l)) {
+                err = "prefill TP: layer " + std::to_string((long long) l) + " is not on the fused native expert kernels (or is steered)";
+                return false;
+            }
+        }
+    }
+    // ---- per prompt: both paths every layer, the same chunks, their residency views, the expert assignment
+    struct Saved { int64_t lb, le; Prefill* next; const int32_t* res; std::function<bool(int64_t, std::string&)> osc; };
+    Saved sv[2];
+    for (int i = 0; i < 2; ++i) {
+        Prefill& X = *P[i];
+        Impl& xm = *X.impl_;
+        const int64_t E = xm.g->n_expert, NL = xm.g->n_layers;
+        sv[i] = {X.stage_lb_, X.stage_le_, X.next_, xm.host_res, X.on_stage_chunk};
+        X.dp_res_.assign((size_t) (NL * E), -1);
+        for (int64_t l = X.dp_full_res_ ? 0 : X.dp_own_lb_; l < (X.dp_full_res_ ? NL : X.dp_own_le_); ++l)
+            std::copy(xm.host_res + l * E, xm.host_res + (l + 1) * E, X.dp_res_.begin() + l * E);
+    }
+    auto restore = [&] {
+        for (int j = 0; j < 2; ++j) {
+            P[j]->impl_->host_res = sv[j].res; P[j]->stage_lb_ = sv[j].lb; P[j]->stage_le_ = sv[j].le;
+            P[j]->next_ = sv[j].next; P[j]->on_stage_chunk = std::move(sv[j].osc); P[j]->tp_active_ = false;
+        }
+    };
+    {
+        // an expert in card 0's cache is card 0's, else in card 1's card 1's; the others (in neither) are split per
+        // layer: STRATA_TP_PREFILL_NR of them (default 0.5: every other one) to the card that holds fewer of the layer
+        static const double nr = [] { const char* v = std::getenv("STRATA_TP_PREFILL_NR"); return v ? std::min(std::atof(v), 1.0) : 0.5; }();
+        const int64_t E = a.impl_->g->n_expert, NL = a.impl_->g->n_layers;
+        a.tp_mine_.assign((size_t) (NL * E), 0);
+        b.tp_mine_.assign((size_t) (NL * E), 0);
+        int64_t share[2] = {0, 0};
+        for (int64_t l = 0; l < NL; ++l) {
+            int64_t ca = 0, cb = 0;
+            for (int64_t e = 0; e < E; ++e) { ca += a.dp_res_[(size_t) (l * E + e)] >= 0; cb += b.dp_res_[(size_t) (l * E + e)] >= 0; }
+            const int light = ca <= cb ? 0 : 1;
+            // STRATA_TP_PREFILL_NR < 0 (default -1): the split that evens the two cards' expert counts of the layer
+            // (the card holding fewer takes the difference first, then every other one); >= 0: that fraction to it
+            const int64_t neither = E - ca - cb, diff = std::abs(ca - cb);
+            const double frac = nr >= 0.0 ? nr : neither > 0 ? std::clamp(0.5 + 0.5 * (double) diff / (double) neither, 0.5, 1.0) : 0.5;
+            double acc = 0.0;
+            for (int64_t e = 0; e < E; ++e) {
+                const size_t i = (size_t) (l * E + e);
+                int who;
+                if (a.dp_res_[i] >= 0) who = 0;
+                else if (b.dp_res_[i] >= 0) who = 1;
+                else {
+                    acc += frac;
+                    if (acc >= 1.0) { acc -= 1.0; who = light; } else who = 1 - light;
+                    ++share[who];
+                }
+                (who == 0 ? a : b).tp_mine_[i] = 1;
+            }
+        }
+        if (std::getenv("STRATA_PREFILL_TIMING") != nullptr)
+            std::fprintf(stderr, "strata prefill TP: %lld tokens in chunks of %lld; the experts neither card holds: %lld to CUDA%d, %lld to CUDA%d\n",
+                         (long long) n, (long long) C, (long long) share[0], a.impl_->device, (long long) share[1], b.impl_->device);
+    }
+    for (int i = 0; i < 2; ++i) {
+        Prefill& X = *P[i];
+        Impl& xm = *X.impl_;
+        const core::OnDevice on(xm.device);
+        const size_t nf = X.tp_mine_.size();
+        bool ok = true;
+        if (xm.tp_keep_n < nf) {
+            if (xm.tp_keep) cudaFree(xm.tp_keep);
+            xm.tp_keep = nullptr;
+            ok = cudaMalloc((void**) &xm.tp_keep, nf) == cudaSuccess;
+            xm.tp_keep_n = ok ? nf : 0;
+        }
+        // STRATA_TP_PREFILL_XPRIO=1 (experiment): the exchange stream at the device's highest priority
+        static const bool xprio = [] { const char* v = std::getenv("STRATA_TP_PREFILL_XPRIO"); return v && std::atoi(v) != 0; }();
+        if (ok && xm.tp_cs == nullptr) {
+            int lo = 0, hi = 0;
+            if (xprio && hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess)
+                ok = hipStreamCreateWithPriority(&xm.tp_cs, hipStreamNonBlocking, hi) == hipSuccess;
+            else
+                ok = cudaStreamCreateWithFlags(&xm.tp_cs, cudaStreamNonBlocking) == cudaSuccess;
+        }
+        if (ok && xm.tp_rdy == nullptr) ok = cudaEventCreateWithFlags(&xm.tp_rdy, cudaEventDisableTiming) == cudaSuccess;
+        if (ok && xm.tp_done == nullptr) ok = cudaEventCreateWithFlags(&xm.tp_done, cudaEventDisableTiming) == cudaSuccess;
+        if (ok) ok = cudaMemcpy(xm.tp_keep, X.tp_mine_.data(), nf, cudaMemcpyHostToDevice) == cudaSuccess &&
+                     cudaEventRecord(xm.tp_done, xm.tp_cs) == cudaSuccess;
+        if (!ok) {
+            (void) cudaGetLastError();
+            err = "prefill TP: the exchange stream, events or expert flags";
+            return false;
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        Prefill& X = *P[i];
+        X.impl_->host_res = X.dp_res_.data();
+        X.stage_lb_ = 0;
+        X.stage_le_ = X.impl_->g->n_layers;
+        X.next_ = nullptr;
+        X.hand_in_ = nullptr;
+        X.on_stage_chunk = nullptr;
+        X.tp_active_ = true;
+        X.tp_chunk_ = 0;
+        X.tp_report_from_ = pos0 + std::max<int64_t>(0, n - min_last);
+        X.force_chunk(C, false, false);
+    }
+    {
+        std::lock_guard<std::mutex> lk(a.dp_link_->mu);
+        for (int i = 0; i < 2; ++i) std::fill(a.dp_link_->tseq[i].begin(), a.dp_link_->tseq[i].end(), (int64_t) -1);
+        a.dp_link_->abort = false;
+    }
+    // the foreign sessions start from the owners' state at pos0 (as run_dp)
+    for (int i = 0; i < 2; ++i) {
+        Prefill& X = *P[i];
+        Prefill& Y = *P[1 - i];
+        core::SessionState* F = X.dp_foreign_;
+        core::SessionState& O = *Y.impl_->ss;
+        const core::ModelGeometry& g = *X.impl_->g;
+        const int dx = X.impl_->device, dy = Y.impl_->device;
+        const core::OnDevice on(dx);
+        bool ok = true;
+        auto cp = [&](void* dst, const void* src, size_t bytes) {
+            if (ok && bytes > 0 && cudaMemcpyPeerAsync(dst, dx, src, dy, bytes, X.impl_->cs) != cudaSuccess) ok = false;
+        };
+        const uint64_t floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+        if (X.dp_foreign_shared_) {
+            const int32_t pv0 = F->ple_prev[0], pv1 = F->ple_prev[1], pt = F->ple_token;
+            core::session_zero(*F, g, nullptr, X.impl_->cs);
+            F->ple_prev[0] = pv0; F->ple_prev[1] = pv1; F->ple_token = pt;
+        }
+        if (F->gdn_alloc > 0)
+            cp(F->gdn_state, O.gdn_state + (size_t) (F->gdn_ord0 - O.gdn_ord0) * floats, (size_t) (F->gdn_alloc * floats) * 4);
+        const strata::kernels::QsaShapes qs = strata::kernels::qsa_real_shapes();
+        const int64_t Di = g.idx_key_dim, blk = qs.idx_block;
+        for (int64_t q = F->qsa_ord0; q < F->qsa_ord0 + F->qsa_alloc; ++q) {
+            core::QsaState& f = F->qsa_states[q];
+            const core::QsaState& o = O.qsa_states[q];
+            const int64_t rows = std::min<int64_t>(f.idx_pooled_rows, pos0 / blk + 2);
+            cp(f.idx_pooled, o.idx_pooled, (size_t) (rows * Di) * 4);
+            cp(f.idx_tail, o.idx_tail, (size_t) ((blk - 1) * Di) * 4);
+            cp(f.idx_dead, o.idx_dead, (size_t) Di * 4);
+            cp(f.idx_block_pos, o.idx_block_pos, 4);
+        }
+        if (F->ple.ready() && O.ple.ready() && F->ple.hist != nullptr && O.ple.hist != nullptr)
+            cp(F->ple.hist, O.ple.hist, (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4);
+        if (!ok || cudaStreamSynchronize(X.impl_->cs) != cudaSuccess) {
+            err = std::string("prefill TP: syncing the foreign state: ") + cudaGetErrorString(cudaGetLastError());
+            restore();
+            return false;
+        }
+    }
+    const int32_t prev0[2] = {a.impl_->ss->ple_prev[0], a.impl_->ss->ple_prev[1]};
+    for (int i = 0; i < 2; ++i) {
+        P[i]->impl_->ss->ple_prev[0] = prev0[0]; P[i]->impl_->ss->ple_prev[1] = prev0[1];
+        P[i]->dp_foreign_->ple_prev[0] = prev0[0]; P[i]->dp_foreign_->ple_prev[1] = prev0[1];
+    }
+    std::string err_a;
+    std::future<bool> fa = std::async(std::launch::async, [&] {
+        strata::aux_cpus::pin_current_thread();
+        const bool r = a.run_impl(tokens, n, pos0, err_a);
+        if (!r) { std::lock_guard<std::mutex> lk(a.dp_link_->mu); a.dp_link_->abort = true; }
+        a.dp_link_->cv.notify_all();
+        return r;
+    });
+    std::string err_b;
+    const bool ok_b = b.run_impl(tokens, n, pos0, err_b);
+    if (!ok_b) {
+        { std::lock_guard<std::mutex> lk(a.dp_link_->mu); a.dp_link_->abort = true; }
+        a.dp_link_->cv.notify_all();
+    }
+    const bool ok_a = fa.get();
+    for (int i = 0; i < 2; ++i) {   // every copy has landed before the hand-back and before decode reads the owners'
+        const core::OnDevice on(P[i]->impl_->device);
+        cudaStreamSynchronize(P[i]->impl_->cs);
+        cudaStreamSynchronize(P[i]->impl_->tp_cs);
+    }
+    bool ok_back = ok_a && ok_b;
+    std::string err_back;
+    if (ok_back) ok_back = a.tp_gdn_back(err_back) && b.tp_gdn_back(err_back);
+    for (int i = 0; i < 2; ++i) {   // the copy stream is this prompt's only: decode shares no HW queue with it (as DP share)
+        Impl& xm = *P[i]->impl_;
+        const core::OnDevice on(xm.device);
+        if (xm.tp_cs) { cudaStreamSynchronize(xm.tp_cs); cudaStreamDestroy(xm.tp_cs); xm.tp_cs = nullptr; }
+    }
+    restore();
+    int32_t last[2] = {prev0[0], prev0[1]};
+    for (int64_t t = 0; t < n; ++t) { last[0] = last[1]; last[1] = (int32_t) tokens[t]; }
+    for (int i = 0; i < 2; ++i) {
+        P[i]->impl_->ss->ple_prev[0] = last[0]; P[i]->impl_->ss->ple_prev[1] = last[1];
+        P[i]->dp_foreign_->ple_prev[0] = last[0]; P[i]->dp_foreign_->ple_prev[1] = last[1];
+    }
+    if (!ok_a || !ok_b) {
+        err = !ok_b && !err_b.empty() && err_b.find("other GPU") == std::string::npos ? err_b : (!err_a.empty() ? err_a : err_b);
+        if (err.rfind("prefill TP: ", 0) == 0) err = "prefill TP (read): " + err.substr(12);   // ran: not a fallback case
+        return false;
+    }
+    if (!ok_back) { err = err_back; return false; }
     return true;
 }
 
