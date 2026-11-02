@@ -28,14 +28,15 @@
 ## RDNA3 / RX 7900 XTX fork
 
 Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, release
-`claude-20261101-rg23`, with every expert computed (no expert skipping). Lines are the median of 3 trials (the faint band
+`claude-20261102-rg24` on two GPUs and `claude-20261101-rg23` on one (the releases in production on 2026-11-02), with
+every expert computed (no expert skipping). Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs; the faint band
 is the trial range); every request was checked for exact input length, 256 output tokens and correct retrieval, with no
 prompt cache.
 
 **What the prompts are.** Each prompt is N tokens of synthetic warehouse records with 3 hidden codes. The model returns
 the codes, then writes either an inventory-auditing guide (**English prose**) or a Python inventory-auditing module
 (**Python code**). Decode speed depends on the text: the model's MTP head drafts ahead, and code drafts are accepted more
-often (about 78 % vs 61 %), so code decodes 19-37 % faster on the same hardware. Compare tok/s only on the same kind
+often (about 79 % vs 61 %), so code decodes 15-37 % faster on the same hardware. Compare tok/s only on the same kind
 of text.
 
 <p align="center"><img src="docs/media/rdna3/prefill.png" width="49%" alt="Flash-Next prefill speed, 1 and 2 RX 7900 XTX"> <img src="docs/media/rdna3/vs-rtx4090.png" width="49%" alt="1 and 2 RX 7900 XTX against a public RTX 4090 run on the same requests"></p>
@@ -43,30 +44,41 @@ of text.
 
 | Flash-Next, tokens/s | prefill 32K / 128K / ≈256K | decode, English prose 32K / 128K / ≈256K | decode, Python code 32K / 128K / ≈256K |
 |---|---|---|---|
-| IQ3_S, 2 GPUs | 6,780 / 6,781 / 6,402 | 132.7 / 137.2 / 129.6 | 169.9 / 162.7 / 161.8 |
+| IQ3_S, 2 GPUs | 6,760 / 6,778 / 6,405 | 129.8 / 141.1 / 127.4 | 169.9 / 162.7 / 161.8 |
 | IQ3_S, 1 GPU | 3,541 / 3,553 / 3,311 | 114.1 / 112.9 / 111.8 | 139.3 / 142.7 / 138.1 |
-| UD-IQ4_XS, 2 GPUs | 7,075 / 7,086 / 6,580 | 127.8 / 123.6 / 121.6 | 167.1 / 159.1 / 158.4 |
+| UD-IQ4_XS, 2 GPUs | 7,060 / 7,082 / 6,586 | 127.8 / 126.8 / 129.9 | 167.1 / 159.1 / 158.4 |
 | UD-IQ4_XS, 1 GPU | 3,455 / 3,480 / 3,251 | 94.2 / 91.9 / 89.0 | 122.3 / 120.6 / 117.3 |
-| UD-Q4_K_XL, 2 GPUs | 5,381 / 6,878 / 6,560 | 109.5 / 105.6 / 102.9 | 139.4 / 135.6 / 134.1 |
-| UD-Q4_K_XL, 1 GPU | 3,613 / 3,676 / 3,429 | 78.3 / 80.9 / 72.1 | 95.6 / 98.3 / 95.6 |
+| UD-Q4_K_XL, 2 GPUs | 5,770 / 7,089 / 6,604 | 116.6 / 113.5 / 113.5 | 142.5 / 141.3 / 141.2 |
+| UD-Q4_K_XL, 1 GPU | 3,613 / 3,676 / 3,442 | 78.3 / 80.9 / 72.1 | 95.6 / 98.3 / 95.6 |
 
-Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). On 2 GPUs IQ3_S and UD-IQ4_XS decode
-tensor parallel and UD-Q4_K_XL uses a pipelined layer split; prompts take one of three paths by length (below).
+Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). On 2 GPUs all three quants decode
+tensor parallel (UD-Q4_K_XL since 2026-11-02, before that a pipelined layer split); prompts take one of three paths by
+length (below). UD-IQ4_XS and IQ3_S 2-GPU code cells are rg23 sweeps (rg24 changes only prompts of 3K-12K).
 
 ### How the two cards are used
 
 | | IQ3_S, UD-IQ4_XS (2 GPUs) | UD-Q4_K_XL (2 GPUs) |
 |---|---|---|
-| Decode | tensor parallel (`--tensor-parallel 2`) | layer split + `--pipeline-windows 2` |
+| Decode | tensor parallel (`--tensor-parallel 2`) | tensor parallel (since 2026-11-02; before: layer split + `--pipeline-windows 2`) |
 | Short prompts | one chunk through the layer split, the idle card computing part of the other's experts | same |
-| Mid-length prompts | tensor-parallel prefill, 3,072 (IQ3_S) / 5,120 (UD-IQ4_XS) to 12,288 tokens | one chunk, then data parallel from 18,000 tokens |
+| Mid-length prompts | tensor-parallel prefill, 3,072 (IQ3_S) / 5,120 (UD-IQ4_XS) to 12,288 tokens | one chunk (tensor-parallel prefill is link-bound on Q4), then data parallel from 18,000 tokens |
 | Long prompts | data parallel | data parallel |
 
 **Tensor-parallel decode.** Every layer runs on both cards: attention is split by head, the routed experts are split by
 expert id across the two cards' expert caches, and the cards exchange their partial results once a layer over PCIe 4.0
 x8. The layer split instead puts layers 0-23 on card 0 and 24-47 on card 1; `--pipeline-windows 2` starts the next
 decode window on card 0 before the current one is verified, so both cards stay busy. Tensor parallel turns that pipeline
-off. UD-Q4_K_XL decode on tensor parallel is under evaluation.
+off. That pipeline had a cost: the early window has to be drafted about four tokens deep, and on UD-Q4_K_XL code its
+acceptance fell to ~71 % against 79 % on one GPU. With the VRAM savings below, UD-Q4_K_XL moved to tensor parallel on
+2026-11-02 (`--vram-reserve-mib 576 --vram-reserve-later-mib 640`, `STRATA_TP_DEAL_BUDGET=5200`). Against its layer split
+on the same binary, over three rounds of 1K-256K sweeps:
+
+- decode is +0.9..+9.1 % on code and +4.0..+12.3 % on English at every length;
+- prefill is +0.6..+13.9 %;
+- code acceptance returns to 75-82 %.
+
+The refill of the borrowed expert slots runs beside the first decode windows, so the code windows of a 256-token answer
+are 3-11 % longer at 8K-128K.
 
 **What tensor parallel costs in VRAM, and what was won back.** At first each card held three extra things beside the
 layer-split weights that prompt reading still uses: a sliced copy of the dense weights, a tensor-parallel session, and a
@@ -99,11 +111,11 @@ plus ~10 GB of exchanges through one PCIe 4.0 x8 link) and loses at every length
 **Against an RTX 4090** (IQ3_S, the exact requests of the public
 [nvidia-4090-flash-next-inference](https://github.com/AnnoyingTechnology/nvidia-4090-flash-next-inference) run of
 2026-10-04 on a 24 GB RTX 4090, replayed here): decode at 32K / 128K is 119 / 108 tok/s on the 4090, 117 / 117 on one
-7900 XTX and 142 / 140 on two; fresh 32K prefill 4,672 vs 3,541 and 6,780 tok/s. Against stock Strata on the same card
-(UD-IQ4_XS, 32K): prefill 1,151 -> 3,455 tok/s on one GPU and 1,727 -> 7,075 on two.
+7900 XTX and 142 / 140 on two; fresh 32K prefill 4,672 vs 3,541 and 6,760 tok/s. Against stock Strata on the same card
+(UD-IQ4_XS, 32K): prefill 1,151 -> 3,455 tok/s on one GPU and 1,727 -> 7,060 on two.
 
 **What the fork adds** (all gfx1100 HIP; most are opt-in environment switches, so stock behaviour is unchanged):
-- Decode: tensor-parallel decode on two cards for IQ3_S / UD-IQ4_XS, with its VRAM copies aliased
+- Decode: tensor-parallel decode on two cards for IQ3_S / UD-IQ4_XS / UD-Q4_K_XL, with its VRAM copies aliased
   (`STRATA_TP_ALIAS`, `STRATA_TP_SHARE_DP`, `STRATA_TP_ALIAS_MAP=rows`); RDNA hyper-connection reads (int8 /
   int8-activation, fused down+up with a grid barrier); multi-column Q4_K/Q5_K/Q6_K/IQ4_XS GEMVs; fused router publish,
   fused waits and CPU-row combine; a register top-k for QSA at 262K capacity, split across many CTAs past 96K
