@@ -50,8 +50,51 @@ of text.
 | UD-Q4_K_XL, 2 GPUs | 5,381 / 6,878 / 6,560 | 109.5 / 105.6 / 102.9 | 139.4 / 135.6 / 134.1 |
 | UD-Q4_K_XL, 1 GPU | 3,613 / 3,676 / 3,429 | 78.3 / 80.9 / 72.1 | 95.6 / 98.3 / 95.6 |
 
-Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). 2 GPUs: tensor parallel for IQ3_S and
-UD-IQ4_XS, pipeline (layer split) for UD-Q4_K_XL.
+Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). On 2 GPUs IQ3_S and UD-IQ4_XS decode
+tensor parallel and UD-Q4_K_XL uses a pipelined layer split; prompts take one of three paths by length (below).
+
+### How the two cards are used
+
+| | IQ3_S, UD-IQ4_XS (2 GPUs) | UD-Q4_K_XL (2 GPUs) |
+|---|---|---|
+| Decode | tensor parallel (`--tensor-parallel 2`) | layer split + `--pipeline-windows 2` |
+| Short prompts | one chunk through the layer split, the idle card computing part of the other's experts | same |
+| Mid-length prompts | tensor-parallel prefill, 3,072 (IQ3_S) / 5,120 (UD-IQ4_XS) to 12,288 tokens | one chunk, then data parallel from 18,000 tokens |
+| Long prompts | data parallel | data parallel |
+
+**Tensor-parallel decode.** Every layer runs on both cards: attention is split by head, the routed experts are split by
+expert id across the two cards' expert caches, and the cards exchange their partial results once a layer over PCIe 4.0
+x8. The layer split instead puts layers 0-23 on card 0 and 24-47 on card 1; `--pipeline-windows 2` starts the next
+decode window on card 0 before the current one is verified, so both cards stay busy. Tensor parallel turns that pipeline
+off. UD-Q4_K_XL decode on tensor parallel is under evaluation.
+
+**What tensor parallel costs in VRAM, and what was won back.** At first each card held three extra things beside the
+layer-split weights that prompt reading still uses: a sliced copy of the dense weights, a tensor-parallel session, and a
+separate session for the data-parallel prompt path. Every MiB there is a MiB less of expert cache, and an expert that is
+not cached has to come over PCIe. Three switches give most of it back (measured on UD-IQ4_XS, per card):
+
+- `STRATA_TP_ALIAS` (on by default): the q/k/v slices are read in place from the full matrices: 207 MiB.
+- `STRATA_TP_SHARE_DP=1`: the data-parallel prompt session lives in the tensor-parallel session's memory: 649 MiB.
+- `STRATA_TP_ALIAS_MAP=rows`: the Q8_0 GDN projections are read from the full matrices through a row map: sliced dense
+  weights 1,159 -> 394 MiB.
+
+Together about 1.6 GiB a card; the expert cache grows from 7,178 + 6,566 to 7,807 + 7,186 slots. None of them changes
+the arithmetic: the aliases read the same bytes, and every mapped slice is checked bit for bit against a dense copy at
+start (`STRATA_TP_ALIAS_MAP_CHECK`, on by default).
+
+**Prompt paths.** Data-parallel prefill (`STRATA_DP_PREFILL=1`) runs all 48 layers on both cards on alternating chunks;
+each card streams the experts its own cache lacks, so most streamed experts cross PCIe twice. Tensor-parallel prefill
+(`STRATA_TP_PREFILL=1`, from release `claude-20261102-rg24`) has both cards read every layer of the *same* chunk: GDN
+split by head, attention by query (keys and values exchanged), experts by id. With `STRATA_TP_PREFILL_CHUNK=8448`,
+`STRATA_TP_PREFILL_MAX=12288` and `STRATA_TP_PREFILL_MIN` 3072 (IQ3_S) / 5120 (UD-IQ4_XS), prefill against the previous
+release: IQ3_S +18.5 % at 4K and +41.6 % at 8K, UD-IQ4_XS +31.8 % at 8K and about +15 % at 12K, decode unchanged.
+
+It stops at 12K because a prompt chunk borrows expert slots from the decode cache. Data parallel gives card 0's slots
+back while card 1 is still reading; tensor parallel keeps both cards busy to the last layer, so both caches refill under
+the first decode windows. Read as one 16K chunk, the decode after it hit its cache about 96 % of the time instead of
+98 % and its windows were 2.7-5.4 % slower; with 8,448-token chunks the prefill gain at 16K was gone. Above 12K
+data parallel stays. On UD-Q4_K_XL tensor-parallel prefill is link-bound (at 16K each card streams ~29 GB of experts
+plus ~10 GB of exchanges through one PCIe 4.0 x8 link) and loses at every length, so it is not used there.
 
 **Against an RTX 4090** (IQ3_S, the exact requests of the public
 [nvidia-4090-flash-next-inference](https://github.com/AnnoyingTechnology/nvidia-4090-flash-next-inference) run of
@@ -60,7 +103,8 @@ UD-IQ4_XS, pipeline (layer split) for UD-Q4_K_XL.
 (UD-IQ4_XS, 32K): prefill 1,151 -> 3,455 tok/s on one GPU and 1,727 -> 7,075 on two.
 
 **What the fork adds** (all gfx1100 HIP; most are opt-in environment switches, so stock behaviour is unchanged):
-- Decode: tensor-parallel decode on two cards for IQ3_S / UD-IQ4_XS; RDNA hyper-connection reads (int8 /
+- Decode: tensor-parallel decode on two cards for IQ3_S / UD-IQ4_XS, with its VRAM copies aliased
+  (`STRATA_TP_ALIAS`, `STRATA_TP_SHARE_DP`, `STRATA_TP_ALIAS_MAP=rows`); RDNA hyper-connection reads (int8 /
   int8-activation, fused down+up with a grid barrier); multi-column Q4_K/Q5_K/Q6_K/IQ4_XS GEMVs; fused router publish,
   fused waits and CPU-row combine; a register top-k for QSA at 262K capacity, split across many CTAs past 96K
   (`STRATA_TOPK_SPLIT_MIN=98304`, 256K decode 5-9 % faster per window); adaptive expert cache swaps every window;
@@ -69,7 +113,7 @@ UD-IQ4_XS, pipeline (layer split) for UD-Q4_K_XL.
   [xyzzing/Strata](https://github.com/xyzzing/Strata)); the chunked GDN recurrence on FP16 matrix cores; FP16 pair
   expert kernels (empty-column skip, 3 blocks a WGP, FP16 IQ codebooks); prompt hyper-connection kernels (upmix at 512
   threads, vectorised write+norm); K-quant MMQ; a dual-GPU data-parallel prompt path (`STRATA_DP_PREFILL=1`, chunk
-  8448 on IQ3_S); a routed CPU+GPU expert walk for short prompts on the Q4 layer split; LDS-staged attention.
+  8448 on IQ3_S); tensor-parallel prefill on IQ3_S / UD-IQ4_XS for 3K-12K prompts (`STRATA_TP_PREFILL=1`); a routed CPU+GPU expert walk for short prompts on the Q4 layer split; LDS-staged attention.
 - Loading: on Linux the expert arena is read with O_DIRECT when the page cache could not keep it (a 72 GB Q4 arena
   loads at ~1.9 instead of ~1.0 GiB/s).
 - CPU: IQ AVX-512 init stays safe on AVX2-only hosts (PR #1).
