@@ -14297,7 +14297,11 @@ int main(int argc, char** argv) {
                 static const int64_t late_head_tp_keep = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_KEEP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
                 size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
                                     ? std::min(rows.size(), (size_t) head_want) : 0;
-                if (paced && tpp_read_req && late_head_tp_keep >= 0 && rows.size() > (size_t) late_head_tp_keep)
+                // STRATA_REFILL_HEAD_TP_MIN=<tokens> (default 0): only after a prompt of at least that many tokens (an 8K
+                // TP read's loan is refilled beside the first windows at no measured decode cost; a head there costs TTFT)
+                static const int64_t late_head_tp_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                if (paced && tpp_read_req && late_head_tp_keep >= 0 && req_prompt_n >= late_head_tp_min &&
+                    rows.size() > (size_t) late_head_tp_keep)
                     head_n = std::max(head_n, rows.size() - (size_t) late_head_tp_keep);
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
