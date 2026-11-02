@@ -90,12 +90,13 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -
   -DSTRATA_MMQ_KQUANTS=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DCMAKE_HIP_COMPILER=$R/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$R \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$R --rocm-device-lib-path=$R/lib/llvm/amdgcn/bitcode" \
-  -DSTRATA_ROCWMMA_INCLUDE_DIR=<rocWMMA>/library/include
+  -DSTRATA_ROCWMMA_INCLUDE_DIR=<rocWMMA>/library/include -DCMAKE_PREFIX_PATH=$R
 cmake --build build -j
 ```
 
 `STRATA_MMQ_KQUANTS=ON` matters for the Q4 (k-quant) pack: without it, two-GPU Q4 prefill is 7-13 % slower
-(32K: ~4,170 instead of ~4,770 tok/s).  IQ3/IQ4 are unaffected.
+(32K: ~4,170 instead of ~4,770 tok/s).  IQ3/IQ4 are unaffected.  `CMAKE_PREFIX_PATH` lets CMake find `libhsa-runtime64`: without it the binary
+builds with `STRATA_NO_HSA` and `STRATA_REFILL_SDMA=1` silently stays on `hipMemcpyAsync` (the configure step now warns).
 
 **Settings used for the numbers above:** the exact environment and command line of each of the six setups are in
 [`docs/RDNA3_SETTINGS.md`](docs/RDNA3_SETTINGS.md).  The tuned paths are environment switches (`STRATA_GR_RDNA=1`,
