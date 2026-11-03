@@ -28,8 +28,9 @@
 ## RDNA3 / RX 7900 XTX fork
 
 Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, release
-`claude-20261102-rg24` on two GPUs and `claude-20261101-rg23` on one (the releases in production on 2026-11-02), with
-every expert computed (no expert skipping). Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs; the faint band
+`claude-20261102-p16k` on two GPUs (16K prompts measured on it; the other lengths take the same path as on
+`claude-20261102-rg24`, where they were measured) and `claude-20261101-rg23` on one (production from 2026-11-02), with
+every expert computed (no expert skipping). Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs except 16K; the faint band
 is the trial range); every request was checked for exact input length, 256 output tokens and correct retrieval, with no
 prompt cache.
 
@@ -53,7 +54,9 @@ of text.
 
 Fastest measured decode: IQ3_S on 2 GPUs writing code, 189 tok/s (4K context). On 2 GPUs all three quants decode
 tensor parallel (UD-Q4_K_XL since 2026-11-02, before that a pipelined layer split); prompts take one of three paths by
-length (below). UD-IQ4_XS and IQ3_S 2-GPU code cells are rg23 sweeps (rg24 changes only prompts of 3K-12K).
+length (below). UD-IQ4_XS and IQ3_S 2-GPU code cells other than 16K are rg23 sweeps (rg24 / p16k change only prompt reads,
+from 3K tokens). At 16K on 2 GPUs prefill is IQ3_S 4,904, UD-IQ4_XS 5,034 and UD-Q4_K_XL 5,000 tok/s (English; 1.56x /
+1.71x / 1.77x one GPU, was 1.52x / 1.45x / 1.29x before p16k).
 
 ### How the two cards are used
 
@@ -61,7 +64,7 @@ length (below). UD-IQ4_XS and IQ3_S 2-GPU code cells are rg23 sweeps (rg24 chang
 |---|---|---|
 | Decode | tensor parallel (`--tensor-parallel 2`) | tensor parallel (since 2026-11-02; before: layer split + `--pipeline-windows 2`) |
 | Short prompts | one chunk through the layer split, the idle card computing part of the other's experts | same |
-| Mid-length prompts | tensor-parallel prefill, 3,072 (IQ3_S) / 5,120 (UD-IQ4_XS) to 12,288 tokens | one chunk (tensor-parallel prefill is link-bound on Q4), then data parallel from 18,000 tokens |
+| Mid-length prompts | tensor-parallel prefill in one chunk, 3,072 (IQ3_S) / 5,120 (UD-IQ4_XS) to 18,432 tokens, with the refill head | one chunk below 10,240 tokens, then tensor-parallel prefill in one chunk to 28,672 tokens with the refill head |
 | Long prompts | data parallel | data parallel |
 
 **Tensor-parallel decode.** Every layer runs on both cards: attention is split by head, the routed experts are split by
@@ -101,12 +104,20 @@ split by head, attention by query (keys and values exchanged), experts by id. Wi
 `STRATA_TP_PREFILL_MAX=12288` and `STRATA_TP_PREFILL_MIN` 3072 (IQ3_S) / 5120 (UD-IQ4_XS), prefill against the previous
 release: IQ3_S +18.5 % at 4K and +41.6 % at 8K, UD-IQ4_XS +31.8 % at 8K and about +15 % at 12K, decode unchanged.
 
-It stops at 12K because a prompt chunk borrows expert slots from the decode cache. Data parallel gives card 0's slots
-back while card 1 is still reading; tensor parallel keeps both cards busy to the last layer, so both caches refill under
-the first decode windows. Read as one 16K chunk, the decode after it hit its cache about 96 % of the time instead of
-98 % and its windows were 2.7-5.4 % slower; with 8,448-token chunks the prefill gain at 16K was gone. Above 12K
-data parallel stays. On UD-Q4_K_XL tensor-parallel prefill is link-bound (at 16K each card streams ~29 GB of experts
-plus ~10 GB of exchanges through one PCIe 4.0 x8 link) and loses at every length, so it is not used there.
+rg24 stopped it at 12K because a prompt chunk borrows expert slots from the decode cache. Data parallel gives card 0's
+slots back while card 1 is still reading; tensor parallel keeps both cards busy to the last layer, so both caches refill
+under the first decode windows: read as one 16K chunk, the decode after it hit its cache about 96 % of the time instead
+of 98 % and its windows were 2.7-5.4 % slower. **The refill head (release `claude-20261102-p16k`):** after a
+tensor-parallel read of at least 8,449 tokens each card waits, before the first token, for every borrowed slot but its
+coldest 900 (IQ3_S) / 800 (UD-IQ4_XS) / 1,400 (UD-Q4_K_XL) (`STRATA_REFILL_HEAD_TP_KEEP`, `STRATA_REFILL_HEAD_TP_MIN`),
+about 0.2-0.35 s, so the decode starts with no more experts missing than after a data-parallel read. The refill goes
+hottest first (an eighth of the borrowed slots holds ~60 % of the prompt's expert rows), and one big chunk saves more
+than the wait costs. Tensor-parallel prefill now reads one chunk up to 18,432 tokens on IQ3_S / UD-IQ4_XS and from 10,240
+to 28,672 on UD-Q4_K_XL. Against rg24 in interleaved pairs: IQ3_S +7.5 % at 12K and +2.9 % at 16K, UD-IQ4_XS +26 % / +17.5 %,
+UD-Q4_K_XL +19 / +37 / +31 / +14 % at 12K / 16K / 20K / 24K, decode windows equal or faster, 8K unchanged.
+UD-Q4_K_XL was excluded before because on its layer split each card held only its own layers' experts and the read was
+link-bound; on the tensor-parallel layout each card holds part of every layer, the streamed experts split evenly over
+the two links, and the 16K read is 43 % faster even without the head.
 
 **Against an RTX 4090** (IQ3_S, the exact requests of the public
 [nvidia-4090-flash-next-inference](https://github.com/AnnoyingTechnology/nvidia-4090-flash-next-inference) run of
@@ -125,7 +136,7 @@ plus ~10 GB of exchanges through one PCIe 4.0 x8 link) and loses at every length
   [xyzzing/Strata](https://github.com/xyzzing/Strata)); the chunked GDN recurrence on FP16 matrix cores; FP16 pair
   expert kernels (empty-column skip, 3 blocks a WGP, FP16 IQ codebooks); prompt hyper-connection kernels (upmix at 512
   threads, vectorised write+norm); K-quant MMQ; a dual-GPU data-parallel prompt path (`STRATA_DP_PREFILL=1`, chunk
-  8448 on IQ3_S); tensor-parallel prefill on IQ3_S / UD-IQ4_XS for 3K-12K prompts (`STRATA_TP_PREFILL=1`); a routed CPU+GPU expert walk for short prompts on the Q4 layer split; LDS-staged attention.
+  8448 on IQ3_S); tensor-parallel prefill on IQ3_S / UD-IQ4_XS for 3K-18K and UD-Q4_K_XL for 10K-28K prompts (`STRATA_TP_PREFILL=1`) with a tensor-parallel-only refill head (`STRATA_REFILL_HEAD_TP_KEEP`); a routed CPU+GPU expert walk for short prompts on the Q4 layer split; LDS-staged attention.
 - Loading: on Linux the expert arena is read with O_DIRECT when the page cache could not keep it (a 72 GB Q4 arena
   loads at ~1.9 instead of ~1.0 GiB/s).
 - CPU: IQ AVX-512 init stays safe on AVX2-only hosts (PR #1).
