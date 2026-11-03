@@ -66,6 +66,12 @@ Notes on what differs from the production files, and why:
   calls), and it costs code decode 11% through MTP acceptance (drafts that repeat earlier tokens are rejected more).
   English is equal within noise. Before this was found, the template A/B against production (whose older server has
   no model-card defaults) read 1.99 vs 2.08 tokens a window on Q4 2 GPUs at 16K with the same ms per window.
+- **`STRATA_ENGINE_NICE=0`** in each config's `env` (added 2026-11-02, read by `serve/server.py`, not the engine). Upstream's
+  server starts the engine at nice +5 on a PC whose HIP devices include a built-in Radeon (it keeps an APU desktop
+  responsive); the Ryzen 9 9950X3D2's iGPU (gfx1036) counts, so the engine ran below every other process. On Q4 2 GPUs
+  through production, 2 of 4 fresh starts at nice +5 were slow (16K decode 22.4-33.0 ms per window, model load 0.86-1.02
+  GB/s) against 0 of 3 at nice 0 and 0 of 4 on the old server (17.2-18.4 ms, ~1.9 GB/s). The reference numbers are at
+  nice 0.
 - The vision encoder (`--vision`, the BF16 mmproj from `setup.py`) is as in production; `run.py --no-vision` drops it.
 
 ## What was measured, on what

@@ -106,7 +106,8 @@
   "STRATA_ADAPT_OVERLAP": "1",
   "STRATA_PF_FUSED_KQ": "1",
   "STRATA_TOPK_SPLIT_MIN": "98304",
-  "STRATA_QSA_ROWS": "1"
+  "STRATA_QSA_ROWS": "1",
+  "STRATA_ENGINE_NICE": "0"
  },
  "sampling": {
   "temperature": 0.6,
