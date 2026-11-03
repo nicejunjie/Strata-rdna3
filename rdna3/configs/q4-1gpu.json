@@ -109,7 +109,8 @@
  "sampling": {
   "temperature": 0.6,
   "top_p": 0.95,
-  "top_k": 20
+  "top_k": 20,
+  "presence_penalty": 0.0
  },
  "vision": {
   "exe": "@STRATA@/engine/strata-vision",

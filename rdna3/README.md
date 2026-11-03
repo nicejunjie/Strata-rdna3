@@ -49,6 +49,13 @@ Notes on what differs from the production files, and why:
   here it is this checkout's `serve/server.py`), the per-GPU-layout tables (`aibox_layouts`, `aibox_single_gpu`:
   already resolved into each config) and the frozen per-layout executable paths and their sha256 (here: the
   engine you build). `engine_silence_s` stays at the sweeps' 1800 s (production's proxy uses 600).
+- **`"presence_penalty": 0` in each config's `sampling` block** (added 2026-11-02 after an A/B against production).
+  This checkout's `serve/server.py` fills the fields a request leaves out from the model card (#2685); with thinking
+  off that set includes `presence_penalty` 1.5, and the config's block only overrides temperature, top_p and top_k.
+  Production's HTTP server is older and has no model-card defaults, so its requests carry no penalty. Without the 0,
+  every bench request (thinking off, no `presence_penalty`) decoded with the penalty: different text and fewer MTP
+  drafts accepted. On Q4 2 GPUs at 16K that was 1.99 against production's 2.08 tokens a window (-4%) at the same
+  ms per window (17.65 vs 17.87).
 - The vision encoder (`--vision`, the BF16 mmproj from `setup.py`) is as in production; `run.py --no-vision` drops it.
 
 ## What was measured, on what

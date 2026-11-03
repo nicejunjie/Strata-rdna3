@@ -9,6 +9,9 @@ server adds `--layer-split 24`, and `--tensor-parallel 2` then runs every layer 
 chunk, for prompts of 3K-18K (IQ3_S), 5K-18K (UD-IQ4_XS) or 10K-28K (UD-Q4_K_XL) tokens; other prompts read the
 layer split on both GPUs (the DP prompt path).
 
+Sampling defaults (the server's, for fields a request leaves out): temperature 0.6, top_p 0.95, top_k 20 and
+presence_penalty 0 (see rdna3/README.md: the server's model-card default would otherwise add 1.5 with thinking off).
+
 ## IQ3_S (GSQ-RCO), 2 GPUs
 
 ```
