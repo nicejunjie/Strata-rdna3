@@ -10,7 +10,7 @@ the start, middle and end, followed by a request for a long answer; 256 output t
 prompt cache, thinking off.  Each request must report exactly n prompt tokens (none cached) and 256 completion tokens,
 and must return the three codes (retrieval).  Speeds are the engine's own timings (prompt_per_second,
 predicted_per_second); a cell is the median of the three.  Results: <out>/<setup>/, summary.json, and a table against
-rdna3/reference.json (the README run, 2026-10-13).
+rdna3/reference.json (production, 2026-11-02).
 """
 import argparse
 import hashlib
@@ -51,6 +51,7 @@ def encoder(cfg):
     service.template = ChatTemplate(path / "chat_template.jinja")
     service.effort_end = False
     service.literals = literal_tags(getattr(service.tok, "control_tokens", ()))
+    service.prompts = None                                # no kept-prompt reuse: every count is a full encode
     return service
 
 

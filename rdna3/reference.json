@@ -1,231 +1,393 @@
 {
- "_about": "README run, 2026-10-13: median of 3 per cell, tokens/s (engine timings); HIP devices 1 and 1,0",
+ "_about": "production 2026-11-02: 2 GPUs release claude-20261102-p16k (Strata-rdna3 main da76c449), 1 GPU release claude-20261101-rg23 (engine 3dbb4051); tokens/s, median of 3 per cell (engine timings), HIP devices 1 and 1,0. prefill/decode = this bench's English prompt (docs/social production-20261102 flash-next-source-data.csv); decode_code = the same lengths with a code-writing request (text-type-source-data.csv), for reference only",
  "iq3-1gpu": {
   "1024": {
-   "prefill": 763.2,
-   "decode": 94.7
+   "prefill": 808.3,
+   "decode": 118.7,
+   "decode_min": 106.8,
+   "decode_max": 125.2,
+   "decode_code": 146.6
   },
   "2048": {
-   "prefill": 1091.2,
-   "decode": 95.7
+   "prefill": 1156.7,
+   "decode": 126.3,
+   "decode_min": 124.5,
+   "decode_max": 127.3,
+   "decode_code": 149.9
   },
   "4096": {
-   "prefill": 1516.0,
-   "decode": 86.4
+   "prefill": 1560.4,
+   "decode": 121.1,
+   "decode_min": 113.4,
+   "decode_max": 124.0,
+   "decode_code": 154.3
   },
   "8192": {
-   "prefill": 2384.9,
-   "decode": 95.7
+   "prefill": 2435.6,
+   "decode": 119.0,
+   "decode_min": 113.6,
+   "decode_max": 120.4,
+   "decode_code": 144.4
   },
   "16384": {
-   "prefill": 3069.7,
-   "decode": 87.4
+   "prefill": 3149.9,
+   "decode": 115.0,
+   "decode_min": 114.7,
+   "decode_max": 115.7,
+   "decode_code": 140.3
   },
   "32768": {
-   "prefill": 3431.5,
-   "decode": 100.0
+   "prefill": 3540.9,
+   "decode": 114.1,
+   "decode_min": 111.1,
+   "decode_max": 118.8,
+   "decode_code": 139.3
   },
   "65536": {
-   "prefill": 3520.0,
-   "decode": 98.1
+   "prefill": 3630.6,
+   "decode": 110.2,
+   "decode_min": 106.5,
+   "decode_max": 118.2,
+   "decode_code": 142.5
   },
   "131072": {
-   "prefill": 3436.1,
-   "decode": 100.4
+   "prefill": 3552.8,
+   "decode": 112.9,
+   "decode_min": 110.4,
+   "decode_max": 118.5,
+   "decode_code": 142.7
   },
   "261632": {
-   "prefill": 3090.7,
-   "decode": 93.6
+   "prefill": 3310.7,
+   "decode": 111.8,
+   "decode_min": 91.2,
+   "decode_max": 112.5,
+   "decode_code": 138.1
   }
  },
  "iq3-2gpu": {
   "1024": {
-   "prefill": 1074.6,
-   "decode": 126.2
+   "prefill": 1259.7,
+   "decode": 152.4,
+   "decode_min": 149.4,
+   "decode_max": 153.2,
+   "decode_code": 187.4
   },
   "2048": {
-   "prefill": 1498.5,
-   "decode": 121.4
+   "prefill": 2201.0,
+   "decode": 142.7,
+   "decode_min": 140.2,
+   "decode_max": 151.2,
+   "decode_code": 188.8
   },
   "4096": {
-   "prefill": 2243.0,
-   "decode": 123.5
+   "prefill": 3404.5,
+   "decode": 145.8,
+   "decode_min": 135.4,
+   "decode_max": 149.6,
+   "decode_code": 189.0
   },
   "8192": {
-   "prefill": 3042.9,
-   "decode": 126.1
+   "prefill": 4585.5,
+   "decode": 142.9,
+   "decode_min": 134.8,
+   "decode_max": 152.6,
+   "decode_code": 173.2
   },
   "16384": {
-   "prefill": 4409.2,
-   "decode": 124.2
+   "prefill": 4903.8,
+   "decode": 142.5,
+   "decode_min": 139.2,
+   "decode_max": 145.8,
+   "decode_code": 174.2
   },
   "32768": {
-   "prefill": 6020.1,
-   "decode": 124.3
+   "prefill": 6759.9,
+   "decode": 129.8,
+   "decode_min": 126.8,
+   "decode_max": 140.1,
+   "decode_code": 169.9
   },
   "65536": {
-   "prefill": 6322.7,
-   "decode": 120.2
+   "prefill": 7056.3,
+   "decode": 129.1,
+   "decode_min": 121.4,
+   "decode_max": 136.4,
+   "decode_code": 156.0
   },
   "131072": {
-   "prefill": 6425.9,
-   "decode": 122.9
+   "prefill": 6777.8,
+   "decode": 141.1,
+   "decode_min": 139.0,
+   "decode_max": 141.9,
+   "decode_code": 162.7
   },
   "261632": {
-   "prefill": 5908.7,
-   "decode": 118.2
+   "prefill": 6405.0,
+   "decode": 127.4,
+   "decode_min": 123.9,
+   "decode_max": 140.2,
+   "decode_code": 161.8
   }
  },
  "iq4-1gpu": {
   "1024": {
-   "prefill": 656.7,
-   "decode": 87.0
+   "prefill": 674.6,
+   "decode": 100.1,
+   "decode_min": 90.1,
+   "decode_max": 101.6,
+   "decode_code": 125.7
   },
   "2048": {
-   "prefill": 935.5,
-   "decode": 86.6
+   "prefill": 971.0,
+   "decode": 95.8,
+   "decode_min": 94.5,
+   "decode_max": 100.3,
+   "decode_code": 127.2
   },
   "4096": {
-   "prefill": 1341.7,
-   "decode": 81.0
+   "prefill": 1375.9,
+   "decode": 99.3,
+   "decode_min": 99.0,
+   "decode_max": 101.0,
+   "decode_code": 129.2
   },
   "8192": {
-   "prefill": 1992.0,
-   "decode": 78.6
+   "prefill": 2039.3,
+   "decode": 93.9,
+   "decode_min": 91.3,
+   "decode_max": 97.2,
+   "decode_code": 128.2
   },
   "16384": {
-   "prefill": 2761.0,
-   "decode": 82.5
+   "prefill": 2939.9,
+   "decode": 96.3,
+   "decode_min": 93.7,
+   "decode_max": 96.6,
+   "decode_code": 124.2
   },
   "32768": {
-   "prefill": 3140.5,
-   "decode": 77.7
+   "prefill": 3454.8,
+   "decode": 94.2,
+   "decode_min": 93.0,
+   "decode_max": 94.2,
+   "decode_code": 122.3
   },
   "65536": {
-   "prefill": 3250.8,
-   "decode": 81.0
+   "prefill": 3549.5,
+   "decode": 95.7,
+   "decode_min": 91.1,
+   "decode_max": 98.6,
+   "decode_code": 126.4
   },
   "131072": {
-   "prefill": 3201.4,
-   "decode": 82.5
+   "prefill": 3480.2,
+   "decode": 91.9,
+   "decode_min": 87.7,
+   "decode_max": 96.2,
+   "decode_code": 120.6
   },
   "261632": {
-   "prefill": 2903.0,
-   "decode": 77.5
+   "prefill": 3251.0,
+   "decode": 89.0,
+   "decode_min": 84.2,
+   "decode_max": 95.2,
+   "decode_code": 117.3
   }
  },
  "iq4-2gpu": {
   "1024": {
-   "prefill": 917.2,
-   "decode": 117.6
+   "prefill": 1527.7,
+   "decode": 133.1,
+   "decode_min": 121.9,
+   "decode_max": 135.1,
+   "decode_code": 171.9
   },
   "2048": {
-   "prefill": 1227.1,
-   "decode": 118.1
+   "prefill": 1918.5,
+   "decode": 143.4,
+   "decode_min": 139.4,
+   "decode_max": 145.8,
+   "decode_code": 180.9
   },
   "4096": {
-   "prefill": 1622.7,
-   "decode": 108.3
+   "prefill": 3023.8,
+   "decode": 130.3,
+   "decode_min": 128.9,
+   "decode_max": 135.6,
+   "decode_code": 178.7
   },
   "8192": {
-   "prefill": 2219.7,
-   "decode": 108.5
+   "prefill": 4597.1,
+   "decode": 130.6,
+   "decode_min": 129.5,
+   "decode_max": 133.5,
+   "decode_code": 173.8
   },
   "16384": {
-   "prefill": 3706.2,
-   "decode": 106.9
+   "prefill": 5033.8,
+   "decode": 132.0,
+   "decode_min": 125.1,
+   "decode_max": 132.8,
+   "decode_code": 180.7
   },
   "32768": {
-   "prefill": 5549.7,
-   "decode": 110.8
+   "prefill": 7059.5,
+   "decode": 127.8,
+   "decode_min": 125.0,
+   "decode_max": 129.3,
+   "decode_code": 167.1
   },
   "65536": {
-   "prefill": 6069.5,
-   "decode": 109.3
+   "prefill": 7230.3,
+   "decode": 123.8,
+   "decode_min": 123.0,
+   "decode_max": 127.9,
+   "decode_code": 170.1
   },
   "131072": {
-   "prefill": 6193.2,
-   "decode": 112.0
+   "prefill": 7082.3,
+   "decode": 126.8,
+   "decode_min": 118.7,
+   "decode_max": 128.9,
+   "decode_code": 159.1
   },
   "261632": {
-   "prefill": 5727.6,
-   "decode": 108.4
+   "prefill": 6585.5,
+   "decode": 129.9,
+   "decode_min": 126.3,
+   "decode_max": 132.6,
+   "decode_code": 158.4
   }
  },
  "q4-1gpu": {
   "1024": {
-   "prefill": 495.7,
-   "decode": 61.2
+   "prefill": 516.8,
+   "decode": 74.6,
+   "decode_min": 59.9,
+   "decode_max": 79.8,
+   "decode_code": 96.7
   },
   "2048": {
-   "prefill": 741.8,
-   "decode": 66.3
+   "prefill": 745.8,
+   "decode": 75.3,
+   "decode_min": 67.6,
+   "decode_max": 81.7,
+   "decode_code": 98.3
   },
   "4096": {
-   "prefill": 1101.8,
-   "decode": 68.3
+   "prefill": 1109.7,
+   "decode": 77.7,
+   "decode_min": 66.3,
+   "decode_max": 80.2,
+   "decode_code": 102.5
   },
   "8192": {
-   "prefill": 1539.8,
-   "decode": 67.9
+   "prefill": 1538.2,
+   "decode": 77.7,
+   "decode_min": 65.8,
+   "decode_max": 78.0,
+   "decode_code": 96.8
   },
   "16384": {
-   "prefill": 2819.5,
-   "decode": 63.6
+   "prefill": 2825.8,
+   "decode": 77.3,
+   "decode_min": 74.5,
+   "decode_max": 77.5,
+   "decode_code": 93.9
   },
   "32768": {
-   "prefill": 3511.4,
-   "decode": 67.5
+   "prefill": 3612.6,
+   "decode": 78.3,
+   "decode_min": 74.3,
+   "decode_max": 78.3,
+   "decode_code": 95.6
   },
   "65536": {
-   "prefill": 3625.0,
-   "decode": 65.7
+   "prefill": 3743.9,
+   "decode": 79.4,
+   "decode_min": 78.8,
+   "decode_max": 81.9,
+   "decode_code": 97.4
   },
   "131072": {
-   "prefill": 3556.1,
-   "decode": 67.0
+   "prefill": 3675.6,
+   "decode": 80.9,
+   "decode_min": 76.3,
+   "decode_max": 81.2,
+   "decode_code": 98.3
   },
   "261632": {
-   "prefill": 3127.4,
-   "decode": 56.2
+   "prefill": 3442.4,
+   "decode": 72.1,
+   "decode_min": 67.6,
+   "decode_max": 73.4,
+   "decode_code": 95.6
   }
  },
  "q4-2gpu": {
   "1024": {
-   "prefill": 726.2,
-   "decode": 109.7
+   "prefill": 1121.1,
+   "decode": 116.4,
+   "decode_min": 98.2,
+   "decode_max": 129.2,
+   "decode_code": 149.2
   },
   "2048": {
-   "prefill": 1000.2,
-   "decode": 106.7
+   "prefill": 1504.7,
+   "decode": 127.4,
+   "decode_min": 118.7,
+   "decode_max": 129.9,
+   "decode_code": 159.6
   },
   "4096": {
-   "prefill": 1024.1,
-   "decode": 112.1
+   "prefill": 2098.7,
+   "decode": 126.4,
+   "decode_min": 120.9,
+   "decode_max": 132.5,
+   "decode_code": 157.5
   },
   "8192": {
-   "prefill": 1403.3,
-   "decode": 102.6
+   "prefill": 3311.8,
+   "decode": 122.5,
+   "decode_min": 117.6,
+   "decode_max": 129.5,
+   "decode_code": 147.7
   },
   "16384": {
-   "prefill": 2924.4,
-   "decode": 105.9
+   "prefill": 5000.5,
+   "decode": 121.6,
+   "decode_min": 120.5,
+   "decode_max": 122.8,
+   "decode_code": 148.7
   },
   "32768": {
-   "prefill": 4710.8,
-   "decode": 97.5
+   "prefill": 5770.0,
+   "decode": 116.6,
+   "decode_min": 111.4,
+   "decode_max": 118.7,
+   "decode_code": 142.5
   },
   "65536": {
-   "prefill": 5592.2,
-   "decode": 99.2
+   "prefill": 7193.5,
+   "decode": 109.9,
+   "decode_min": 107.1,
+   "decode_max": 117.8,
+   "decode_code": 141.0
   },
   "131072": {
-   "prefill": 5723.9,
-   "decode": 101.7
+   "prefill": 7089.2,
+   "decode": 113.5,
+   "decode_min": 110.0,
+   "decode_max": 118.5,
+   "decode_code": 141.3
   },
   "261632": {
-   "prefill": 5308.8,
-   "decode": 92.7
+   "prefill": 6604.4,
+   "decode": 113.5,
+   "decode_min": 109.5,
+   "decode_max": 122.9,
+   "decode_code": 141.2
   }
  }
 }

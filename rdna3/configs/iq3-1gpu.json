@@ -37,6 +37,12 @@
   "auto",
   "--ple-row-cache",
   "1048576",
+  "--conversation-cache-mib",
+  "8192",
+  "--conversation-cache-slots",
+  "8",
+  "--mtp-draft-vocab",
+  "@STRATA@/rdna3/draft_vocab_zh60k.bin",
   "--kv-resident",
   "32768",
   "--pcie-frac",
@@ -48,7 +54,11 @@
   "--mtp-q4",
   "all",
   "--mtp-window",
-  "4096"
+  "4096",
+  "--adapt-every",
+  "1",
+  "--adapt-swaps",
+  "32"
  ],
  "env": {
   "STRATA_HIPBLASLT_TUNING": "@STRATA@/tools/hip/gfx1100-hipblaslt-100200.txt",
@@ -71,8 +81,8 @@
   "STRATA_GR_INJ_UP": "1",
   "STRATA_PF_FUSED": "1",
   "STRATA_STAGER_RING": "64",
-  "STRATA_PREFILL_CPU_SHARE": "auto",
-  "STRATA_PREFILL_CPU_SHARE_MAX": "6144",
+  "STRATA_PREFILL_CPU_SHARE": "0.6",
+  "STRATA_PREFILL_CPU_SHARE_MAX": "4096",
   "GPU_MAX_HW_QUEUES": "6",
   "STRATA_GR_FUSED": "1",
   "STRATA_GDN_HEAD": "1",
@@ -92,7 +102,10 @@
   "STRATA_PF_GROUP_RES": "1",
   "STRATA_PF_F16": "2",
   "STRATA_PREFILL_RING": "192",
-  "STRATA_KV_HOST_DMA": "1"
+  "STRATA_KV_HOST_DMA": "1",
+  "STRATA_ADAPT_OVERLAP": "1",
+  "STRATA_TOPK_SPLIT_MIN": "98304",
+  "STRATA_QSA_ROWS": "1"
  },
  "sampling": {
   "temperature": 0.6,
