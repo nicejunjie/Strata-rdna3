@@ -8064,8 +8064,11 @@ FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
 MODEL_CARD_SAMPLING = {
     # Qwen3.8-Flash-Next (and Gyro, the same base model)
+    # [claude] RDNA3 fork: presence_penalty 0 where the card says 1.5 (non-thinking).  Measured 2026-11-02 on IQ3_S 2 GPUs
+    # (rdna3/README.md): 1.5 showed no quality gain (qeval2 40/40, tools 24/24, 0 loops in 40 long replies either way) and
+    # cost MTP acceptance - 16K code decode 157 -> 177 tok/s at 0.  A request's own presence_penalty still wins.
     "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
-                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 0.0}},
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},

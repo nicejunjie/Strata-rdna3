@@ -10,7 +10,9 @@ chunk, for prompts of 3K-18K (IQ3_S), 5K-18K (UD-IQ4_XS) or 10K-28K (UD-Q4_K_XL)
 layer split on both GPUs (the DP prompt path).
 
 Sampling defaults (the server's, for fields a request leaves out): temperature 0.6, top_p 0.95, top_k 20 and
-presence_penalty 0 (see rdna3/README.md: the server's model-card default would otherwise add 1.5 with thinking off).
+presence_penalty 0 - also the fork's model-card default for Qwen3.8-Flash-Next since 2026-11-02 (upstream: 1.5 with
+thinking off). Measured on IQ3_S 2 GPUs: 16K code decode 177.2 tok/s at 0 vs 157.1 at 1.5 (2.88 vs 2.54 tokens a window),
+English 144.8 vs 147.3 (noise); qeval2 40/40, tools 24/24 and 0 loops in 40 long replies at both. Table: rdna3/README.md.
 
 ## IQ3_S (GSQ-RCO), 2 GPUs
 
