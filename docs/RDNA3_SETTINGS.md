@@ -14,6 +14,15 @@ presence_penalty 0 - also the fork's model-card default for Qwen3.8-Flash-Next s
 thinking off). Measured on IQ3_S 2 GPUs: 16K code decode 177.2 tok/s at 0 vs 157.1 at 1.5 (2.88 vs 2.54 tokens a window),
 English 144.8 vs 147.3 (noise); qeval2 40/40, tools 24/24 and 0 loops in 40 long replies at both. Table: rdna3/README.md.
 
+`GPU_MAX_HW_QUEUES` (8 with 2 GPUs, 6 with 1 GPU) and idle power: gfx1100 gives a process 8 compute queue slots a
+card (`/sys/class/kfd/kfd/topology/nodes/<n>/properties`: `num_cp_queues 8`), and HIP opens `GPU_MAX_HW_QUEUES` queues
+per priority level plus one 4 KB runtime queue. 8 is therefore 9 queues a card: the kernel's scheduler (MES) time-slices
+them forever and **both cards stay at 100% busy, full clock, ~90-100 W while the server is idle** (no kernel runs; a
+rocprofv3 trace of 40 idle seconds is empty). 7, 6 or the default (4) fit and idle at ~5 W, but on 2 GPUs they cost
+the tensor-parallel prompt path 27-31% at 8K (IQ3_S, UD-IQ4_XS; at 7 the prompt's exchange stream shares a card's
+compute queue) and UD-IQ4_XS 1K prompts 4%, so these settings keep 8 and accept the idle power. 1 GPU: 6 (7 queues) is
+idle-clean. Measurements: the aibox notes of 2026-11-03 (hwq-20261103).
+
 ## IQ3_S (GSQ-RCO), 2 GPUs
 
 ```
