@@ -23,6 +23,24 @@ the tensor-parallel prompt path 27-31% at 8K (IQ3_S, UD-IQ4_XS; at 7 the prompt'
 compute queue) and UD-IQ4_XS 1K prompts 4%, so these settings keep 8 and accept the idle power. 1 GPU: 6 (7 queues) is
 idle-clean. Measurements: the aibox notes of 2026-11-03 (hwq-20261103).
 
+## 2026-11-06 idle-power follow-up: Q6 + idle unload
+
+Problem: a production llama-swap RDNA3 target using the 2-GPU IQ3_S config stayed at **100% GPU busy, full clock, ~105-113 W per card** while loaded but idle. `top -H` showed the host threads sleeping and the server log stopped after the request, so the cards were not running useful inference.
+
+Cause: `GPU_MAX_HW_QUEUES=8` opens 9 HIP queues per card (8 compute queues plus the 4 KB runtime queue) while gfx1100 exposes 8 KFD compute queue slots. MES keeps time-slicing the queue slots forever even when no kernel is running. This matches the queue-slot note above.
+
+Measured on 2x RX 7900 XTX, IQ3_S, engine `0.1.49.1`, same command line except `GPU_MAX_HW_QUEUES`:
+
+| `GPU_MAX_HW_QUEUES` | loaded idle | 128-token decode | 512-token decode | 6132-token prompt |
+|---:|---|---:|---:|---:|
+| 8 | 100%, 105-113 W | 148.9 tok/s | 131.6 tok/s | 1603 ms |
+| 6 | 0%, 10-17 W | 146.4 tok/s | 130.2 tok/s | 1854 ms |
+| 7 | 0%, 13-14 W | 145.9 tok/s | 128.6 tok/s | 2236 ms |
+
+`--pipeline-windows 0` did not change the loaded-idle behavior. Q6 prefill tuning with `STRATA_DP_PIPE_CHUNK=11264`, `STRATA_PREFILL_RING=96`, or both did not recover the 6k prompt penalty.
+
+Recommendation: keep Q8 when long-prompt speed is the priority and loaded idle power is acceptable. For deployments that need low loaded-idle power, use [`rdna3/configs/iq3-2gpu-low-idle.json`](../rdna3/configs/iq3-2gpu-low-idle.json): Q6 plus `"idle_unload_s": 600`. Q6 costs about 1-2% short decode but about 15% on this 6k prompt; Q7 was not a better tradeoff in this test.
+
 ## IQ3_S (GSQ-RCO), 2 GPUs
 
 ```
