@@ -26,6 +26,10 @@ is ROCr's utility queue, and after 2 s without any submission the engine deactiv
 8 queues and idles); the next submission reactivates it within 2 ms. Idle 98 + 91 W -> 5 + 13 W, prefill and ms/window
 equal at 1K-128K (IQ3_S, UD-IQ4_XS, Q4_K_M). It only acts on a card holding more than 8 queues;
 `STRATA_KFDQ=0` turns it off, `STRATA_KFDQ_LOG=1` logs it. 1 GPU: 6 (7 queues) is idle-clean anyway.
+The 8 slots are per card, not per process: when another process (a GPU vision server, a second engine) also holds
+queues on the card and the total read from KFD's sysfs is over 8, the idle engine parks all of its queues there.
+Cost: the first request after an idle period starts 4-10 ms later (waking the card; an idle card without parking
+already adds 11-20 ms); decode and prefill speed are unchanged.
 Measurements: the aibox notes of 2026-11-03 (hwq-20261103) and 2026-11-07 (kfdq-20261107).
 
 ## IQ3_S (GSQ-RCO), 2 GPUs

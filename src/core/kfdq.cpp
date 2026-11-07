@@ -6,7 +6,9 @@
 // ~95 W, while idle. Fewer HIP queues fit but decode 2-5% slower. This keeps the 9 queues while the engine submits work
 // and deactivates the utility queue (AMDKFD_IOC_UPDATE_QUEUE, percentage 0 - the call ROCr itself uses - so MES unmaps it)
 // after STRATA_KFDQ_IDLE_MS without any write-pointer change on any queue; the next submission reactivates it within
-// STRATA_KFDQ_POLL_US. Only a card holding more than STRATA_KFDQ_SLOTS (8) queues is touched.
+// STRATA_KFDQ_POLL_US. Only a card holding more than STRATA_KFDQ_SLOTS (8) queues is touched. When another process
+// (a vision server, a second engine) shares the card and the card's total from KFD's sysfs is over the slots, the idle
+// engine parks all of its queues on that card instead, so the other process's queues fit.
 // Measured (2x RX 7900 XTX, IQ3/IQ4/Q4, 1K-128K): idle 98 + 91 W -> 5 + 13 W, prefill and ms/window equal.
 //
 // Mechanism: the strata executable defines and exports ioctl() (CMake: --export-dynamic-symbol=ioctl), so ROCr's
@@ -14,6 +16,7 @@
 // Env: STRATA_KFDQ=0 off; STRATA_KFDQ_SLOTS (8); STRATA_KFDQ_IDLE_MS (2000); STRATA_KFDQ_POLL_US (2000);
 //      STRATA_KFDQ_LOG=1 logs queue creation, park and unpark to stderr.
 #if defined(__linux__) && __has_include(<linux/kfd_ioctl.h>)
+#include <dirent.h>
 #include <dlfcn.h>
 #include <linux/kfd_ioctl.h>
 #include <pthread.h>
@@ -49,6 +52,12 @@ long now_ms() {
     return t.tv_sec * 1000L + t.tv_nsec / 1000000L;
 }
 
+double wall() {   // unix time with ms, for the STRATA_KFDQ_LOG lines
+    timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
 long env_long(const char* name, long def) {
     const char* e = getenv(name);
     return e && *e ? atol(e) : def;
@@ -72,6 +81,34 @@ int gpu_queues(uint32_t gpu) {
     return n;
 }
 
+// System-wide compute queues on one GPU (every process, from KFD's sysfs) and how many belong to other processes.
+int sys_queues(uint32_t gpu, int* others) {
+    int n = 0;
+    *others = 0;
+    char path[600], buf[32];
+    DIR* pd = opendir("/sys/class/kfd/kfd/proc");
+    if (!pd) return -1;
+    while (dirent* pe = readdir(pd)) {
+        if (pe->d_name[0] < '0' || pe->d_name[0] > '9') continue;
+        bool mine = atoi(pe->d_name) == static_cast<int>(getpid());
+        snprintf(path, sizeof path, "/sys/class/kfd/kfd/proc/%s/queues", pe->d_name);
+        DIR* qd = opendir(path);
+        if (!qd) continue;
+        while (dirent* qe = readdir(qd)) {
+            if (qe->d_name[0] < '0' || qe->d_name[0] > '9') continue;
+            unsigned long g = 0, ty = 9;
+            snprintf(path, sizeof path, "/sys/class/kfd/kfd/proc/%s/queues/%s/gpuid", pe->d_name, qe->d_name);
+            if (FILE* f = fopen(path, "r")) { if (fgets(buf, sizeof buf, f)) g = strtoul(buf, nullptr, 10); fclose(f); }
+            snprintf(path, sizeof path, "/sys/class/kfd/kfd/proc/%s/queues/%s/type", pe->d_name, qe->d_name);
+            if (FILE* f = fopen(path, "r")) { if (fgets(buf, sizeof buf, f)) ty = strtoul(buf, nullptr, 10); fclose(f); }
+            if (g == gpu && ty == 0) { n++; if (!mine) (*others)++; }   // type 0 = compute (AQL); SDMA queues map elsewhere
+        }
+        closedir(qd);
+    }
+    closedir(pd);
+    return n;
+}
+
 void* watcher(void*) {
     long last_act = now_ms();
     bool parked = false;
@@ -91,18 +128,40 @@ void* watcher(void*) {
         if (parked && act) {
             for (auto& q : qs)
                 if (q.used && q.parked) {
+                    double t0 = wall();
                     int rc = set_pct(q, run_pct(q));
                     q.parked = 0;
-                    if (logon) fprintf(stderr, "[kfdq %ld] unpark gpu %u q %u rc %d\n", (long) time(nullptr), q.a.gpu_id, q.a.queue_id, rc);
+                    if (logon) fprintf(stderr, "[kfdq %.3f] unpark gpu %u q %u rc %d ioctl_ms %.2f\n", wall(), q.a.gpu_id, q.a.queue_id, rc, (wall() - t0) * 1e3);
                 }
             parked = false;
         } else if (!parked && t - last_act >= idle_ms) {
-            for (auto& q : qs)
-                if (q.used && q.util && gpu_queues(q.a.gpu_id) > slots) {
+            // Per GPU: park the utility queue when this process alone holds more than the slots; when other processes
+            // also hold queues there (e.g. a vision server) and the card's total is over the slots, park every queue
+            // of this idle process so the rest fit.
+            uint32_t gpus[16];
+            bool all[16] = {};
+            int ng = 0;
+            for (auto& q : qs) {
+                if (!q.used || ng == 16) continue;
+                bool seen = false;
+                for (int g = 0; g < ng; g++) seen |= gpus[g] == q.a.gpu_id;
+                if (seen) continue;
+                int others = 0, tot = sys_queues(q.a.gpu_id, &others);
+                all[ng] = tot > slots && others > 0;
+                if (logon && all[ng]) fprintf(stderr, "[kfdq %.3f] gpu %u shared: %d compute queues, %d of other processes -> park all %d of ours\n", wall(), q.a.gpu_id, tot, others, gpu_queues(q.a.gpu_id));
+                gpus[ng++] = q.a.gpu_id;
+            }
+            for (auto& q : qs) {
+                if (!q.used || q.parked) continue;
+                int g = 0;
+                while (g < ng && gpus[g] != q.a.gpu_id) g++;
+                if (g < ng && (all[g] || (q.util && gpu_queues(q.a.gpu_id) > slots))) {
+                    double t0 = wall();
                     int rc = set_pct(q, 0);
                     if (rc == 0) { q.parked = 1; parked = true; }
-                    if (logon) fprintf(stderr, "[kfdq %ld] park gpu %u q %u rc %d\n", (long) time(nullptr), q.a.gpu_id, q.a.queue_id, rc);
+                    if (logon) fprintf(stderr, "[kfdq %.3f] park gpu %u q %u rc %d ioctl_ms %.2f\n", wall(), q.a.gpu_id, q.a.queue_id, rc, (wall() - t0) * 1e3);
                 }
+            }
             if (!parked) last_act = t;   // nothing over the slots: look again after another idle period
         }
         pthread_mutex_unlock(&mu);
@@ -143,7 +202,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
                     bool seen = false;
                     for (int g = 0; g < n_util_gpu; g++) seen |= util_gpu_seen[g] == a->gpu_id;
                     if (!seen && a->ring_size <= 65536 && n_util_gpu < 16) { util_gpu_seen[n_util_gpu++] = a->gpu_id; q.util = 1; }
-                    if (logon) fprintf(stderr, "[kfdq %ld] create gpu %u q %u ring %u util %d\n", (long) time(nullptr), a->gpu_id, a->queue_id, a->ring_size, q.util);
+                    if (logon) fprintf(stderr, "[kfdq %.3f] create gpu %u q %u ring %u util %d\n", wall(), a->gpu_id, a->queue_id, a->ring_size, q.util);
                     break;
                 }
             if (!th_started) {
