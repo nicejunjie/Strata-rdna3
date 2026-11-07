@@ -20,8 +20,13 @@ per priority level plus one 4 KB runtime queue. 8 is therefore 9 queues a card: 
 them forever and **both cards stay at 100% busy, full clock, ~90-100 W while the server is idle** (no kernel runs; a
 rocprofv3 trace of 40 idle seconds is empty). 7, 6 or the default (4) fit and idle at ~5 W, but on 2 GPUs they cost
 the tensor-parallel prompt path 27-31% at 8K (IQ3_S, UD-IQ4_XS; at 7 the prompt's exchange stream shares a card's
-compute queue) and UD-IQ4_XS 1K prompts 4%, so these settings keep 8 and accept the idle power. 1 GPU: 6 (7 queues) is
-idle-clean. Measurements: the aibox notes of 2026-11-03 (hwq-20261103).
+compute queue) and UD-IQ4_XS 1K prompts 4%, and even a stream plan that keeps the prompt path at 7 decodes 2-5% slower,
+so these settings keep 8. Since 2026-11-07 the engine fixes the idle power itself (`src/core/kfdq.cpp`): the 4 KB queue
+is ROCr's utility queue, and after 2 s without any submission the engine deactivates it through KFD (the card then holds
+8 queues and idles); the next submission reactivates it within 2 ms. Idle 98 + 91 W -> 5 + 13 W, prefill and ms/window
+equal at 1K-128K (IQ3_S, UD-IQ4_XS, Q4_K_M). It only acts on a card holding more than 8 queues;
+`STRATA_KFDQ=0` turns it off, `STRATA_KFDQ_LOG=1` logs it. 1 GPU: 6 (7 queues) is idle-clean anyway.
+Measurements: the aibox notes of 2026-11-03 (hwq-20261103) and 2026-11-07 (kfdq-20261107).
 
 ## IQ3_S (GSQ-RCO), 2 GPUs
 

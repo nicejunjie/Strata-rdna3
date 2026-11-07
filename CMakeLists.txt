@@ -787,6 +787,11 @@ endif()
     # CMAKE_PREFIX_PATH, and a silent STRATA_NO_HSA turned the SDMA refill off (TP refill on hipMemcpyAsync)
     find_library(STRATA_HSA_RUNTIME_LIB hsa-runtime64 HINTS ${CMAKE_PREFIX_PATH} ${CMAKE_HIP_COMPILER_ROCM_ROOT} $ENV{ROCM_PATH}
                  PATH_SUFFIXES lib lib64)
+    # [claude] 11-07 src/core/kfdq.cpp: the exported ioctl() lets the engine park ROCr's idle utility queue, so a card
+    # holding 9 queues (GPU_MAX_HW_QUEUES=8) idles at ~5-13 W instead of 100% busy at ~95 W (STRATA_KFDQ=0: off)
+    target_sources(strata PRIVATE src/core/kfdq.cpp)
+    target_link_options(strata PRIVATE "LINKER:--export-dynamic-symbol=ioctl")
+    target_link_libraries(strata PRIVATE ${CMAKE_DL_LIBS})
     if(STRATA_HSA_RUNTIME_LIB)
       target_link_libraries(strata PRIVATE ${STRATA_HSA_RUNTIME_LIB})
     else()
