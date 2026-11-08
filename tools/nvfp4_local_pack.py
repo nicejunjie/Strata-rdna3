@@ -434,36 +434,50 @@ def cmd_mtp(a) -> int:
 # ------------------------------------------------------------------------------------------------------ the slim GGUF
 def cmd_slim(a) -> int:
     """Copy a converted GGUF without its routed experts (and their .scale / .input_scale tensors): the file the engine
-    reads the dense weights from (--native / --native-dense-gguf), ~9 GB instead of ~74 GB, once experts.bin is cut."""
+    reads the dense weights from (--native / --native-dense-gguf), ~9 GB instead of ~74 GB, once experts.bin is cut.
+    [claude] 2026-11-07: every shard of a split GGUF (--gguf repeated, in order) is written to --out (a directory then)
+    under its own name, so --native keeps pointing at the same file names; split.tensors.count is set to the new total in
+    every shard (the engine requires all shards to agree). A pack with experts.bin reads no expert from the GGUF."""
     from _paths import add_gguf_py
     add_gguf_py()
     import gguf
     from gguf import GGUFReader, GGUFWriter, GGUFValueType as VT
-    rd = GGUFReader(a.gguf)
-    arch = rd.fields["general.architecture"].contents()
-    w = GGUFWriter(a.out, arch)
-    for key, f in rd.fields.items():
-        if key.startswith("GGUF.") or key == "general.architecture":
-            continue
-        vt = f.types[0]
-        w.add_key_value(key, f.contents(), vt, sub_type=f.types[-1] if vt == VT.ARRAY else None)
+    shards = a.gguf if isinstance(a.gguf, list) else [a.gguf]
+    readers = [GGUFReader(s) for s in shards]
+    total = sum(1 for rd in readers for t in rd.tensors if "_exps." not in t.name)
+    from pathlib import Path
+    out_dir = Path(a.out) if len(shards) > 1 else None
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
     kept = skipped = 0
-    for t in rd.tensors:
-        if "_exps." in t.name:
-            skipped += 1
-            continue
-        data = np.asarray(t.data)
-        qt = t.tensor_type
-        if qt in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
-            w.add_tensor(t.name, data)
-        else:                                   # raw bytes with the type: the quantized blocks (BF16 rides as uint16)
-            raw = np.ascontiguousarray(data).view(np.uint8)
-            w.add_tensor(t.name, raw, raw_dtype=qt, raw_shape=[int(x) for x in raw.shape])
-        kept += 1
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_tensors_to_file()
-    w.close()
+    for src, rd in zip(shards, readers):
+        dst = str(out_dir / Path(src).name) if out_dir is not None else a.out
+        arch = rd.fields["general.architecture"].contents() if "general.architecture" in rd.fields else None
+        w = GGUFWriter(dst, arch or "")
+        if arch is None:                         # a data shard without the architecture key: write none either
+            w.kv_data[0].pop("general.architecture", None)
+        for key, f in rd.fields.items():
+            if key.startswith("GGUF.") or key == "general.architecture":
+                continue
+            vt = f.types[0]
+            value = total if key == "split.tensors.count" else f.contents()
+            w.add_key_value(key, value, vt, sub_type=f.types[-1] if vt == VT.ARRAY else None)
+        for t in rd.tensors:
+            if "_exps." in t.name:
+                skipped += 1
+                continue
+            data = np.asarray(t.data)
+            qt = t.tensor_type
+            if qt in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16):
+                w.add_tensor(t.name, data)
+            else:                               # raw bytes with the type: the quantized blocks (BF16 rides as uint16)
+                raw = np.ascontiguousarray(data).view(np.uint8)
+                w.add_tensor(t.name, raw, raw_dtype=qt, raw_shape=[int(x) for x in raw.shape])
+            kept += 1
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
     print("slim: %d tensors kept, %d expert tensors left out -> %s" % (kept, skipped, a.out))
     return 0
 
@@ -672,7 +686,7 @@ def main() -> int:
     pr.add_argument("--model", required=True)
     pr.add_argument("--out", required=True)
     sl = sub.add_parser("slim")
-    sl.add_argument("--gguf", required=True)
+    sl.add_argument("--gguf", required=True, action="append", help="repeat for every shard, in order")
     sl.add_argument("--out", required=True)
     v = sub.add_parser("verify")
     v.add_argument("--model", required=True)
