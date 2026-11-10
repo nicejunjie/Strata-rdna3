@@ -37,12 +37,12 @@ def retryable(action, error) -> bool:
             and required_mib(error) is not None)
 
 
-def session_file(service, action, path, refused_type):
+def session_file(service, action, path, refused_type, slot=None):
     """Called only when --session-save-reclaim is enabled; never changes RESTORE."""
     engine = service.engine
     process = getattr(engine, 'proc', None)
     try:
-        return engine.session_file(action, path)
+        return engine.session_file(action, path, slot)
     except refused_type as error:
         if not retryable(action, error) or process is None:
             raise
@@ -73,7 +73,7 @@ def session_file(service, action, path, refused_type):
             if not same_process():
                 raise last_error
             try:
-                return engine.session_file(action, path)
+                return engine.session_file(action, path, slot)
             except refused_type as failure:
                 if not retryable(action, failure):
                     raise
