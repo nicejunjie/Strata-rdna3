@@ -521,6 +521,21 @@ inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
     return v;
 }
+// [claude] STRATA_PF_NO_GATED=1 (loan-20261110, ported from main af0424fb3): the prompt path's `gated` buffer (T x 4 x 2560
+// FP32, 40 KB a token) holds the hyper-connection up projection only for the unfused pair (bf16_proj + gr_mix_r).  With
+// STRATA_HC_UPMIX=1 on the fused read's conditions every read of a chunk of max(STRATA_PF_SWITCH_MIN_T, hc_upmix_min_t())
+// tokens or more is gr_upmix, which writes `mixed` directly, and `gated` is never touched - yet it was carved and lent from
+// the expert cache for every row of every loan.  It is carved (and counted) for the rows below that threshold only; a read
+// that would need more ends with an error naming this switch.
+inline int64_t gated_rows(size_t T, bool f16_io) {
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_PF_NO_GATED");
+        const char* q = std::getenv("STRATA_HC_REQ8");
+        return e && e[0] == '1' && !(q && q[0] != '\0' && q[0] != '0');
+    }();
+    if (!(env && hc_upmix() && !gr_unfused() && !bf16x2(f16_io) && !bf16x2_hc(f16_io))) return (int64_t) T;
+    return std::min<int64_t>((int64_t) T, std::max<int64_t>(0, std::max(pf_switch_min_t(), hc_upmix_min_t()) - 1));
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -953,6 +968,7 @@ struct Prefill::Impl {
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    int64_t gated_rows = 0;   // [claude] STRATA_PF_NO_GATED: the rows `gated` holds
     float* grs = nullptr;                    // F-1: the hyper-connection read's row scales (T x 4)
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
@@ -1717,7 +1733,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
+    m.gated_rows = gated_rows(T, m.f16_io);   // [claude] STRATA_PF_NO_GATED: only the rows the unfused pair may need
+    m.gated = m.gated_rows > 0 ? o.take<float>((size_t) m.gated_rows * D, ok) : nullptr;
+    m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
@@ -2670,10 +2688,11 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     } else {   // STRATA_RING_BYTES=0: 0.1.39's count
         f(T * N); f(T * D); f(T * D);
     }
-    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
-    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
+    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
+    f((size_t) gated_rows(T, f16_io) * D);   // gated ([claude] STRATA_PF_NO_GATED: the rows below the upmix threshold)
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
+    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -4066,7 +4085,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
-                    if (checks > 0) {   // the default pair first, kept for the comparison
+                    if (checks > 0 && m.gated_rows >= T) {   // the default pair first, kept for the comparison
                         --checks;
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                         gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
@@ -4088,6 +4107,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
+                }
+                if (!upmixed && T > m.gated_rows) {   // [claude] STRATA_PF_NO_GATED: the fused read was expected
+                    err = "prefill: the hyper-connection up projection of layer " + std::to_string((long long) l) +
+                          " cannot take the fused read (STRATA_HC_UPMIX), and STRATA_PF_NO_GATED=1 left out its buffer";
+                    return false;
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
