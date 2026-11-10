@@ -553,6 +553,42 @@ inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
     return v;
 }
+// [claude] STRATA_PF_NO_GATED=1 (loan-20261110): the prompt path's `gated` buffer (T x 4 x 2560 FP32, 40 KB a token) holds
+// the hyper-connection up projection only for the unfused pair (bf16_proj + gr_mix_r).  With STRATA_HC_UPMIX=1 on the
+// fused read's conditions (no unfused read, no BF16x2 rows, no switch threshold, BF16 up weights: gr_upmix never refuses
+// on gfx11) every read of a chunk of max(STRATA_PF_SWITCH_MIN_T, hc_upmix_min_t()) tokens or more is gr_upmix, which
+// writes `mixed` directly, and `gated` is never touched - yet it was carved and lent from the expert cache for every row
+// of every loan (~12% of a prompt token's bytes).  It is carved (and counted) for the rows below that threshold only (32
+// here: this file is host-compiled, so hc_upmix_min_t() is 33); a read that would need more (a model whose up weights
+// are not plain BF16) ends with an error naming this switch.
+inline int64_t gated_rows(size_t T, bool f16_io) {
+    static const bool env = [] {
+        const char* e = std::getenv("STRATA_PF_NO_GATED");
+        const char* q = std::getenv("STRATA_HC_REQ8");
+        return e && e[0] == '1' && !(q && q[0] != '\0' && q[0] != '0');
+    }();
+    if (!(env && hc_upmix() && !gr_unfused() && !bf16x2(f16_io) && !bf16x2_hc(f16_io))) return (int64_t) T;
+    return std::min<int64_t>((int64_t) T, std::max<int64_t>(0, std::max(pf_switch_min_t(), hc_upmix_min_t()) - 1));
+}
+// [claude] STRATA_TP_PREFILL_OWNROWS=1 (loan-20261110): a TP layout's per-token buffers (emb/bo, R, grs, xn16, lo, lo16,
+// inj, mixed, mixed_bf, ple_emb) hold only this path's rows of a chunk - the larger share, tp_half_rows(T) - instead of
+// all T: the per-token work (embedding, hyper-connection read/write, router, shared expert, combine, PLE) runs on the
+// owner's rows only, so the other rows were carved, lent from the expert cache and never written (~50 KB a token).
+// mixed_h (the GDN input all-gather), the shared region and the exchange buffers keep every row.  R also holds the rows
+// the drafter's path reports (the prompt's last kTpReportRows positions, sent by the first path).  run_impl points each
+// buffer at its first own row for a chunk (the code addresses them as buf + o0 * stride) and back at the end.
+constexpr int64_t kTpReportRows = 4224 + 64;   // generate.cpp's kDpMinLast (run_tp's min_last), and a margin
+inline bool tp_ownrows_on() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_TP_PREFILL_OWNROWS"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+inline bool own_rows_layout(size_t T, bool f16_io) {
+    return tp_ownrows_on() && tp_layout(T) && !gr_unfused() && !bf16x2(f16_io) && !bf16x2_hc(f16_io) && tp_half_rows(T) < T;
+}
+inline size_t own_rows(size_t T, bool f16_io) { return own_rows_layout(T, f16_io) ? tp_half_rows(T) : T; }
+inline size_t r_rows(size_t T, bool f16_io) {
+    return own_rows_layout(T, f16_io) ? std::min(T, std::max(tp_half_rows(T), (size_t) kTpReportRows)) : T;
+}
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
@@ -985,6 +1021,13 @@ struct Prefill::Impl {
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
+    int64_t gated_rows = 0;   // [claude] STRATA_PF_NO_GATED: the rows `gated` holds (the chunk without it)
+    // [claude] STRATA_TP_PREFILL_OWNROWS: the own-row buffers' rows (own_cap; R: r_cap) and their allocations (run_impl
+    // points emb/bo, R, grs, xn16, lo, lo16, inj, mixed, mixed_bf at a chunk's first own row and back)
+    bool own_rows = false;
+    int64_t own_cap = 0, r_cap = 0;
+    float *emb_a = nullptr, *R_a = nullptr, *grs_a = nullptr, *lo_a = nullptr, *inj_a = nullptr, *mixed_a = nullptr;
+    uint16_t *xn16_a = nullptr, *lo16_a = nullptr, *mixed_bf_a = nullptr;
     float* grs = nullptr;                    // F-1: the hyper-connection read's row scales (T x 4)
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
@@ -1766,13 +1809,22 @@ bool Prefill::carve(size_t T, void* alloc) {
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     bool ok = true;
-    m.emb = o.take<float>(T * N, ok); m.R = o.take<float>(T * D, ok);
+    // [claude] STRATA_TP_PREFILL_OWNROWS: Tw rows of the per-token buffers (T without it), TR of R
+    const size_t Tw = own_rows(T, m.f16_io), TR = r_rows(T, m.f16_io);
+    m.own_rows = Tw < T;
+    m.own_cap = (int64_t) Tw;
+    m.r_cap = (int64_t) TR;
+    m.emb = o.take<float>(Tw * N, ok); m.R = o.take<float>(TR * D, ok);
     m.xn = gr_unfused() ? o.take<float>(T * D, ok) : nullptr;   // F-1: not needed (gr_mix_r reads R)
-    m.grs = o.take<float>(T * HC, ok);
-    m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
-    m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
-    m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
+    m.grs = o.take<float>(Tw * HC, ok);
+    m.xn16 = o.take<uint16_t>(Tw * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(Tw * LR, ok); m.lo16 = o.take<uint16_t>(Tw * LR, ok);
+    m.gated_rows = gated_rows(Tw, m.f16_io);   // [claude] STRATA_PF_NO_GATED: only the rows the unfused pair may need
+    m.gated = m.gated_rows > 0 ? o.take<float>((size_t) m.gated_rows * D, ok) : nullptr;
+    m.inj = o.take<float>(Tw * HC, ok);
+    m.mixed = o.take<float>(Tw * N, ok); m.mixed_bf = o.take<uint16_t>(Tw * N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
+    m.emb_a = m.emb; m.R_a = m.R; m.grs_a = m.grs; m.xn16_a = m.xn16; m.lo_a = m.lo; m.lo16_a = m.lo16; m.inj_a = m.inj;
+    m.mixed_a = m.mixed; m.mixed_bf_a = m.mixed_bf;
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
     if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
@@ -1880,7 +1932,7 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.used_of[i] = i;
         }
     }
-    m.ple_emb = o.take<float>(T * N, ok);
+    m.ple_emb = o.take<float>(Tw * N, ok);   // (the own rows from 0: a TP chunk's To rows)
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
@@ -2730,17 +2782,23 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     // `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk, 252 MB (48 Q8_0 slots) at 6144 - the
     // prompt path was told it had less room than it did.  Safe - the direction is over-estimating, and `take`
     // still bounds-checks - but it under-sizes every loan, so every chunk the scan picks is one step smaller.
-    if (ring_bytes_on()) {
-        f(T * N); f(T * D);
-        if (gr_unfused()) f(T * D);
-        f(T * HC);
-    } else {   // STRATA_RING_BYTES=0: 0.1.39's count
-        f(T * N); f(T * D); f(T * D);
-    }
-    o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
-    f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
-    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
+    // [claude] STRATA_TP_PREFILL_OWNROWS (T without it).  STRATA_TP_OWNROWS_LOAN_FULL=1 (check only): the loan of a full
+    // layout, the own rows carved inside it - the same lent slots and so the same resident experts as without OWNROWS
+    // (bits comparable with the full layout's)
+    static const bool loan_full = [] { const char* e = std::getenv("STRATA_TP_OWNROWS_LOAN_FULL"); return e && e[0] == '1'; }();
+    const size_t Tw = loan_full ? T : own_rows(T, f16_io), TR = loan_full ? T : r_rows(T, f16_io);
+    if (ring_bytes_on()) {
+        f(Tw * N); f(TR * D);
+        if (gr_unfused()) f(T * D);
+        f(Tw * HC);
+    } else {   // STRATA_RING_BYTES=0: 0.1.39's count
+        f(Tw * N); f(TR * D); f(T * D);
+    }
+    o.take<uint16_t>(Tw * (D + (hc_pad() ? XN_PAD : 0)), ok); f(Tw * LR); o.take<uint16_t>(Tw * LR, ok);
+    f((size_t) gated_rows(Tw, f16_io) * D);   // gated ([claude] STRATA_PF_NO_GATED: the rows below the upmix threshold)
+    f(Tw * HC); f(Tw * N); o.take<uint16_t>(Tw * N, ok); o.take<uint16_t>(T * N, ok);
+    if (!emb_reuse_account()) f(Tw * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -2776,7 +2834,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     } else {
         for (int i = 0; i < stage_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     }
-    f(T * N);
+    f(Tw * N);   // ple_emb
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
     take_stage(o, ss, s, stage, ok);
@@ -3206,6 +3264,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
     }
 #endif
+    // [claude] STRATA_TP_PREFILL_OWNROWS: the own-row buffers point at their allocations again when the read ends
+    struct OwnRowsScope {
+        Impl& m;
+        ~OwnRowsScope() {
+            if (!m.own_rows) return;
+            m.emb = m.emb_a; m.bo = m.emb_a; m.R = m.R_a; m.grs = m.grs_a; m.xn16 = m.xn16_a; m.lo = m.lo_a;
+            m.lo16 = m.lo16_a; m.inj = m.inj_a; m.mixed = m.mixed_a; m.mixed_bf = m.mixed_bf_a;
+        }
+    } own_rows_scope{m};
     for (int64_t c0 = 0; c0 < n; c0 += step_at(c0)) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
@@ -3221,6 +3288,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const int64_t o0 = tp && dp_index_ == 1 ? tsplit : 0, To = tp ? (dp_index_ == 0 ? tsplit : T - tsplit) : T;
         const int64_t po0 = tp ? (dp_index_ == 0 ? tsplit : 0) : 0, Tp = T - To;
         (void) Tp; (void) po0;
+        if (m.own_rows) {   // [claude] STRATA_TP_PREFILL_OWNROWS: this chunk's own rows are the buffers' first rows
+            // R from the first row this path reports (the drafter's path: the prompt's last rows the first path sends)
+            const int64_t want_r = std::clamp<int64_t>(tp_report_from_ - p0, 0, T);
+            const int64_t rb = tp && dp_index_ == 1 ? std::min(o0, want_r) : 0;
+            const int64_t r_end = tp ? o0 + To : T;
+            if (To > m.own_cap || r_end - rb > m.r_cap) {
+                err = std::string(tp ? "prefill TP (read)" : "prefill") + ": a chunk of " + std::to_string((long long) T) +
+                      " tokens needs " + std::to_string((long long) To) + " own rows (" + std::to_string((long long) (r_end - rb)) +
+                      " of R) of a layout holding " + std::to_string((long long) m.own_cap) + " (" +
+                      std::to_string((long long) m.r_cap) + "): STRATA_TP_PREFILL_OWNROWS lays out TP reads only";
+                return false;
+            }
+            const int64_t ldx_c = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() && !m.xn16_lo ? D + XN_PAD : D;
+            // (the addresses below the allocation are never read or written: every access is buf + o0 * stride and on)
+            m.emb = m.emb_a - o0 * N; m.bo = m.emb; m.R = m.R_a - rb * D; m.grs = m.grs_a - o0 * HC;
+            m.xn16 = m.xn16_a - o0 * ldx_c; m.lo = m.lo_a - o0 * LR; m.lo16 = m.lo16_a - o0 * LR; m.inj = m.inj_a - o0 * HC;
+            m.mixed = m.mixed_a - o0 * N; m.mixed_bf = m.mixed_bf_a - o0 * N;
+        }
         int64_t dp_k = 0;   // [claude] DP: this chunk's index in the plan; the other path's chunks are skipped
         if (dp) {
             while (dp_k + 1 < (int64_t) dp_plan_.size() && dp_plan_[(size_t) dp_k].c0 != c0) ++dp_k;
@@ -3291,19 +3376,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 return false;
             }
             if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+                nemb->gather_dev(m.tok_dev + o0, To, m.emb + o0 * N, m.cs);   // [claude] TP prefill: its own rows (all: T)
             } else {
                 const auto* codes = (const uint8_t*) wemb->data;
                 const auto* scales = (const float*) (codes + wemb->codes_bytes);
                 const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
                                                        : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev + o0, (int) To, wemb->ne0,
                                                       wemb->code_bits, wemb->code_bias, wemb->group_elems,
                                                       (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb + o0 * N, m.cs);
             }
         }
-        for (int64_t t = 0; hand_in_ == nullptr && !batched && t < T;) {
+        for (int64_t t = o0; hand_in_ == nullptr && !batched && t < o0 + To;) {   // [claude] (TP: its own rows)
             const float* row = embd_rows ? embd_rows[p0 + t] : nullptr;
             if (row) {
                 // #1996: the picture's rows live in the caller's (pageable) memory.  A run of consecutive rows is
@@ -4176,7 +4261,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 uint16_t* const lo16_o = m.lo16 + o0 * LR;
                 uint16_t* const lo16lo_o = m.lo16_lo ? m.lo16_lo + o0 * LR : nullptr;
                 float* const inj_o = m.inj + o0 * HC;
-                float* const gated_o = m.gated + o0 * N;
+                float* const gated_o = m.gated ? m.gated + o0 * N : nullptr;   // ([claude] STRATA_PF_NO_GATED: none)
                 float* const mixed_o = m.mixed + o0 * N;
                 uint16_t* const mixedbf_o = m.mixed_bf + o0 * N;
                 uint16_t* const mixedh_o = m.mixed_h ? m.mixed_h + o0 * N : nullptr;
@@ -4205,7 +4290,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
-                    if (checks > 0 && !tp) {   // the default pair first, kept for the comparison
+                    if (checks > 0 && !tp && m.gated_rows >= T) {   // the default pair first, kept for the comparison
                         --checks;
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                         gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
@@ -4227,6 +4312,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         upmixed = gr_upmix(lo16_o, (const uint16_t*) wu->data, R_o, grs_o, (const float*) wn->data,
                                            mixed_o, mixedbf_o, mixedh_o, To, m.cs);
                     }
+                }
+                if (!upmixed && (o0 + To) * D > m.gated_rows * D) {   // [claude] STRATA_PF_NO_GATED: the fused read was expected
+                    err = "prefill: the hyper-connection up projection of layer " + std::to_string((long long) l) +
+                          " cannot take the fused read (STRATA_HC_UPMIX), and STRATA_PF_NO_GATED=1 left out its buffer";
+                    return false;
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, lo16_o, gated_o, To, su, err, 0, lo16lo_o, 0, m.cs)) return false;
                 if (!hcd && !bf16_proj(m.gemm, wi, xn16_o, inj_o, To, si, err, 0, xn16lo_o, ldx != D ? ldx : 0, m.cs, xf16)) return false;
@@ -6562,7 +6652,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
+        if (const char* dump = m.own_rows ? nullptr : std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
             // S25 (draft-layer distillation data, opt-in): every position's final multi-stream residual as BF16
             // (round-to-nearest-even), rows in position order, appended across chunks and requests: [n][hc*n_embd]
             cudaStreamSynchronize(m.cs);
@@ -6599,7 +6689,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (want < tsplit) {
                 if (dp_index_ == 0) {
                     Impl& pm = *dp_peer_->impl_;
-                    if (!tp_send(0, kXEnd, pm.R + want * D, m.R + want * D, (size_t) ((tsplit - want) * D) * 4, err) ||
+                    // (STRATA_TP_PREFILL_OWNROWS: the drafter's path's R starts at row `want` for this chunk)
+                    if (!tp_send(0, kXEnd, pm.own_rows ? pm.R_a : pm.R + want * D, m.R + want * D, (size_t) ((tsplit - want) * D) * 4, err) ||
                         !tp_post(0, kXEnd, err))
                         return false;
                 } else if (!tp_take(0, kXEnd, m.cs, err)) return false;
@@ -6624,7 +6715,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // stage can return while later GPUs are still processing the previous chunk.
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
-    if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
+    if (!m.own_rows && std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
             std::vector<float> h((size_t) n);
@@ -7131,6 +7222,7 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
 
 // ---- [claude] TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt)
 bool Prefill::tp_prefill_env() { return tp_prefill_on(); }
+bool Prefill::tp_ownrows_env() { return tp_prefill_on() && tp_ownrows_on(); }
 void Prefill::set_tp_layout(bool on) { g_tp_layout_next.store(on); }
 bool Prefill::tp_layout_now() const { return impl_->tp_ids != nullptr; }
 

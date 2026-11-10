@@ -14436,7 +14436,10 @@ int main(int argc, char** argv) {
                     // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
                     // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
                     const int64_t dp_n = tokens - dp_head(a0);
-                    if (tpp_takes(dp_n)) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
+                    // [claude] STRATA_TP_PREFILL_OWNROWS: a prompt with picture rows is not read by run_tp (it declines them),
+                    // and the usual path cannot use a TP layout that holds only its own rows: that loan is laid out as DP's
+                    const bool tpp_pictures = strata::prefill::Prefill::tp_ownrows_env() && sp.embd_rows != nullptr;
+                    if (tpp_takes(dp_n) && !tpp_pictures) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
                     else if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
                     else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
