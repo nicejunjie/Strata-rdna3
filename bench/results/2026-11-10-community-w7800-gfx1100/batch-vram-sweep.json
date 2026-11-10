@@ -1,0 +1,34 @@
+{
+  "note": "Per-batch VRAM budget and throughput on one W7800 48GB. Each batch value is its own engine restart; slots and expert-cache figures come from the engine's own startup lines.",
+  "date": "2026-11-10",
+  "method": "tools/serve_load.py --max-tokens 128 --rounds 3, requests marked fresh (conversation cache cannot help)",
+  "budget": [
+    {"batch": 2, "expert_cache_gib": 38.47, "expert_slots": 15069, "slots_delta": 0,     "vram_free_mib": 786},
+    {"batch": 3, "expert_cache_gib": 37.47, "expert_slots": 14665, "slots_delta": -404,  "vram_free_mib": 784},
+    {"batch": 4, "expert_cache_gib": 36.47, "expert_slots": 14260, "slots_delta": -809,  "vram_free_mib": 786},
+    {"batch": 5, "expert_cache_gib": 35.47, "expert_slots": 13856, "slots_delta": -1213, "vram_free_mib": 782},
+    {"batch": 6, "expert_cache_gib": 34.47, "expert_slots": 13452, "slots_delta": -1617, "vram_free_mib": 780},
+    {"batch": 8, "expert_cache_gib": 32.48, "expert_slots": 12643, "slots_delta": -2426, "vram_free_mib": 778}
+  ],
+  "throughput": [
+    {"batch": 2, "clients": 1, "total_tps": 68.5, "per_req_tps": 84.4, "ttft_p50": 0.35, "errors": 0},
+    {"batch": 2, "clients": 2, "total_tps": 84.2, "per_req_tps": 53.1, "ttft_p50": 0.54, "errors": 0},
+    {"batch": 3, "clients": 1, "total_tps": 66.1, "per_req_tps": 80.8, "ttft_p50": 0.35, "errors": 0},
+    {"batch": 3, "clients": 2, "total_tps": 82.9, "per_req_tps": 51.2, "ttft_p50": 0.56, "errors": 0},
+    {"batch": 3, "clients": 3, "total_tps": 93.3, "per_req_tps": 38.7, "ttft_p50": 0.77, "errors": 0},
+    {"batch": 4, "clients": 1, "total_tps": 67.1, "per_req_tps": 82.5, "ttft_p50": 0.36, "errors": 0},
+    {"batch": 4, "clients": 2, "total_tps": 81.3, "per_req_tps": 50.2, "ttft_p50": 0.56, "errors": 0},
+    {"batch": 4, "clients": 3, "total_tps": 91.7, "per_req_tps": 38.5, "ttft_p50": 0.78, "errors": 0},
+    {"batch": 4, "clients": 4, "total_tps": 0.1,  "per_req_tps": 0.0,  "ttft_p50": 22.42, "errors": 0, "note": "5 tokens per round, 49 s latency"},
+    {"batch": 5, "clients": 4, "total_tps": 0.1,  "per_req_tps": 0.0,  "ttft_p50": 22.91, "errors": 0},
+    {"batch": 6, "clients": 1, "total_tps": 0.0,  "per_req_tps": 0.0,  "ttft_p50": null,  "errors": 0, "note": "0 tokens in 21.6 s: single request already starved"}
+  ],
+  "tier_state": {
+    "note": "files N blobs is the engine's own count of expert-file reads; it stays 0 at every batch value, so the cliff is not SSD reading.",
+    "batch_2": {"resident_ram_gib": 19.52, "files_blobs": 0, "exchanged": 649},
+    "batch_4": {"resident_ram_gib": 21.53, "files_blobs": 0, "exchanged": 39},
+    "batch_6": {"resident_ram_gib": 23.53, "files_blobs": 0, "exchanged": 54}
+  },
+  "conclusion": "Each slot costs about 1 GiB of VRAM and displaces about 404 expert-cache slots. Up to 3 the batch pays (3 clients: 93.3 vs 84.2 tok/s, +10.8%); from 4 it collapses to 0.1 tok/s although the server reports no errors, because hot experts no longer fit in VRAM and must be fetched from the RAM tier over PCIe every step. Not an SSD problem: resident RAM grows with the batch and the engine reads 0 blobs from files.",
+  "production_choice": "batch 3, parallel 3, max_queue 3 (admission limit 6): 9 simultaneous requests gave 6 x 200 and 3 x 429, c=3 95.3 tok/s (+13.2% over batch 2)."
+}

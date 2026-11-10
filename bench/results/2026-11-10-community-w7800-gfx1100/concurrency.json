@@ -1,0 +1,6 @@
+{"tool":"tools/serve_load.py","date":"2026-11-10","clients":[1,2,3,4],"rounds":3,"max_tokens":128,"server_batch":2,"config":"production strata-iq3s-p2.json",
+"rows":[
+{"clients":1,"total_tps":67.4,"per_req_tps":81.9,"ttft_p50":0.34,"ttft_p95":0.68,"lat_p50":1.90,"lat_p95":2.38,"errors":0},
+{"clients":2,"total_tps":85.0,"per_req_tps":52.4,"ttft_p50":0.52,"ttft_p95":0.70,"lat_p50":2.97,"lat_p95":3.01,"errors":0},
+{"clients":3,"total_tps":79.2,"per_req_tps":49.3,"ttft_p50":0.70,"ttft_p95":3.29,"lat_p50":3.45,"lat_p95":4.87,"errors":0},
+{"clients":4,"total_tps":85.8,"per_req_tps":49.4,"ttft_p50":2.01,"ttft_p95":3.71,"lat_p50":4.60,"lat_p95":5.97,"errors":0}]}
