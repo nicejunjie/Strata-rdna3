@@ -43,21 +43,21 @@ class Retry(unittest.TestCase):
     def call(self, available=5000, action='save'):
         with mock.patch.object(retry,'available_mib',side_effect=available if isinstance(available,list) else None,
                                return_value=None if isinstance(available,list) else available):
-            return retry.session_file(self.service,action,'same.bin',SessionRefused)
+            return retry.session_file(self.service,action,'same.bin',SessionRefused,None)
 
     def test_success_does_not_poll_or_wait(self):
         self.engine.session_file.return_value=RESULT
         with mock.patch.object(retry,'available_mib',side_effect=AssertionError('unexpected memory probe')):
             self.assertEqual(retry.session_file(self.service,'save','same.bin',SessionRefused),RESULT)
         self.assertEqual(self.clock.now,0)
-        self.engine.session_file.assert_called_once_with('save','same.bin')
+        self.engine.session_file.assert_called_once_with('save','same.bin',None)
 
     def test_delayed_ram_reuses_same_process_path_and_floor(self):
         self.engine.session_file.side_effect=[refused(),RESULT]
         self.assertEqual(self.call([534,541,800,1400]),RESULT)
         self.assertEqual(self.clock.now,1.5)
         self.assertIs(self.engine.proc,self.proc)
-        self.assertEqual(self.engine.session_file.call_args_list,[mock.call('save','same.bin')]*2)
+        self.assertEqual(self.engine.session_file.call_args_list,[mock.call('save','same.bin',None)]*2)
         self.assertEqual(retry.required_mib(refused()),1125)
 
     def test_persistent_pressure_expires_without_another_save(self):
