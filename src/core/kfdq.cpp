@@ -13,6 +13,8 @@
 //
 // Mechanism: the strata executable defines and exports ioctl() (CMake: --export-dynamic-symbol=ioctl), so ROCr's
 // KFD calls come here first; we record each queue's ring and read/write pointers and forward to libc.
+// KFD commands match by type, number and direction with a minimum size (the build's kfd_ioctl.h and ROCr's may differ in
+// struct size, e.g. 88 vs 96 bytes for create); in a PID namespace the own queues are the ones this hook recorded.
 // Env: STRATA_KFDQ=0 off; STRATA_KFDQ_SLOTS (8); STRATA_KFDQ_IDLE_MS (2000); STRATA_KFDQ_POLL_US (2000);
 //      STRATA_KFDQ_LOG=1 logs queue creation, park and unpark to stderr.
 #if defined(__linux__) && __has_include(<linux/kfd_ioctl.h>)
@@ -24,6 +26,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
+#include <cstring>
 #include <ctime>
 #include <unistd.h>
 
@@ -189,9 +193,16 @@ void init() {
 // kfd_ioctl.h each side was built with, and KFD itself dispatches on the number. TheRock 7.10's ROCr creates queues
 // with 0xc0604b02 (96-byte args) while Ubuntu 24.04's header gives 0xc0584b02 (88), so an exact compare never matched
 // and nothing was parked. A larger struct only appends fields; only the header's own size is read.
-inline bool kfd_cmd(unsigned long req, unsigned long want) {
-    return _IOC_TYPE(req) == _IOC_TYPE(want) && _IOC_NR(req) == _IOC_NR(want) && _IOC_SIZE(req) >= _IOC_SIZE(want);
+// [claude] 2026-11-10 follow-up: the direction bits must match too (no unrelated 'K' ioctl with the same number), and a
+// caller's struct may be smaller than this header's as long as it holds every field the hook reads (`min`): an older
+// ROCr against a newer header is matched as well, and only the caller's bytes are copied (see create below).
+inline bool kfd_cmd(unsigned long req, unsigned long want, size_t min) {
+    return _IOC_TYPE(req) == _IOC_TYPE(want) && _IOC_NR(req) == _IOC_NR(want) && _IOC_DIR(req) == _IOC_DIR(want) &&
+           _IOC_SIZE(req) >= min;
 }
+// create: every field read (ring/rptr/wptr addresses, ring_size, gpu_id, queue_type, percentage, priority, queue_id) lies
+// in the prefix up to queue_id, which every KFD version shares
+constexpr size_t kCreateMin = offsetof(kfd_ioctl_create_queue_args, queue_id) + sizeof(uint32_t);
 
 }  // namespace
 
@@ -202,7 +213,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
     va_end(ap);
     if (enabled < 0) init();
     if (!enabled) return real_ioctl(fd, req, arg);
-    if (kfd_cmd(req, AMDKFD_IOC_CREATE_QUEUE)) {
+    if (kfd_cmd(req, AMDKFD_IOC_CREATE_QUEUE, kCreateMin)) {
         pthread_mutex_lock(&mu);
         int rc = real_ioctl(fd, req, arg);
         auto* a = static_cast<kfd_ioctl_create_queue_args*>(arg);
@@ -210,7 +221,9 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
             for (auto& q : qs)
                 if (!q.used) {
                     q = Queue{};
-                    q.used = 1; q.fd = fd; q.a = *a;
+                    q.used = 1; q.fd = fd;
+                    q.a = kfd_ioctl_create_queue_args{};   // the caller's bytes only (its struct may be the smaller one)
+                    std::memcpy(&q.a, a, _IOC_SIZE(req) < sizeof q.a ? _IOC_SIZE(req) : sizeof q.a);
                     // The first AQL queue of each GPU is ROCr's utility queue (created right before the first user
                     // queue, at ROCr's minimum AQL size: 4 KB; HIP queues are 1 MB).
                     bool seen = false;
@@ -228,7 +241,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
         pthread_mutex_unlock(&mu);
         return rc;
     }
-    if (kfd_cmd(req, AMDKFD_IOC_DESTROY_QUEUE)) {
+    if (kfd_cmd(req, AMDKFD_IOC_DESTROY_QUEUE, sizeof(kfd_ioctl_destroy_queue_args))) {
         pthread_mutex_lock(&mu);
         auto* d = static_cast<kfd_ioctl_destroy_queue_args*>(arg);
         for (auto& q : qs)
@@ -240,7 +253,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
         pthread_mutex_unlock(&mu);
         return rc;
     }
-    if (kfd_cmd(req, AMDKFD_IOC_UPDATE_QUEUE)) {
+    if (kfd_cmd(req, AMDKFD_IOC_UPDATE_QUEUE, sizeof(kfd_ioctl_update_queue_args))) {
         pthread_mutex_lock(&mu);
         auto* u = static_cast<kfd_ioctl_update_queue_args*>(arg);
         for (auto& q : qs)
