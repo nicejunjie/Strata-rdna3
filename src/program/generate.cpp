@@ -10894,11 +10894,14 @@ int main(int argc, char** argv) {
         // STRATA_REFILL_TRANCHES (default 4) parts; part t joins the tables after decode window (t + 1) * W, waited for
         // there - so which window an expert first runs on the GPU in does not depend on the copies' timing (#463).
         // Until then those experts run where any miss does.  The adaptive tier waits until every part has joined.
-        struct LateRow { int32_t i, slot; };
+        // [claude] review 2 R2-L1: a row also keeps its copy (dst / src / bytes; src null: copied and fenced on the part's HIP
+        // stream already) so a part whose SDMA copies failed or timed out is copied again instead of left lent out for good
+        struct LateRow { int32_t i, slot; uint8_t* dst = nullptr; const uint8_t* src = nullptr; size_t nb = 0; };
         struct LateTranche { cudaEvent_t ev = nullptr; int dev = -1; std::vector<int32_t>* tbl = nullptr;
                              std::vector<LateRow> rows; int64_t due = 0; int64_t pending = 0; cudaStream_t stream = nullptr;
                              uint64_t id = 0; strata::core::SdmaCopier* sd = nullptr; strata::core::SdmaCopier::Done done;
-                             bool bad = false; bool head = false; };
+                             bool bad = false; bool head = false;
+                             bool sd_lost = false; };   // [claude] R2-L1: its SDMA wait failed / timed out: the signal is not destroyed
         // STRATA_REFILL_SDMA=1: the refill copies go to the card's SDMA engine through HSA (strata/core/sdma_copy.hpp) instead
         // of hipMemcpyAsync, which ran them as copy kernels beside the decode windows' kernels here (every stage of a window
         // on that card 3-4x slower while ~14 GB streamed in).  The default stays hipMemcpyAsync.
@@ -10936,10 +10939,13 @@ int main(int argc, char** argv) {
             return cudaMemcpyAsync(dst, src, nb, cudaMemcpyHostToDevice, t.stream) == cudaSuccess;
         };
         // whether a part's copies are all in (wait: block until they are)
+        // STRATA_REFILL_FAULT_TEST=1 (tests only): the first waited part reports a failed copy (exercises late_recover)
+        static bool late_fault = [] { const char* v = std::getenv("STRATA_REFILL_FAULT_TEST"); return v != nullptr && v[0] == '1'; }();
         auto late_ready = [&](LateTranche& t, bool wait) -> bool {
-            // [claude] review M5: wait reports a failed / lost copy (false), and the join then keeps the part's rows lent
+            // [claude] review M5: wait reports a failed / lost copy (false), and the join then copies the part again
+            if (wait && late_fault) { late_fault = false; t.sd_lost = true; return false; }
             if (t.sd != nullptr) {
-                if (wait) { if (!t.sd->wait(t.done)) return false; }
+                if (wait) { if (!t.sd->wait(t.done)) { t.sd_lost = true; return false; } }
                 else if (!t.sd->landed(t.done)) return false;
             }
             if (t.ev != nullptr) {
@@ -10948,6 +10954,23 @@ int main(int argc, char** argv) {
                 else if (cudaEventQuery(t.ev) != cudaSuccess) return false;
             }
             return true;
+        };
+        // [claude] R2-L1: a part that did not land is copied again, synchronously on its HIP stream (the experts' arena source
+        // is stable; a recycled stage buffer was copied and fenced on that stream when it was issued).  true: every row is in.
+        // One overall deadline is not needed: a failed part blocks for its own 30 s wait at most once, then this copy.
+        auto late_recover = [&](LateTranche& t) -> bool {
+            const strata::core::OnDevice on(t.dev);
+            for (const LateRow& r : t.rows) {
+                if (r.src == nullptr) continue;
+                if (r.dst == nullptr || cudaMemcpyAsync(r.dst, r.src, r.nb, cudaMemcpyHostToDevice, t.stream) != cudaSuccess) return false;
+            }
+            return cudaStreamSynchronize(t.stream) == cudaSuccess;
+        };
+        // a part's SDMA counter: destroyed once nothing can still decrement it (a timed-out wait may have copies in flight)
+        auto late_sd_release = [&](LateTranche& t) {
+            if (t.sd == nullptr) return;
+            if (!t.sd_lost) t.sd->destroy(t.done);
+            else { static bool said = false; if (!said) { said = true; std::fprintf(stderr, "strata serve: an SDMA refill counter is kept (a copy may still be in flight)\n"); } }
         };
         std::vector<LateTranche> late;
         int64_t late_windows = 0;   // the decode windows run since this request's prompt was read
@@ -11033,16 +11056,18 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 while (t.pending > 0 && !late_q.empty()) late_pump((int64_t) late_q.front().nb);   // due before its copies all went: the rest now
-                if (!t.bad && !late_ready(t, true)) {   // [claude] review M5: a failed copy: its rows stay lent out
-                    t.bad = true;
-                    std::fprintf(stderr, "strata serve: a late refill part did not land: its %zu rows stay out of the cache\n", t.rows.size());
+                if (!t.bad && !late_ready(t, true)) {   // [claude] review M5 / R2-L1: a failed copy: copied again
+                    const bool ok = late_recover(t);
+                    t.bad = !ok;
+                    std::fprintf(stderr, "strata serve: a late refill part did not land: its %zu rows %s\n", t.rows.size(),
+                                 ok ? "were copied again" : "stay out of the cache (the copy again failed too)");
                 }
                 if (!t.bad) {   // (bad: its event failed; nothing to wait for, the rows stay lent out)
                     for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
                     rows_joined += t.rows.size();
                 }
                 if (t.ev != nullptr) { const strata::core::OnDevice on(t.dev); cudaEventDestroy(t.ev); t.ev = nullptr; }
-                if (t.sd != nullptr) t.sd->destroy(t.done);
+                late_sd_release(t);
                 ++joined;
             }
             late.swap(keep);   // (the parts not joined were moved into `keep`: back, whether any joined or not)
@@ -14399,7 +14424,7 @@ int main(int argc, char** argv) {
                             e = std::string("prefill: a late refill copy failed: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
                         }
-                        lt.rows.push_back({i, slot});
+                        lt.rows.push_back({i, slot, dst, srcp->recycles(b) ? nullptr : b, (size_t) nb});
                     }
                     // paced: the window its last copy goes out in (fixed by the queue's bytes), then W more
                     // (landed: W windows from now for every part, then as its copies land)
@@ -14429,7 +14454,7 @@ int main(int argc, char** argv) {
                     bool join = t.head && !t.bad;
                     if (!join && late_join_now_env && late_landed_now() && t.pending == 0 && !t.bad) join = late_ready(t, false);
                     if (!join) { keep.push_back(std::move(t)); continue; }
-                    if (!late_ready(t, true)) {   // [claude] review M5: a failed copy: its rows stay lent out
+                    if (!late_ready(t, true) && !late_recover(t)) {   // [claude] review M5 / R2-L1: copied again first
                         std::fprintf(stderr, "strata serve: a refill head part did not land: its %zu rows stay out of the cache\n", t.rows.size());
                         t.bad = true;
                     } else {
@@ -14437,7 +14462,7 @@ int main(int argc, char** argv) {
                         rows_joined += t.rows.size();
                     }
                     if (t.ev != nullptr) { const strata::core::OnDevice on(t.dev); cudaEventDestroy(t.ev); t.ev = nullptr; }
-                    if (t.sd != nullptr) t.sd->destroy(t.done);
+                    late_sd_release(t);
                     ++joined;
                 }
                 late.swap(keep);
@@ -16329,7 +16354,7 @@ int main(int argc, char** argv) {
                             LateCopy c = *it;
                             c.tranche = nt->id;
                             ++nt->pending;
-                            nt->rows.push_back({c.i, c.slot});
+                            nt->rows.push_back({c.i, c.slot, c.dst, c.src, c.nb});
                             hot.push_back(c);
                             it = late_q.erase(it);
                         }
