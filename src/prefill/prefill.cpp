@@ -4890,7 +4890,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill TP: the expert input rows"; return false;
                         }
                         help_remap(m.ids, m.tp_keep + (size_t) l * NE, 1, m.tp_ids, T * K, (int) NE, m.cs);
-                        fused::group(m.tp_ids, T * K, (int) K, (int) NE + 1, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // this GPU's experts in id order, in batches of at most kMaxBatch experts of which at most a third of the
                         // ring is streamed (as the one-card walk); the other GPU's are not here (no rows: the dummy expert)
                         const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
@@ -4898,7 +4897,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (m.stager) per = std::min(per, (size_t) std::max(1, m.stager->kRing));
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
+                        // [claude] 2026-11-11 (review 2, P5) STRATA_TP_MOE_SPLIT (=0 off): two passes over this GPU's experts -
+                        // first the other GPU's tokens, whose FP16 sums then cross the link while the second pass computes this
+                        // GPU's own tokens (one pass sent them only after every expert, then waited: 195-280 ms of a 16K read
+                        // the compute stream sat at that wait).  Every (token, k) row is the same kernel on the same inputs: IQ3
+                        // reads are bit-identical; on Q4 an expert's tiles hold other rows, which moves the first token's residual
+                        // by 2.3e-3 (the one-pass read's own run-to-run spread there: 4.0e-3).  The cost is each expert's
+                        // weights read twice.  The layer's streamed experts stay in the ring until the second pass (falls back to
+                        // one pass when they exceed it).  16K reads: IQ3 / IQ4 / Q4 +1.8 / +2.5 / +3.4% (p5i).
+                        static const bool moe_split_env = [] { const char* v = std::getenv("STRATA_TP_MOE_SPLIT"); return v == nullptr || v[0] != '0'; }();
+                        const bool moe_split = moe_split_env && Tp > 0 && To > 0 && kend - k <= (size_t) m.ring;
+                        // (pass 1 puts this GPU's own rows on the dummy expert in place; pass 2 remaps every row again, then the
+                        // other GPU's rows: no extra buffer)
+                        if (moe_split) strata::prefill::ids_dummy_range(m.tp_ids, m.tp_ids, T * K, o0 * K, (o0 + To) * K, (int) NE, m.cs);
+                        fused::group(m.tp_ids, T * K, (int) K, (int) NE + 1, m.GU, m.slot_dev, m.src_dev, m.cs);
                         const uint8_t* const mine = tp_mine_.data() + (size_t) l * NE;
+                        std::vector<fused::Batch> done_b;
+                        std::vector<std::pair<size_t, size_t>> done_k;
+                        auto run_batch = [&](const fused::Batch& bt) {
+                            if (fused::f16_on())
+                                fused::experts_native_f16(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                            else
+                                fused::experts_native(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                        };
+                        auto release_k = [&](size_t k0, size_t k1) {
+                            for (size_t kk = k0; kk < k1; ++kk) {
+                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
+                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                            }
+                            if (k1 > k0) {
+                                consumed = k1;
+                                give_back(consumed);
+                            }
+                        };
                         for (int32_t e = 0; e < (int32_t) NE;) {
                             while (e < (int32_t) NE && !mine[e]) ++e;
                             if (e >= (int32_t) NE) break;
@@ -4927,23 +4958,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfGemmGU, cs);
                             // (no mid-point hook here: fused::set_mid_hook is process-wide, and both GPUs' threads launch
                             // experts at once - one card's timing event recorded on the other's stream: invalid handle)
-                            if (fused::f16_on())
-                                fused::experts_native_f16(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
-                            else
-                                fused::experts_native(bt, ng, (int) NE + 1, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
-                            for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
-                            }
-                            if (k > k0) {
-                                consumed = k;
-                                give_back(consumed);
-                            }
+                            run_batch(bt);
+                            if (moe_split) { done_b.push_back(bt); done_k.emplace_back(k0, k); }
+                            else release_k(k0, k);
                         }
                         if (k != kend) { err = "prefill TP: the layer's streamed experts were not all used"; return false; }
                         pt.mark(kPfCombine, cs);
                         help_sum16(m.Dm, m.slot_dev + po0 * K, m.w + po0 * K, m.tp_ids + po0 * K, (int) NE, m.tp_out, Tp, m.cs);
                         if (!tp_send(l, kXMsum, pm.tp_in_sum, m.tp_out, (size_t) (Tp * N) * 2, err) || !tp_post(l, kXMsum, err)) return false;
+                        if (moe_split) {   // the second pass: this GPU's own tokens while the sums cross the link
+                            help_remap(m.ids, m.tp_keep + (size_t) l * NE, 1, m.tp_ids, T * K, (int) NE, m.cs);
+                            strata::prefill::ids_dummy_range(m.tp_ids, m.tp_ids, T * K, po0 * K, (po0 + Tp) * K, (int) NE, m.cs);
+                            fused::group(m.tp_ids, T * K, (int) K, (int) NE + 1, m.GU, m.slot_dev, m.src_dev, m.cs);
+                            pt.mark(kPfGemmGU, cs);
+                            for (size_t b = 0; b < done_b.size(); ++b) {
+                                run_batch(done_b[b]);
+                                release_k(done_k[b].first, done_k[b].second);
+                            }
+                            pt.mark(kPfCombine, cs);
+                        }
                         if (!tp_take(l, kXMsum, m.cs, err)) return false;
                         moe_combine_help16(m.Dm, m.slot_dev + o0 * K, m.w + o0 * K, m.tp_ids + o0 * K, (int) NE, m.shared + o0 * N,
                                            m.sg + o0, m.tp_in_sum, m.bo + o0 * N, To, m.cs);
@@ -6644,11 +6677,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
+        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th (appended)
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
             // [claude] TP prefill: each path its own rows, into <file>.tp0 / .tp1
             const std::string dpath = tp ? std::string(dump) + ".tp" + std::to_string(dp_index_) : std::string(dump);
-            if (std::FILE* f = std::fopen(dpath.c_str(), c0 == 0 ? "wb" : "ab")) {
+            if (std::FILE* f = std::fopen(dpath.c_str(), "ab")) {   // every request appended (each starts at position 0)
                 std::vector<float> row((size_t) D);
                 for (int64_t t = o0 + (64 - (p0 + o0) % 64) % 64; t < o0 + To; t += 64) {
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);

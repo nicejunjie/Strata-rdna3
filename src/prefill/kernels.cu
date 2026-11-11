@@ -3920,6 +3920,17 @@ __global__ void moe_combine_help16_kernel(const float* __restrict__ Dm, const in
     bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
 }
 }  // namespace
+// [claude] TP two-pass MoE (P5): out[i] = ne for i in [r0, r1), ids[i] elsewhere (out may be ids)
+__global__ void ids_dummy_range_kernel(const int32_t* ids, int32_t* out, int64_t n, int64_t r0, int64_t r1, int ne) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = (i >= r0 && i < r1) ? ne : ids[i];
+}
+void ids_dummy_range(const int32_t* ids, int32_t* out, int64_t n, int64_t r0, int64_t r1, int ne, void* stream) {
+    if (n <= 0) return;
+    ids_dummy_range_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(ids, out, n, r0, r1, ne);
+    check("ids_dummy_range");
+}
 void help_remap(const int32_t* ids, const uint8_t* flag, int want, int32_t* out, int64_t n, int ne, void* stream) {
     if (n <= 0) return;
     help_remap_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(ids, flag, want, out, n, ne);
