@@ -2922,7 +2922,9 @@ int main(int argc, char** argv) {
                         std::strncmp(od.gcnArchName, ad.gcnArchName, 7) != 0) { all_igpu = false; (void) cudaGetLastError(); break; }
                 }
             }
-            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu);
+            int n_dev_all = 0;
+            if (cudaGetDeviceCount(&n_dev_all) != cudaSuccess) { n_dev_all = 0; (void) cudaGetLastError(); }
+            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, n_dev_all, o.tensor_parallel != 0);
 #if defined(_WIN32)
             const bool win_host = true;
 #else
@@ -2980,6 +2982,23 @@ int main(int argc, char** argv) {
             o.prefill_chunk = 16384;
             o.prefill_gfx12_16k = true;
             std::fprintf(stderr, "strata generate: gfx12: --prefill auto may take chunks up to 16384 (STRATA_GFX12_CHUNK=0 keeps 8192)\n");
+        }
+        (void) cudaGetLastError();
+    }
+#endif
+#if defined(STRATA_USE_HIP)
+    if (o.prefill_auto_bare && o.prefill_auto_cap == 0 && o.tensor_parallel == 0) {
+        // [claude] 2026-11-11 (review 2, section 4): one discrete gfx1100 card (RX 7900 XTX): a bare `--prefill auto` may
+        // take chunks up to 49152 (what every aibox 1-GPU profile set as STRATA_PREFILL_AUTO_MAX since 11-11: 40K +5.7..+10.9%).
+        // The fit scan still takes the largest chunk whose loan fits.  STRATA_GFX1100_DEFAULTS=0 keeps 8192.
+        const char* d0 = std::getenv("STRATA_GFX1100_DEFAULTS");
+        int nd = 0;
+        cudaDeviceProp cp{};
+        if (!(d0 != nullptr && d0[0] == '0') && cudaGetDeviceCount(&nd) == cudaSuccess && nd == 1 &&
+            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && cp.integrated == 0 && strata::kernels::gfx_arch_is(cp.gcnArchName, "gfx1100")) {
+            o.prefill_auto_max = 49152;
+            o.prefill_chunk = 49152;
+            std::fprintf(stderr, "strata generate: gfx1100, one card: --prefill auto may take chunks up to 49152 (STRATA_GFX1100_DEFAULTS=0 keeps 8192)\n");
         }
         (void) cudaGetLastError();
     }
@@ -8031,8 +8050,9 @@ int main(int argc, char** argv) {
         // [claude] 2026-11-11 STRATA_PREFILL_EQUAL_TAIL_MAX=<tokens> (default: no limit): the short-last-chunk exception only
         // for chunks up to that size.  With STRATA_PREFILL_AUTO_MAX 49152 a 57K prompt read 49152 + 8185: the 49152 loan
         // took 81% of a Q4 1-GPU cache, so both passes streamed nearly every expert (18.6 s against 15.35 s in two 28672
-        // chunks); past the limit the prompt is split evenly whatever its tail
-        static const int64_t equal_tail_max = [] { const char* v = std::getenv("STRATA_PREFILL_EQUAL_TAIL_MAX"); return v ? (int64_t) std::atoll(v) : INT64_MAX; }();
+        // chunks); past the limit the prompt is split evenly whatever its tail.  Default 32768 since 2026-11-11 (review 2,
+        // section 4: the unlimited default was the configuration that regressed)
+        static const int64_t equal_tail_max = [] { const char* v = std::getenv("STRATA_PREFILL_EQUAL_TAIL_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 32768; }();
         if (n <= 1 || (last < strata::prefill::Prefill::stream_all_min_tokens() && max_chunk <= equal_tail_max)) return plain;
         const int64_t per = tokens / n + (tokens % n != 0);
         const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
@@ -9794,6 +9814,13 @@ int main(int argc, char** argv) {
         bool tp_pre_ok = false;
         int64_t tp_pre_pages = 0;      // the host pages the precopy moved (valid for the next move to the TP sessions only)
         int64_t tp_moved_cells = -1;   // the cells of the last move to the TP sessions (the way back skips their pages)
+        // [claude] 2026-11-11 (review 2, R2-M1): the cells of a move back to the stages that only a checkpoint followed
+        // (the H1 move before checkpoint_at): both sides' host K/V pages below it are equal, and nothing has written the
+        // stages since, so the next move to the TP sessions skips them as the way back does (that move copied every
+        // page: +45 ms at a few K, +145 ms at 128K of first-token time on a short-message turn).  Set only by the H1
+        // site; cleared by every other move and every call that keeps the state on the stages (a batched part writes
+        // them), and at each request's start
+        int64_t tp_clean_cells = -1;
         std::string tp_pre_err;
         auto tp_pre_join = [&]() -> int64_t {   // the precopy's pages (0: none, or it failed)
             if (tp_pre_th.joinable()) tp_pre_th.join();
@@ -9805,7 +9832,7 @@ int main(int argc, char** argv) {
             return p;
         };
         auto tp_to = [&](bool want_tp, int64_t cells, std::string& e) -> bool {
-            if (!tp_on || tp_state_tp == want_tp) { if (tp_on && !want_tp) tp_pre_join(); return true; }
+            if (!tp_on || tp_state_tp == want_tp) { if (tp_on && !want_tp) { tp_pre_join(); tp_clean_cells = -1; } return true; }
             strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
             const int sdev[2] = {0, stages[0]->dev};
             const int64_t slb[2] = {0, split_at[0]};
@@ -9817,7 +9844,10 @@ int main(int argc, char** argv) {
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "tensor parallel: a device sync failed before the state move"; return false; }
             }
             const int64_t PSc = strata::kernels::qsa_real_shapes().page_size;
-            const int64_t skip = want_tp ? pre : (tp_back_skip_env && tp_moved_cells > 0 && PSc > 0 ? tp_moved_cells / PSc : 0);
+            static const bool tp_fwd_skip = [] { const char* v = std::getenv("STRATA_TP_FWD_SKIP"); return v == nullptr || v[0] != '0'; }();
+            const int64_t clean = want_tp && tp_fwd_skip && tp_clean_cells > 0 && PSc > 0 ? std::min(tp_clean_cells, cells) / PSc : 0;
+            tp_clean_cells = -1;
+            const int64_t skip = want_tp ? std::max(pre, clean) : (tp_back_skip_env && tp_moved_cells > 0 && PSc > 0 ? tp_moved_cells / PSc : 0);
             if (!strata::core::tp_state_move(g, tp_g, sst, sdev, 2, slb, tst, tp_dev, cells, want_tp, e, skip)) return false;
             tp_moved_cells = want_tp ? cells : -1;
             tp_state_tp = want_tp;
@@ -13952,6 +13982,7 @@ int main(int argc, char** argv) {
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
+            tp_clean_cells = -1;
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
@@ -14324,6 +14355,10 @@ int main(int argc, char** argv) {
                 if (paced && tpp_read_req && late_head_tp_keep >= 0 && req_prompt_n >= late_head_tp_min &&
                     rows.size() > (size_t) late_head_tp_keep)
                     head_n = std::max(head_n, rows.size() - (size_t) late_head_tp_keep);
+                // [claude] 2026-11-11 (review 2, R2-L2): the big head applies on its own, not only past STRATA_REFILL_HEAD_MIN
+                // (IQ3's 131072 would have turned it off at 66-80K, where the bigger loan is)
+                if (paced && late_head_big > 0 && p.lent_chunk > late_head_big_chunk)
+                    head_n = std::max(head_n, std::min(rows.size(), (size_t) late_head_big));
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
@@ -15405,11 +15440,12 @@ int main(int argc, char** argv) {
                 // [claude] review H1 (2026-11-10): a windows part under tensor parallel leaves the new state on the TP pair
                 // (tp_ss); checkpoint_at saves the stage sessions, so the state goes back to the stages first - else the
                 // checkpoint at turn_at / message_at holds a state that never read this part (a short last message)
-                if (tp_on && tp_state_tp && (to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !tp_to(false, to, err)) {
+                const bool h1_back = tp_on && tp_state_tp && (to == turn_at || to == root_at || to == message_at || to == pin_at);
+                if (h1_back && !tp_to(false, to, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (h1_back) tp_clean_cells = to;   // (only a move back from the pair: a batched part left the TP side behind)
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
@@ -16625,7 +16661,9 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
-            late_apply(true);   // a short answer: the rest of the refill joins before the session is parked
+            // (review 2, P3, 2026-11-11: joining this after DONE measured no gain - 30K / 60K prompts, 8-token answers, IQ3 / Q4
+            // 2-GPU, wall -0.3 .. +1.2% median of 8 - so it stays here)
+            late_apply(true);
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!dv.wait_commit(err)) {

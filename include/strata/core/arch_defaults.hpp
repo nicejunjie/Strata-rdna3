@@ -51,6 +51,8 @@ std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gc
 /// environment where the user has not set the variable, prints one line to stderr per table when it set anything, and
 /// returns the names it set.  `integrated` is true when every visible GPU is an integrated one.  Call once, before any
 /// engine code reads its switches (they are read lazily, at first use).
-std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrated = false);
+std::vector<std::pair<std::string, std::string>> gfx1100_default_env(const char* gcn_arch, int n_devices, bool tensor_parallel);
+
+std::vector<std::string> apply_arch_defaults(const char* gcn_arch, bool integrated = false, int n_devices = 0, bool tensor_parallel = false);
 
 }  // namespace strata::core
