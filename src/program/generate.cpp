@@ -2685,7 +2685,9 @@ int main(int argc, char** argv) {
             // [claude] 2026-11-10: an explicit ceiling above 32768 (auto:N / STRATA_PREFILL_AUTO_MAX) is kept on the 8192 grid up to
             // 49152 - a 40-48K prompt then reads in one chunk instead of two (one expert-stream pass each: 1-GPU 32K -> 40K
             // dipped 4-7%). 49152 is the last step before the R buffer (40 KB a token) passes 2 GiB; the scan still takes the
-            // largest chunk whose loan fits, so the loan, not this ceiling, decides on a smaller card.
+            // largest chunk whose loan fits, so the loan, not this ceiling, decides on a smaller card.  (R2-L7: R is not the
+            // largest buffer - Qf (T x 12288 FP32) and GU (T x K x 1280 FP32) pass 2 GiB above 43,690 tokens, 2.42 GB at 49152,
+            // and Dm was already 3.36 GB at 32768; every size, offset and element count there is 64-bit or below 2^31.)
             o.prefill_auto_max = want_max >= 32768 ? std::min<long long>(49152, want_max / 8192 * 8192)
                                                    : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());

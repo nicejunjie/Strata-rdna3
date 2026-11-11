@@ -1192,6 +1192,13 @@ struct Prefill::Impl {
     // layer (device flags for help_remap) and the routing with the other GPU's experts on the dummy expert
     cudaStream_t tp_cs = nullptr;
     cudaEvent_t tp_rdy = nullptr, tp_done = nullptr;
+    // [claude] STRATA_TP_WAIT_TIMING: per exchange kind, how long this card's compute stream sat at a tp_take wait (GPU: an
+    // event before and after the cross-device wait, nothing between them) and how long the host waited for the other path
+    // to post it.  Diagnostics only (P5, review 2).
+    std::vector<cudaEvent_t> tpw_ev;   // pairs
+    std::vector<int> tpw_x;
+    size_t tpw_used = 0;
+    double tpw_host_ms[8] = {};
     uint8_t* tp_keep = nullptr;
     size_t tp_keep_n = 0;
     int32_t* tp_ids = nullptr;   // carved (tp_layout): the routing, the other GPU's experts on the dummy
@@ -6775,6 +6782,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        if (m.tpw_used > 0) {   // [claude] STRATA_TP_WAIT_TIMING (see Impl::tpw_ev)
+            static const char* xn[8] = {"gdn in", "gdn out", "qkv", "moe in", "moe sum", "ple", "ple2", "end"};
+            double gpu[8] = {}; int cnt[8] = {};
+            for (size_t k = 0; k + 1 < m.tpw_used; k += 2) {
+                float ms = 0.0f;
+                if (cudaEventSynchronize(m.tpw_ev[k + 1]) == cudaSuccess && cudaEventElapsedTime(&ms, m.tpw_ev[k], m.tpw_ev[k + 1]) == cudaSuccess) {
+                    gpu[m.tpw_x[k]] += ms; ++cnt[m.tpw_x[k]];
+                }
+            }
+            std::string wl; double gt = 0, ht = 0;
+            for (int k = 0; k < 8; ++k) {
+                if (cnt[k] == 0 && m.tpw_host_ms[k] <= 0) continue;
+                char wb[128];
+                std::snprintf(wb, sizeof wb, " %s %.1f / %.1f (%d)", xn[k], gpu[k], m.tpw_host_ms[k], cnt[k]);
+                wl += wb; gt += gpu[k]; ht += m.tpw_host_ms[k]; m.tpw_host_ms[k] = 0;
+            }
+            std::fprintf(stderr, "strata prefill timing: device %d TP waits (GPU stalled ms / host waited ms (n)): total %.1f / %.1f:%s\n",
+                         m.device, gt, ht, wl.c_str());
+            m.tpw_used = 0;
+        }
         // [claude] what this run's experts came from (a TP card holds half of every layer's hot experts)
         std::fprintf(stderr, "strata prefill timing: device %d experts: %lld streamed (%lld straight from the pinned arena), "
                              "%lld resident, %lld on the CPU\n", m.device, (long long) stats_.experts_streamed,
@@ -7260,15 +7287,28 @@ bool Prefill::tp_take(int64_t l, int x, void* stream, std::string& err, int64_t 
     const int peer = 1 - dp_index_;
     const size_t i = (size_t) l * DpLink::kTpX + (size_t) x;
     if (want < 0) want = tp_chunk_;
+    static const bool tpw = std::getenv("STRATA_TP_WAIT_TIMING") != nullptr;
+    Impl& m = *impl_;
+    const auto h0 = std::chrono::steady_clock::now();
     {
         std::unique_lock<std::mutex> lk(L.mu);
         L.cv.wait(lk, [&] { return L.abort || L.tseq[peer][i] >= want; });
         if (L.abort) { err = "prefill TP: the other GPU's path stopped"; return false; }
     }
+    cudaEvent_t w0 = nullptr, w1 = nullptr;
+    if (tpw && x >= 0 && x < 8) {
+        m.tpw_host_ms[x] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+        if (m.tpw_used + 2 > m.tpw_ev.size()) {
+            for (int k = 0; k < 2; ++k) { cudaEvent_t e = nullptr; cudaEventCreate(&e); m.tpw_ev.push_back(e); m.tpw_x.push_back(0); }
+        }
+        w0 = m.tpw_ev[m.tpw_used]; w1 = m.tpw_ev[m.tpw_used + 1]; m.tpw_x[m.tpw_used] = x; m.tpw_used += 2;
+        cudaEventRecord(w0, (cudaStream_t) stream);
+    }
     if (cudaStreamWaitEvent((cudaStream_t) stream, L.tev[peer][i], 0) != cudaSuccess) {
         err = std::string("prefill TP: a cross-device wait: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    if (w1 != nullptr) cudaEventRecord(w1, (cudaStream_t) stream);
     return true;
 }
 

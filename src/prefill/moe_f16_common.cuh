@@ -51,6 +51,9 @@ constexpr int GU_NFB = 640 / 64, D_NFB = 2560 / ROWS;   // work items per tile: 
 constexpr int GU_ACT_LD = 2560 / 64 * AB, H_LD = 640 / 64 * AB;   // bytes per activation / H row
 
 /// STRATA_PF_F16=1 (on top of STRATA_PF_FUSED=1): the covered formats take the F16 kernels on gfx11.
+/// [claude] R2-L4: only '1' here.  STRATA_PF_F16=2 (what every aibox gfx1100 profile runs) turns on the fused-IQ F16 path
+/// (moe_fused_iq.cu f16_on() accepts '1' and '2') but NOT these K-quant / Q8_0 F16 kernels.  Harmless on aibox: IQ4 / Q4 set
+/// STRATA_PF_FUSED_KQ=1, and the IQ3_S packs hold no Q8_0 or K-quant expert layer (types 18 / 20 / 21 / 22 / 23 / 42).
 inline bool requested() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PF_F16");
