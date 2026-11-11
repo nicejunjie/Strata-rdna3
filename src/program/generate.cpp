@@ -170,7 +170,8 @@ double spec_cum_floor() {
     static const double v = [] { const char* e = std::getenv("STRATA_SPEC_CUM"); return e ? std::atof(e) : 0.0; }();
     return v;
 }
-// [claude] DP prompt path tunables: STRATA_DP_MIN (tokens from which a segment reads on both GPUs, default 16384),
+// [claude] DP prompt path tunables: STRATA_DP_MIN (tokens from which a segment reads on both GPUs; unset: 8000, which
+// dp_takes() then refuses below 8448 anyway - IQ3 2-GPU runs on that; an explicit value is floored at 8448),
 // STRATA_DP_PIPE_CHUNK (the layer pipeline's chunk for shorter segments, default 8192)
 // ([claude] issue #3: the floor is the shortest prompt the plan can take - two chunks, the last of kDpMinLast = 4224
 // tokens - not 4096; a smaller value only moved prompts it then refused)
