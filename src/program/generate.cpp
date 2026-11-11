@@ -14303,7 +14303,14 @@ int main(int argc, char** argv) {
                 // windows lose more without it)
                 static const int64_t late_head2 = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
                 static const int64_t late_head2_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) INT64_MAX; }();
-                const int64_t head_want = late_head2 >= 0 && req_prompt_n >= late_head2_min ? late_head2 : late_head;
+                int64_t head_want = late_head2 >= 0 && req_prompt_n >= late_head2_min ? late_head2 : late_head;
+                // [claude] 2026-11-11 STRATA_REFILL_HEAD_BIG=<n slots> (with STRATA_REFILL_HEAD_BIG_CHUNK=<tokens>, default 32768):
+                // a part whose loan was laid out for a chunk above that (STRATA_PREFILL_AUTO_MAX past 32768: a 66-80K DP prompt in
+                // two 40K chunks instead of four) is bigger than the others; at least n of its rows join before the first token,
+                // so the first windows do not pay for the larger loan (Q4 2-GPU 72-80K: ms/window +3.4%, hit -1.7 pt without it)
+                static const int64_t late_head_big = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_BIG"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
+                static const int64_t late_head_big_chunk = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_BIG_CHUNK"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 32768; }();
+                if (late_head_big > 0 && p.lent_chunk > late_head_big_chunk) head_want = std::max(head_want, late_head_big);
                 // [claude] STRATA_REFILL_HEAD_TP_KEEP=<n slots> (P16K): after a prompt the TP prompt path read (both cards
                 // busy to its last layer, so neither card's loan went back during it), every lent row of a part but its
                 // n coldest joins before the first token; a part of at most n rows keeps the late refill as before.
