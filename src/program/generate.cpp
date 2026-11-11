@@ -2664,7 +2664,10 @@ int main(int argc, char** argv) {
             const char* env_max = std::getenv("STRATA_PREFILL_AUTO_MAX");
             const long long want_max = v.rfind("auto:", 0) == 0 ? std::atoll(v.c_str() + 5)
                                      : (o.prefill_auto && env_max != nullptr ? std::atoll(env_max) : 8192);
-            o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
+            // [claude] 2026-11-10 (port of main 791cca4b2): an explicit ceiling above 32768 is kept on the 8192 grid up to 49152
+            // (one chunk for a 40-48K prompt instead of two; 49152: the R buffer stays below 2 GiB)
+            o.prefill_auto_max = want_max >= 32768 ? std::min<long long>(49152, want_max / 8192 * 8192)
+                                                   : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
             {   // #1630: Windows HIP, RX 7900 XTX: a first long prompt at 8192-token chunks charged ~70 GB of commit and
                 // killed the engine; 7500 and below were flat.  A bare auto stops at 6144; a chunk the user names stays.
