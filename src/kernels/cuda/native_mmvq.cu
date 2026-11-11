@@ -1828,10 +1828,23 @@ bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("ST
 #else
 // RDNA wave32 prototype, opt-in until measured and checked on the target card.
 constexpr int NATIVE_WAVE = 32;
-const char* g_rdna_wave_env = std::getenv("STRATA_RDNA_MMVQ_WAVE");
-const bool g_wave_exact = g_rdna_wave_env && std::string(g_rdna_wave_env) == "3";
-const bool g_wave_shapes = g_wave_exact || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "2");
-bool g_wave_off = !(g_wave_exact || g_wave_shapes || (g_rdna_wave_env && std::string(g_rdna_wave_env) == "1"));
+// [claude] 2026-11-11: read at first use, not at static initialisation, so the gfx1100 table of
+// strata/core/arch_defaults (applied in main, after the device is known) can set STRATA_RDNA_MMVQ_WAVE=3
+struct RdnaWaveMode { bool exact, shapes, off; };
+static const RdnaWaveMode& rdna_wave_mode() {
+    static const RdnaWaveMode m = [] {
+        const char* e = std::getenv("STRATA_RDNA_MMVQ_WAVE");
+        RdnaWaveMode r{};
+        r.exact = e && std::string(e) == "3";
+        r.shapes = r.exact || (e && std::string(e) == "2");
+        r.off = !(r.exact || r.shapes || (e && std::string(e) == "1"));
+        return r;
+    }();
+    return m;
+}
+#define g_wave_exact (rdna_wave_mode().exact)
+#define g_wave_shapes (rdna_wave_mode().shapes)
+#define g_wave_off (rdna_wave_mode().off)
 #endif
 constexpr int NATIVE_WAVES_PER_BLOCK = 256 / NATIVE_WAVE;
 template<typename F, int NCOLS, int R>

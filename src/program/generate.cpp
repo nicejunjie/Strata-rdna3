@@ -2903,7 +2903,9 @@ int main(int argc, char** argv) {
                         std::strncmp(od.gcnArchName, ad.gcnArchName, 7) != 0) { all_igpu = false; (void) cudaGetLastError(); break; }
                 }
             }
-            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu);
+            int n_dev_all = 0;
+            if (cudaGetDeviceCount(&n_dev_all) != cudaSuccess) { n_dev_all = 0; (void) cudaGetLastError(); }
+            strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, n_dev_all, o.tensor_parallel != 0);
 #if defined(_WIN32)
             const bool win_host = true;
 #else
@@ -2961,6 +2963,23 @@ int main(int argc, char** argv) {
             o.prefill_chunk = 16384;
             o.prefill_gfx12_16k = true;
             std::fprintf(stderr, "strata generate: gfx12: --prefill auto may take chunks up to 16384 (STRATA_GFX12_CHUNK=0 keeps 8192)\n");
+        }
+        (void) cudaGetLastError();
+    }
+#endif
+#if defined(STRATA_USE_HIP)
+    if (o.prefill_auto_bare && o.prefill_auto_cap == 0 && o.tensor_parallel == 0) {
+        // [claude] 2026-11-11 (review 2, section 4): one discrete gfx1100 card (RX 7900 XTX): a bare `--prefill auto` may
+        // take chunks up to 49152 (what every aibox 1-GPU profile set as STRATA_PREFILL_AUTO_MAX since 11-11: 40K +5.7..+10.9%).
+        // The fit scan still takes the largest chunk whose loan fits.  STRATA_GFX1100_DEFAULTS=0 keeps 8192.
+        const char* d0 = std::getenv("STRATA_GFX1100_DEFAULTS");
+        int nd = 0;
+        cudaDeviceProp cp{};
+        if (!(d0 != nullptr && d0[0] == '0') && cudaGetDeviceCount(&nd) == cudaSuccess && nd == 1 &&
+            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && cp.integrated == 0 && strata::kernels::gfx_arch_is(cp.gcnArchName, "gfx1100")) {
+            o.prefill_auto_max = 49152;
+            o.prefill_chunk = 49152;
+            std::fprintf(stderr, "strata generate: gfx1100, one card: --prefill auto may take chunks up to 49152 (STRATA_GFX1100_DEFAULTS=0 keeps 8192)\n");
         }
         (void) cudaGetLastError();
     }
@@ -8012,8 +8031,9 @@ int main(int argc, char** argv) {
         // [claude] 2026-11-11 STRATA_PREFILL_EQUAL_TAIL_MAX=<tokens> (default: no limit): the short-last-chunk exception only
         // for chunks up to that size.  With STRATA_PREFILL_AUTO_MAX 49152 a 57K prompt read 49152 + 8185: the 49152 loan
         // took 81% of a Q4 1-GPU cache, so both passes streamed nearly every expert (18.6 s against 15.35 s in two 28672
-        // chunks); past the limit the prompt is split evenly whatever its tail
-        static const int64_t equal_tail_max = [] { const char* v = std::getenv("STRATA_PREFILL_EQUAL_TAIL_MAX"); return v ? (int64_t) std::atoll(v) : INT64_MAX; }();
+        // chunks); past the limit the prompt is split evenly whatever its tail.  Default 32768 since 2026-11-11 (review 2,
+        // section 4: the unlimited default was the configuration that regressed)
+        static const int64_t equal_tail_max = [] { const char* v = std::getenv("STRATA_PREFILL_EQUAL_TAIL_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 32768; }();
         if (n <= 1 || (last < strata::prefill::Prefill::stream_all_min_tokens() && max_chunk <= equal_tail_max)) return plain;
         const int64_t per = tokens / n + (tokens % n != 0);
         const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
