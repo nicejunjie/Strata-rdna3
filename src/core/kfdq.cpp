@@ -86,11 +86,13 @@ int sys_queues(uint32_t gpu, int* others) {
     int n = 0;
     *others = 0;
     char path[600], buf[32];
+    bool seen_self = false;
     DIR* pd = opendir("/sys/class/kfd/kfd/proc");
     if (!pd) return -1;
     while (dirent* pe = readdir(pd)) {
         if (pe->d_name[0] < '0' || pe->d_name[0] > '9') continue;
         bool mine = atoi(pe->d_name) == static_cast<int>(getpid());
+        seen_self |= mine;
         snprintf(path, sizeof path, "/sys/class/kfd/kfd/proc/%s/queues", pe->d_name);
         DIR* qd = opendir(path);
         if (!qd) continue;
@@ -106,6 +108,10 @@ int sys_queues(uint32_t gpu, int* others) {
         closedir(qd);
     }
     closedir(pd);
+    // In a PID namespace (Docker, Podman) getpid() is the namespace's PID while KFD's sysfs lists host PIDs, so no
+    // entry is ours and every queue of ours would count as another process's (an idle card then parks all 9). The
+    // queues this hook recorded are ours, so the rest of the card's total belongs to other processes.
+    if (!seen_self) { *others = n - gpu_queues(gpu); if (*others < 0) *others = 0; }
     return n;
 }
 
@@ -179,6 +185,14 @@ void init() {
     logon = (e = getenv("STRATA_KFDQ_LOG")) && e[0] == '1';
 }
 
+// A KFD command matched by type and number, not by the whole request: the request's size bits come from the
+// kfd_ioctl.h each side was built with, and KFD itself dispatches on the number. TheRock 7.10's ROCr creates queues
+// with 0xc0604b02 (96-byte args) while Ubuntu 24.04's header gives 0xc0584b02 (88), so an exact compare never matched
+// and nothing was parked. A larger struct only appends fields; only the header's own size is read.
+inline bool kfd_cmd(unsigned long req, unsigned long want) {
+    return _IOC_TYPE(req) == _IOC_TYPE(want) && _IOC_NR(req) == _IOC_NR(want) && _IOC_SIZE(req) >= _IOC_SIZE(want);
+}
+
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned long req, ...) {
@@ -188,7 +202,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
     va_end(ap);
     if (enabled < 0) init();
     if (!enabled) return real_ioctl(fd, req, arg);
-    if (req == AMDKFD_IOC_CREATE_QUEUE) {
+    if (kfd_cmd(req, AMDKFD_IOC_CREATE_QUEUE)) {
         pthread_mutex_lock(&mu);
         int rc = real_ioctl(fd, req, arg);
         auto* a = static_cast<kfd_ioctl_create_queue_args*>(arg);
@@ -214,7 +228,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
         pthread_mutex_unlock(&mu);
         return rc;
     }
-    if (req == AMDKFD_IOC_DESTROY_QUEUE) {
+    if (kfd_cmd(req, AMDKFD_IOC_DESTROY_QUEUE)) {
         pthread_mutex_lock(&mu);
         auto* d = static_cast<kfd_ioctl_destroy_queue_args*>(arg);
         for (auto& q : qs)
@@ -226,7 +240,7 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
         pthread_mutex_unlock(&mu);
         return rc;
     }
-    if (req == AMDKFD_IOC_UPDATE_QUEUE) {
+    if (kfd_cmd(req, AMDKFD_IOC_UPDATE_QUEUE)) {
         pthread_mutex_lock(&mu);
         auto* u = static_cast<kfd_ioctl_update_queue_args*>(arg);
         for (auto& q : qs)
