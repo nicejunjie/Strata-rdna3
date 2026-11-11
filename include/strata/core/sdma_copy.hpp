@@ -28,8 +28,10 @@ public:
     /// an asynchronous copy of `bytes` from pinned host memory the HSA runtime knows (hipHostRegister'ed / hipHostMalloc'ed)
     /// into device memory, decrementing `d` when it lands.  false: not issued (the caller copies another way).
     bool copy(void* dst_dev, const void* src_host, size_t bytes, Done& d, std::string& err);
+    /// landed: no copy still in flight (a failed copy - the signal went negative - counts as landed; `wait` reports it)
     bool landed(const Done& d) const;
-    void wait(const Done& d) const;
+    /// [claude] review M5: blocks until `d` lands; false when a copy failed (negative signal) or `timeout_ms` passed
+    bool wait(const Done& d, int timeout_ms = 30000) const;
     /// `fn(arg)` once `d` lands (the runtime's async thread; at most once per call; the Done must stay alive until then).
     /// false: not registered (the caller polls `landed` instead).
     bool on_landed(Done& d, void (*fn)(void*), void* arg);

@@ -199,6 +199,9 @@ public:
     /// pointers are never recycled ignores it.  (#1237: a page-locked stage buffer is read by the DMA after the copy call
     /// returned, where a pageable one is staged by the driver before it returns.)
     virtual void note_async_read(const uint8_t* blob, void* stream) { (void) blob; (void) stream; }
+    /// [claude] review M6: `blob` is memory this source recycles (a page-locked stage buffer): an asynchronous copy out of
+    /// it must be issued at once on a stream and noted (note_async_read), never queued for later or sent over SDMA
+    virtual bool recycles(const uint8_t* blob) { (void) blob; return false; }
 
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
@@ -912,6 +915,7 @@ public:
     const uint8_t* blob_stable(int64_t layer, int64_t expert) override;
     int blob_parts(int64_t layer, int64_t expert, BlobPart* out) override;
     void note_async_read(const uint8_t* blob, void* stream) override;
+    bool recycles(const uint8_t* blob) override;
     /// Windows, opt-in with STRATA_FILE_RELEASE=1: trim the file mapping's full pages after their expert reaches
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;

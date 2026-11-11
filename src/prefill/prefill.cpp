@@ -7544,7 +7544,11 @@ bool Prefill::run_tp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         if (err.rfind("prefill TP: ", 0) == 0) err = "prefill TP (read): " + err.substr(12);   // ran: not a fallback case
         return false;
     }
-    if (!ok_back) { err = err_back; return false; }
+    if (!ok_back) {   // [claude] review M2: the read ran - never "declined" (the caller would read the prompt again)
+        err = err_back;
+        if (err.rfind("prefill TP: ", 0) == 0) err = "prefill TP (read): " + err.substr(12);
+        return false;
+    }
     return true;
 }
 

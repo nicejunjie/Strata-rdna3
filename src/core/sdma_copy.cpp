@@ -1,6 +1,7 @@
 // [claude] see include/strata/core/sdma_copy.hpp
 #include "strata/core/sdma_copy.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,9 +110,23 @@ bool SdmaCopier::copy(void* dst_dev, const void* src_host, size_t bytes, Done& d
 bool SdmaCopier::landed(const Done& d) const {
     return d.handle == 0 || hsa_signal_load_scacquire(sig_of(d)) <= 0;
 }
-void SdmaCopier::wait(const Done& d) const {
-    if (d.handle == 0) return;
-    while (hsa_signal_wait_scacquire(sig_of(d), HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, HSA_WAIT_STATE_BLOCKED) > 0) {}
+bool SdmaCopier::wait(const Done& d, int timeout_ms) const {
+    if (d.handle == 0) return true;
+    // [claude] review M5: bounded (a lost completion hung the engine in the next request's join) and the error state seen
+    static const uint64_t freq = [] {
+        uint64_t f = 0;
+        return hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &f) == HSA_STATUS_SUCCESS && f > 0 ? f : (uint64_t) 1000000000;
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        const hsa_signal_value_t v = hsa_signal_wait_scacquire(sig_of(d), HSA_SIGNAL_CONDITION_LT, 1, freq / 100, HSA_WAIT_STATE_BLOCKED);
+        if (v == 0) return true;
+        if (v < 0) { std::fprintf(stderr, "strata sdma: a copy failed (signal %lld)\n", (long long) v); return false; }
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
+            std::fprintf(stderr, "strata sdma: copies not landed after %d ms (%lld left)\n", timeout_ms, (long long) v);
+            return false;
+        }
+    }
 }
 namespace {
 struct Landed { void (*fn)(void*); void* arg; };
@@ -137,7 +152,7 @@ void SdmaCopier::destroy(Done& d) { d.handle = 0; }
 void SdmaCopier::skip(Done&, int64_t) {}
 bool SdmaCopier::copy(void*, const void*, size_t, Done&, std::string& err) { err = "not a HIP build"; return false; }
 bool SdmaCopier::landed(const Done&) const { return true; }
-void SdmaCopier::wait(const Done&) const {}
+bool SdmaCopier::wait(const Done&, int) const { return true; }
 bool SdmaCopier::on_landed(Done&, void (*)(void*), void*) { return false; }
 #endif
 

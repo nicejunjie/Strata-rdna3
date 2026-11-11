@@ -344,6 +344,8 @@ __device__ __forceinline__ void phase_wait(unsigned* done, unsigned items, unsig
     if (wave0()) {
         long spins = 0;
         while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(done, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) < items) {
+            // [claude] review M7: a phase already reported stalled: the window is lost - no further 1-2 s spins
+            if (stall != nullptr && __builtin_amdgcn_readfirstlane(__hip_atomic_load(stall, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) != 0) break;
             __builtin_amdgcn_s_sleep(1);
             if (++spins > (1l << 24)) {   // ~1-2 s: not every block is resident (see run_phase) - say so, never silently
                 atomicMax(diag, phase + 1);

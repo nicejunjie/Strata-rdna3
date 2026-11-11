@@ -3921,7 +3921,12 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
             const OnDevice on(x->device_);
             const cudaError_t le = cudaGraphLaunch(x->ex(T), x->cs_);
             x->trace_ev("LAUNCHED", -1, -1, (int64_t) le);
-            if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+            if (le != cudaSuccess) {
+                err = std::string("verify: launch: ") + cudaGetErrorString(le);
+                // [claude] review M4: the card launched first spins on the rings: let it go (else ~Verifier waits forever)
+                for (Verifier* y : v) if (y != x) (void) y->release_gpu_waits(5000);
+                return false;
+            }
             (void) cudaStreamQuery(x->cs_);
         }
         ms_launch += ms_since(tl);
@@ -3929,8 +3934,12 @@ bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn po
     // the card whose layers come first is served first (its layer 0 gathers the PLE rows for both)
     Verifier* first = tp_lb_ <= tp_peer_->tp_lb_ ? this : tp_peer_;
     Verifier* second = first == this ? tp_peer_ : this;
-    if (!first->serve_rings(T, pool, user, do_ple, ple_rows, second, err)) return false;
-    if (!second->serve_rings(T, pool, user, false, nullptr, nullptr, err)) return false;
+    // [claude] review M4: a failure while serving leaves both windows spinning: release both cards' waits
+    if (!first->serve_rings(T, pool, user, do_ple, ple_rows, second, err) ||
+        !second->serve_rings(T, pool, user, false, nullptr, nullptr, err)) {
+        for (Verifier* x : v) (void) x->release_gpu_waits(5000);
+        return false;
+    }
     progress_at("verify window: waiting for the GPUs to finish the window", (int64_t) T);
     for (Verifier* x : v) {
         const OnDevice on(x->device_);
@@ -4126,6 +4135,7 @@ bool Verifier::commit_one(int n_keep, std::string& err) {
     if (h_mk_stall_ != nullptr && *(volatile unsigned*) h_mk_stall_ != 0) {   // the window just read is wrong: never commit it
         err = "verify: STRATA_MEGAKERNEL: phase " + std::to_string(*(volatile unsigned*) h_mk_stall_ - 1) +
               " of the persistent kernel never completed (not every block was resident: another kernel held CUs)";
+        *(volatile unsigned*) h_mk_stall_ = 0;   // [claude] review M7: reported - the next window may run (it was sticky)
         return false;
     }
     const Clock::time_point t0 = Clock::now();
@@ -5197,6 +5207,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     if (h_mk_stall_ != nullptr && *(volatile unsigned*) h_mk_stall_ != 0) {
         err = "verify: STRATA_MEGAKERNEL: a phase of the persistent kernel never completed";
+        *(volatile unsigned*) h_mk_stall_ = 0;   // [claude] review M7: reported, not sticky
         return false;
     }
     const Clock::time_point t0 = Clock::now();

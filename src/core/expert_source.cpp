@@ -2029,6 +2029,12 @@ void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us
     stage_cv_.notify_all();
 }
 
+bool FileExpertSource::recycles(const uint8_t* blob) {   // [claude] review M6
+    if (blob == nullptr) return false;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    const auto it = stage_idx_.find(blob);
+    return it != stage_idx_.end() && stage_buf_[it->second].get_deleter().pinned;
+}
 void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
     if (blob == nullptr) return;
     std::lock_guard<std::mutex> lk(stage_mu_);

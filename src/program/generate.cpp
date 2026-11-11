@@ -10894,13 +10894,14 @@ int main(int argc, char** argv) {
         };
         // whether a part's copies are all in (wait: block until they are)
         auto late_ready = [&](LateTranche& t, bool wait) -> bool {
+            // [claude] review M5: wait reports a failed / lost copy (false), and the join then keeps the part's rows lent
             if (t.sd != nullptr) {
-                if (wait) t.sd->wait(t.done);
+                if (wait) { if (!t.sd->wait(t.done)) return false; }
                 else if (!t.sd->landed(t.done)) return false;
             }
             if (t.ev != nullptr) {
                 const strata::core::OnDevice on(t.dev);
-                if (wait) cudaEventSynchronize(t.ev);
+                if (wait) { if (cudaEventSynchronize(t.ev) != cudaSuccess) return false; }
                 else if (cudaEventQuery(t.ev) != cudaSuccess) return false;
             }
             return true;
@@ -10989,8 +10990,11 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 while (t.pending > 0 && !late_q.empty()) late_pump((int64_t) late_q.front().nb);   // due before its copies all went: the rest now
+                if (!t.bad && !late_ready(t, true)) {   // [claude] review M5: a failed copy: its rows stay lent out
+                    t.bad = true;
+                    std::fprintf(stderr, "strata serve: a late refill part did not land: its %zu rows stay out of the cache\n", t.rows.size());
+                }
                 if (!t.bad) {   // (bad: its event failed; nothing to wait for, the rows stay lent out)
-                    late_ready(t, true);
                     for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
                     rows_joined += t.rows.size();
                 }
@@ -14322,7 +14326,17 @@ int main(int argc, char** argv) {
                             e = "prefill: a late refill copy has no source or slot";
                             return false;
                         }
-                        if (pace && !is_head) {
+                        // [claude] review M6: a recycled stage buffer is copied now, on this part's HIP stream, and fenced
+                        // there (#1237) - a paced or SDMA copy would read it after the source handed the buffer out again
+                        if (srcp->recycles(b)) {
+                            const strata::core::OnDevice on(lt.dev);
+                            if (cudaMemcpyAsync(dst, b, (size_t) nb, cudaMemcpyHostToDevice, lt.stream) != cudaSuccess) {
+                                e = std::string("prefill: a late refill copy failed: ") + cudaGetErrorString(cudaGetLastError());
+                                return false;
+                            }
+                            srcp->note_async_read(b, lt.stream);
+                            if (lt.sd != nullptr) lt.sd->skip(lt.done, 1);   // the SDMA counter waits for this copy no more
+                        } else if (pace && !is_head) {
                             late_q.push_back({dst, b, (size_t) nb, tid, i, slot});
                             queued += nb;
                             ++lt.pending;
@@ -14330,7 +14344,6 @@ int main(int argc, char** argv) {
                             e = std::string("prefill: a late refill copy failed: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
                         }
-                        srcp->note_async_read(b, nullptr);   // #1237
                         lt.rows.push_back({i, slot});
                     }
                     // paced: the window its last copy goes out in (fixed by the queue's bytes), then W more
@@ -14361,9 +14374,13 @@ int main(int argc, char** argv) {
                     bool join = t.head && !t.bad;
                     if (!join && late_join_now_env && late_landed_now() && t.pending == 0 && !t.bad) join = late_ready(t, false);
                     if (!join) { keep.push_back(std::move(t)); continue; }
-                    late_ready(t, true);
-                    for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
-                    rows_joined += t.rows.size();
+                    if (!late_ready(t, true)) {   // [claude] review M5: a failed copy: its rows stay lent out
+                        std::fprintf(stderr, "strata serve: a refill head part did not land: its %zu rows stay out of the cache\n", t.rows.size());
+                        t.bad = true;
+                    } else {
+                        for (const LateRow& r : t.rows) (*t.tbl)[(size_t) r.i] = r.slot;
+                        rows_joined += t.rows.size();
+                    }
                     if (t.ev != nullptr) { const strata::core::OnDevice on(t.dev); cudaEventDestroy(t.ev); t.ev = nullptr; }
                     if (t.sd != nullptr) t.sd->destroy(t.done);
                     ++joined;
@@ -14422,6 +14439,7 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            bool lend_no_tp = false;   // [claude] review M1: lend lays this segment out for the usual read, not TP's
             auto lend = [&](int64_t a0, int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
@@ -14439,7 +14457,7 @@ int main(int argc, char** argv) {
                     // [claude] STRATA_TP_PREFILL_OWNROWS: a prompt with picture rows is not read by run_tp (it declines them),
                     // and the usual path cannot use a TP layout that holds only its own rows: that loan is laid out as DP's
                     const bool tpp_pictures = strata::prefill::Prefill::tp_ownrows_env() && sp.embd_rows != nullptr;
-                    if (tpp_takes(dp_n) && !tpp_pictures) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
+                    if (tpp_takes(dp_n) && !tpp_pictures && !lend_no_tp) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
                     else if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
                     else want_full = std::min(want_full, pipe_chunk_for(tokens));
                 }
@@ -14578,6 +14596,26 @@ int main(int argc, char** argv) {
                 }
                 const bool planned = plan.chunk > 0;
                 const bool plan_single = planned && plan.single;
+                // [claude] review M1: with STRATA_TP_PREFILL_OWNROWS a TP loan holds only its path's own rows, which no other
+                // read can use. When the read does not go to run_tp after all (a planned segment, or run_tp declines: a
+                // card's loan halved below TP_MIN, a steered layer, ...), the loan goes back and is lent again laid out for
+                // the usual read - before, the request failed ("lays out TP reads only") instead of reading slower.
+                auto own_rows_back = [&](std::string& e2) -> bool {
+                    if (!strata::prefill::Prefill::tp_ownrows_env()) return true;
+                    bool tp_laid = false;
+                    for (PfPart& q : pf_parts) tp_laid = tp_laid || (q.first >= 0 && q.sp->tp_layout_now());
+                    if (!tp_laid) return true;
+                    for (int d : {0, stages[0]->dev}) {   // the head read on the old layout is done before it moves
+                        const strata::core::OnDevice on(d);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e2 = "prefill: a device sync failed before relending"; return false; }
+                    }
+                    std::fprintf(stderr, "strata serve: the TP loan is laid out again for the usual prompt path\n");
+                    lend_no_tp = true;
+                    const bool ok = lend(a0, b0 - a0, e2, planned ? plan.chunk : 0);   // a plan keeps its chunk
+                    lend_no_tp = false;
+                    return ok;
+                };
+                if (planned && dp_on && !own_rows_back(e)) return false;
                 if (b0 - a0 > req_chunk_len) {
                     req_chunk_len = b0 - a0;
                     req_chunk = planned ? std::min(plan.chunk, b0 - a0) : std::min(sp.chunk(), b0 - a0);
@@ -14618,6 +14656,7 @@ int main(int argc, char** argv) {
                     }
                     if (te.rfind("prefill TP: ", 0) != 0) { e = te; return false; }   // it ran: the state is not usable
                     std::fprintf(stderr, "strata serve: %s - the usual prompt path reads it\n", te.c_str());
+                    if (!own_rows_back(e)) return false;   // [claude] review M1
                     if (dp_takes(tn, o.prefill_chunk)) {
                         std::string de;
                         if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, tn, a0 + head,
@@ -15346,6 +15385,14 @@ int main(int argc, char** argv) {
                 }
                 at = to;
                 tr("part done", at, to);
+                // [claude] review H1 (2026-11-10): a windows part under tensor parallel leaves the new state on the TP pair
+                // (tp_ss); checkpoint_at saves the stage sessions, so the state goes back to the stages first - else the
+                // checkpoint at turn_at / message_at holds a state that never read this part (a short last message)
+                if (tp_on && tp_state_tp && (to == turn_at || to == root_at || to == message_at || to == pin_at) &&
+                    !tp_to(false, to, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
@@ -16128,7 +16175,10 @@ int main(int argc, char** argv) {
                 }
             }
             tr("decode start", n);
-            if (tp_on && !pl_ran && !cancelled && produced_n < max_new && !tp_to(true, n, err)) {   // TENSOR PARALLEL: the state to the cards
+            // [claude] review M3: the stages hold [0, n - 1) here (the first window reads token n - 1): moving n recorded cell
+            // n - 1 as moved, and STRATA_TP_BACK_SKIP then skipped its page on the way back when n % page_size == 0 (stale K/V
+            // for the next live-continued turn)
+            if (tp_on && !pl_ran && !cancelled && produced_n < max_new && !tp_to(true, n - 1, err)) {   // TENSOR PARALLEL: the state to the cards
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
