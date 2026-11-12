@@ -200,11 +200,19 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
 constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the CPU share's default limit)
 int64_t g_stream_min_share = 0;
-inline int64_t stream_all_min() {
+int64_t g_stream_min_part = 0;   // [claude] planner step 1b: the part's plan (0: none, today's rule)
+int64_t g_walk_max_part = 0;     // [claude] planner step 1b: the routed walk's limit from the part's plan (0: none)
+inline int64_t legacy_stream_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
     return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
 }
+inline int64_t stream_all_min() { return g_stream_min_part > 0 ? g_stream_min_part : legacy_stream_min(); }
+inline int64_t legacy_walk_max() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_FUSED_ROUTED_MAX"); return e ? (int64_t) std::atoll(e) : (int64_t) 2048; }();
+    return v;
+}
+inline int64_t walk_max() { return g_walk_max_part > 0 ? g_walk_max_part : legacy_walk_max(); }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
 // `auto`: the share measured, each layer's CPU time per expert and the GPU's per streamed expert (CUDA events around
@@ -1073,6 +1081,8 @@ struct Prefill::Impl {
     uint16_t* dq_d[DQ] = {};
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
+    int64_t layout_smin = -1;                // [claude] planner step 1b: the staged threshold this layout was laid out with
+    bool layout_forced = false;              // ...and whether a part's plan set it (not today's rule)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
@@ -1813,6 +1823,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.ds_sum = o.take<uint16_t>(th * N, ok); m.ds_own = o.take<int32_t>(T * K, ok);
     }
     m.ring = ring_slots(T);
+    m.layout_smin = stream_all_min();   // [claude] planner step 1b: run() reads with this threshold only
+    m.layout_forced = g_stream_min_part > 0;
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
     if (o.base == nullptr && m.ring > 0) {
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
@@ -2554,6 +2566,13 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 }
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+void Prefill::set_part_stream_min(int64_t tokens) { g_stream_min_part = std::max<int64_t>(0, tokens); }
+int64_t Prefill::legacy_stream_min_tokens() { return legacy_stream_min(); }
+void Prefill::set_part_walk_max(int64_t tokens) { g_walk_max_part = std::max<int64_t>(0, tokens); }
+int64_t Prefill::walk_max_tokens() { return walk_max(); }
+int64_t Prefill::legacy_walk_max_tokens() { return legacy_walk_max(); }
+int64_t Prefill::layout_stream_min() const { return impl_ ? impl_->layout_smin : -1; }
+bool Prefill::layout_stream_min_forced() const { return impl_ && impl_->layout_forced; }
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -2968,6 +2987,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
+    // [claude] planner step 1b (review 1 M1): a layout and the chunks read in it must see ONE staged threshold - a fused
+    // layout keeps MMQ's buffers for stream_all_min() - 1 rows only, so a smaller threshold than the layout's would write
+    // past them.  The serve lend lays a part out again when its plan's threshold differs; this is the backstop.
+    // (checked when a part's plan set the threshold now or for this layout: today's rule alone is never checked here)
+    if ((g_stream_min_part > 0 || m.layout_forced) && m.layout_smin >= 0 && m.layout_smin != stream_all_min()) {
+        err = "prefill: this part's staged threshold (" + std::to_string(stream_all_min()) + ") is not the one its buffers were laid "
+              "out for (" + std::to_string(m.layout_smin) + "): lay the part out again first";
+        return false;
+    }
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
@@ -3400,7 +3428,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         double r_acc = 0.0;
         {
             static const bool r_env = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED"); return v != nullptr && std::atoi(v) != 0; }();
-            static const int64_t r_max = [] { const char* v = std::getenv("STRATA_FUSED_ROUTED_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 2048; }();
+            const int64_t r_max = walk_max();   // [claude] planner step 1b: the part's plan, else STRATA_FUSED_ROUTED_MAX (2048)
             rmode = r_env && stream_all && ps_on && m.pp->fused && !ds_chunk && !dp && T <= r_max && T == n && m.stager;
             int r_why = 0;
             for (int64_t l = LB; rmode && l < LE; ++l) {

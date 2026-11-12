@@ -194,7 +194,7 @@ bool refill_order_prompt() {
 // [claude] planner step 1 (results/planner-20261112): today's thresholds, parsed once exactly as the helpers below parsed
 // them before; the rules live in include/strata/program/segment_plan.hpp (one place, CPU-tested).  This 1-GPU line has no
 // TP prompt path and no HEAD_BIG / HEAD_TP_KEEP: those thresholds stay at their "off" defaults here.
-const strata::program::segment_plan::Thresholds& legacy_thresholds() {
+strata::program::segment_plan::Thresholds legacy_base_thresholds() {
     static const strata::program::segment_plan::Thresholds t = [] {
         strata::program::segment_plan::Thresholds t;
         auto env = [](const char* k) { return std::getenv(k); };
@@ -213,6 +213,31 @@ const strata::program::segment_plan::Thresholds& legacy_thresholds() {
         return t;
     }();
     return t;
+}
+// [claude] planner step 1b: the thresholds in force for the request now - today's (legacy_base_thresholds) unless the
+// request forces a plan through its per-request switches (strata_tune env PLAN_*; request_switches.hpp, request-only)
+strata::program::segment_plan::Thresholds& thresholds_now() {
+    static strata::program::segment_plan::Thresholds t = legacy_base_thresholds();
+    return t;
+}
+const strata::program::segment_plan::Thresholds& legacy_thresholds() { return thresholds_now(); }
+// at every GEN/GENI after reqsw::apply_request: the request's forced plan values (none: today's), and the staged threshold
+// and walk limit the prompt kernels take for this request's parts (Prefill::set_part_stream_min / set_part_walk_max)
+bool g_plan_forced = false;   // the request running now forced a plan (for the plan log line)
+bool apply_plan_switches() {
+    namespace R = strata::core::reqsw;
+    strata::program::segment_plan::Thresholds t = legacy_base_thresholds();
+    const int64_t tp_min = R::get_i64(R::PLAN_TP_MIN), tp_max = R::get_i64(R::PLAN_TP_MAX), dp_min = R::get_i64(R::PLAN_DP_MIN);
+    const int64_t tail = R::get_i64(R::PLAN_TAIL_MAX), staged = R::get_i64(R::PLAN_STAGED_MAX), walk = R::get_i64(R::PLAN_WALK_MAX);
+    if (tp_min >= 0) t.tp_lo = std::max<int64_t>(1024, tp_min);     // (the env floors, as legacy_base_thresholds)
+    if (tp_max >= 0) t.tp_hi = tp_max;
+    if (dp_min >= 0) t.dp_min = std::max<int64_t>(2 * strata::program::segment_plan::kDpMinLast, dp_min);
+    if (tail >= 0) t.equal_tail_max = tail;
+    thresholds_now() = t;
+    strata::prefill::Prefill::set_part_stream_min(staged > 0 ? staged : 0);
+    strata::prefill::Prefill::set_part_walk_max(walk > 0 ? walk : 0);
+    g_plan_forced = tp_min >= 0 || tp_max >= 0 || dp_min >= 0 || tail >= 0 || staged > 0 || walk > 0;
+    return g_plan_forced;
 }
 // the DP plan's chunk for a segment of n tokens (Prefill::run_dp: an even number of balanced chunks, multiples of 256)
 int64_t dp_step_for(int64_t n, int64_t cap) { return strata::program::segment_plan::dp_step_for(n, cap); }
@@ -13262,6 +13287,7 @@ int main(int argc, char** argv) {
                 // (every GEN/GENI starts from the start-up values)
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
+                apply_plan_switches();   // [claude] planner step 1b: this request's forced plan (none: today's rules)
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -14464,8 +14490,13 @@ int main(int argc, char** argv) {
                 bool any = false;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
+                    // [claude] planner step 1b: a layout laid out for another staged threshold (a forced plan now or then)
+                    // is laid out again: its buffers hold MMQ's rows for that threshold only (review 1 M1)
+                    const bool smin_mismatch = (p.sp->layout_stream_min_forced() ||
+                                                strata::prefill::Prefill::stream_all_min_tokens() != strata::prefill::Prefill::legacy_stream_min_tokens()) &&
+                                               p.sp->layout_stream_min() != strata::prefill::Prefill::stream_all_min_tokens();
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        if (want <= p.lent_chunk && !smin_mismatch) continue;   // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -14500,7 +14531,7 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                    if (want_p != p.sp->chunk() || first != p.first_now || smin_mismatch) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
@@ -15331,11 +15362,13 @@ int main(int argc, char** argv) {
                             cl += (size_t) std::snprintf(cards + cl, sizeof(cards) - cl, "%s%lld@%lld", c ? "," : "",
                                                          (long long) seg_cur.lent_rows[c], (long long) seg_cur.lent_chunk[c]);
                         std::fprintf(stderr, "strata plan: part %lld-%lld %s (lend %s want %lld head %lld chunk %lld) ran %s | lent %s | "
-                                     "kernels: chunks %d stream_all %d staged %d walk %d helped %d ring %d/%d first %lld | %.1f ms\n",
+                                     "kernels: chunks %d stream_all %d staged %d walk %d helped %d ring %d/%d first %lld | staged< %lld walk<= %lld%s | %.1f ms\n",
                                      (long long) at, (long long) to, spn::path_name(seg_cur.path), spn::path_name(seg_cur.lend_path),
                                      (long long) seg_cur.want, (long long) seg_cur.head, (long long) seg_cur.read_chunk,
                                      spn::path_name(seg_ran), cards[0] ? cards : "-", rf.chunks, rf.stream_all, rf.staged, rf.walk,
-                                     rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk, part_ms);
+                                     rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk,
+                                     (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) strata::prefill::Prefill::walk_max_tokens(),
+                                     g_plan_forced ? " forced" : "", part_ms);
                     }
                     seg_cur_set = false;
                 }
