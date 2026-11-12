@@ -256,6 +256,20 @@ public:
     /// download a chunk).  generate.cpp refills a long prompt's lent cache slots in this order (STRATA_REFILL_OVERLAP).
     void route_hist_enable(bool on) { route_hist_on_ = on; }
     const std::vector<int32_t>& route_hist() const { return route_hist_; }
+    /// [claude] planner step 1: what the last run() / run_impl() really did per chunk (the decisions made inside the
+    /// prompt kernels), for the per-part plan log line next to the planned values.  Accumulated over every run_impl of
+    /// this instance (a DP / TP read calls it per chunk); the serve loop resets it before each part.  Read only.
+    struct RunFacts {
+        int32_t chunks = 0;        ///< chunks read
+        int32_t stream_all = 0;    ///< chunks that streamed every non-resident expert
+        int32_t staged = 0;        ///< chunks staged after their routing (the CPU share's range)
+        int32_t walk = 0;          ///< chunks on the routed walk (STRATA_FUSED_ROUTED)
+        int32_t helped = 0;        ///< chunks with the layer split's help (the idle stage streams a share)
+        int32_t ring = 0;          ///< the ring slots the layout holds (m.ring)
+        int64_t first_chunk = 0;   ///< the first chunk's tokens
+    };
+    const RunFacts& run_facts() const { return run_facts_; }
+    void reset_run_facts() { run_facts_ = RunFacts{}; }
     void route_hist_reset() { std::fill(route_hist_.begin(), route_hist_.end(), 0); }
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
@@ -315,6 +329,7 @@ private:
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     bool route_hist_on_ = false;                     ///< route_hist_enable
+    RunFacts run_facts_;                             ///< [claude] planner step 1: run_facts()
     std::vector<int32_t> route_hist_;                ///< route_hist
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
