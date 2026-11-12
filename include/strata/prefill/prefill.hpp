@@ -92,6 +92,18 @@ public:
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
     static int64_t stream_all_min_tokens();
+    /// [claude] planner step 1b: the part's plan sets the staged threshold (the chunk size from which a chunk streams every
+    /// expert: stream_all_min_tokens) and the routed walk's limit (STRATA_FUSED_ROUTED_MAX) for the part's layout and
+    /// read; 0 = none (today's rule: STRATA_PREFILL_STREAM_MIN, the CPU share's limit, 1024; FUSED_ROUTED_MAX, 2048).
+    /// The threshold a layout was laid out with is recorded (layout_stream_min) and run() refuses a part whose
+    /// threshold differs from it (review 1 M1: the fused layouts keep MMQ buffers for stream_all_min - 1 rows only).
+    static void set_part_stream_min(int64_t tokens);
+    static int64_t legacy_stream_min_tokens();   ///< the threshold without a part's plan (today's rule)
+    static void set_part_walk_max(int64_t tokens);
+    static int64_t walk_max_tokens();            ///< the routed walk's limit in force (the part's plan, else today's)
+    static int64_t legacy_walk_max_tokens();
+    int64_t layout_stream_min() const;
+    bool layout_stream_min_forced() const;
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk
