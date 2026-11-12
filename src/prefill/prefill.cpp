@@ -3596,6 +3596,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
             }
         }
+        // [claude] stall-20261112: the pool is tried again at every layer that could share, not only once at the chunk's
+        // start.  On a layer split the later stage's host thread enters its chunk while the earlier stage still holds the
+        // pool (released when that stage's chunk returns), so the single try lost the race in ~15% of short reads and the
+        // stage then streamed every expert the card does not hold for the whole chunk: IQ3 2-GPU 254-token reads 300 ->
+        // 730-780 ms on card 1 ('wait copy' 75 -> 465 ms), +0.45..0.5 s TTFT.  Still one stage at a time: whoever holds
+        // the flag shares; a stage that gets it mid-chunk shares from that layer on (buffers are had lazily per layer).
+        const bool pool_wanted = cpu_pool_ != nullptr && cpu_share_on() && ((!stream_all && !pipe_chunked) || rmode);
+        auto pool_retry = [&] {
+            if (pool_wanted && !pool_hold.held) {
+                bool expect = false;
+                pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+            }
+        };
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
@@ -3849,6 +3862,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             static const double cfrac = [] { const char* v = std::getenv("STRATA_FUSED_CPU_FRAC"); return v ? std::clamp(std::atof(v), 0.0, 1.0) : 0.3; }();
             static const int cmaxt = [] { const char* v = std::getenv("STRATA_FUSED_CPU_MAXT"); return v ? std::max(1, std::atoi(v)) : 8; }();
+            pool_retry();
             bool cpu_on = pool_hold.held && cfrac > 0.0 && cpu_pool_ != nullptr && !m.cpu_dead && lay0.native;
             const size_t tn = (size_t) T * N, tk = (size_t) T * K;
             auto host_buf = [&](float*& b, size_t& cap, size_t want, const char* what) -> bool {
@@ -5361,6 +5375,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
+                        pool_retry();
                         bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
                                          lay.native && !m.pp && !lay.fmt.empty();
                         // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
