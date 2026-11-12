@@ -3522,6 +3522,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
         }
         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
+        {   // [claude] planner step 1: record what this chunk does (no decision is made here)
+            RunFacts& rf = run_facts_;
+            if (rf.chunks == 0) rf.first_chunk = (int64_t) T;
+            ++rf.chunks;
+            rf.stream_all += stream_all ? 1 : 0;
+            rf.staged += stream_all ? 0 : 1;
+            rf.helped += ps_on ? 1 : 0;
+            rf.ring = m.ring;
+        }
         // [claude] DP share: this chunk (a DP prompt of two chunks, the streamed walk, the threaded ring issuer)
         const bool ds_chunk = dp && m.ds_on && stream_all && dp_link_ && [] {
             const char* v = std::getenv("STRATA_PREFILL_ISSUER");
@@ -3579,6 +3588,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     else if (m.src->blob_stable(l, e) == nullptr) { rmode = false; r_why = 4; }
                 }
             }
+            run_facts_.walk += rmode ? 1 : 0;   // [claude] planner step 1: record only
             if (r_env && std::getenv("STRATA_PREFILL_TIMING") != nullptr)
                 std::fprintf(stderr, "strata prefill: routed walk %s (why %d, stream_all %d help %d fused %d ds %d dp %d T %lld n %lld stager %d)\n",
                              rmode ? "on" : "off", r_why, (int) stream_all, (int) ps_on, (int) (ps_on && m.pp->fused), (int) ds_chunk,
