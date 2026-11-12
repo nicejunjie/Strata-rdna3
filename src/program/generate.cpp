@@ -224,11 +224,33 @@ const strata::program::segment_plan::Thresholds& legacy_thresholds() { return th
 // at every GEN/GENI after reqsw::apply_request: the request's forced plan values (none: today's), and the staged threshold
 // and walk limit the prompt kernels take for this request's parts (Prefill::set_part_stream_min / set_part_walk_max)
 bool g_plan_forced = false;   // the request running now forced a plan (for the plan log line)
-bool apply_plan_switches() {
+// [claude] planner step 2b (review 4 A2): the PLAN_* switches are honoured only by an engine the calibration tool started
+// with --calibration-plans (a CLI flag, never an environment variable), never under --batch slots (a slot read keeps the
+// last GEN's switches), and PLAN_STAGED_MAX never on a layer split (not audited there).  Forced values are clamped and
+// checked: the staged threshold and the walk limit at least 1024 (the key's floor; below ~1000 tokens other kernels run)
+// and at most the start-up chunk, on the 256 grid or one past it (an exclusive bound); anything else rejects the
+// request's whole plan and says so on one line.
+bool apply_plan_switches(bool allowed, int64_t cap, bool batch, bool split) {
     namespace R = strata::core::reqsw;
     strata::program::segment_plan::Thresholds t = legacy_base_thresholds();
-    const int64_t tp_min = R::get_i64(R::PLAN_TP_MIN), tp_max = R::get_i64(R::PLAN_TP_MAX), dp_min = R::get_i64(R::PLAN_DP_MIN);
-    const int64_t tail = R::get_i64(R::PLAN_TAIL_MAX), staged = R::get_i64(R::PLAN_STAGED_MAX), walk = R::get_i64(R::PLAN_WALK_MAX);
+    int64_t tp_min = R::get_i64(R::PLAN_TP_MIN), tp_max = R::get_i64(R::PLAN_TP_MAX), dp_min = R::get_i64(R::PLAN_DP_MIN);
+    int64_t tail = R::get_i64(R::PLAN_TAIL_MAX), staged = R::get_i64(R::PLAN_STAGED_MAX), walk = R::get_i64(R::PLAN_WALK_MAX);
+    const bool asked = tp_min >= 0 || tp_max >= 0 || dp_min >= 0 || tail >= 0 || staged >= 0 || walk >= 0;
+    std::string why;
+    auto grid_ok = [](int64_t v) { return v % 256 == 0 || v % 256 == 1; };
+    if (asked) {
+        if (!allowed) why = "this engine was not started with --calibration-plans";
+        else if (batch) why = "batch slots are configured (a slot read would keep the forced plan)";
+        else if (staged >= 0 && split) why = "PLAN_STAGED_MAX is not supported on a layer split";
+        else if (staged >= 0 && (staged < 1024 || staged > cap + 1 || !grid_ok(staged))) why = "PLAN_STAGED_MAX outside [1024, start-up chunk + 1] or off the 256 grid";
+        else if (walk >= 0 && (walk < 1024 || walk > cap || !grid_ok(walk))) why = "PLAN_WALK_MAX outside [1024, start-up chunk] or off the 256 grid";
+        else if (tp_min >= 0 && (tp_min < 1024 || !grid_ok(tp_min))) why = "PLAN_TP_MIN below 1024 or off the 256 grid";
+        else if ((tp_max >= 0 && !grid_ok(tp_max)) || (dp_min >= 0 && !grid_ok(dp_min))) why = "PLAN_TP_MAX / PLAN_DP_MIN off the 256 grid";
+        if (!why.empty()) {
+            std::fprintf(stderr, "strata plan: forced plan REJECTED (%s): this request runs today's plan\n", why.c_str());
+            tp_min = tp_max = dp_min = tail = staged = walk = -1;
+        }
+    }
     if (tp_min >= 0) t.tp_lo = std::max<int64_t>(1024, tp_min);     // (the env floors, as legacy_base_thresholds)
     if (tp_max >= 0) t.tp_hi = tp_max;
     if (dp_min >= 0) t.dp_min = std::max<int64_t>(2 * strata::program::segment_plan::kDpMinLast, dp_min);
@@ -866,6 +888,8 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    /// [claude] planner step 2b: --calibration-plans: honour a request's PLAN_* switches (the calibration tool's engines only)
+    bool calibration_plans = false;
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
@@ -2786,6 +2810,7 @@ int main(int argc, char** argv) {
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--calibration-plans") o.calibration_plans = true;   // [claude] planner: the tool's engines only
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -13287,7 +13312,7 @@ int main(int argc, char** argv) {
                 // (every GEN/GENI starts from the start-up values)
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
-                apply_plan_switches();   // [claude] planner step 1b: this request's forced plan (none: today's rules)
+                apply_plan_switches(o.calibration_plans, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules)
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -14525,6 +14550,8 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
                                          "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
                                          (long long) want_p);
+                        if (g_plan_forced)   // [claude] review 4 A2.2: the tool discards this arm
+                            std::fprintf(stderr, "strata plan: forced plan INVALID: a chunk was halved (#2090) under it\n");
                         if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
                             std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
                                          "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
