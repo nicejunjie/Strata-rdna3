@@ -14550,7 +14550,7 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
                                          "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
                                          (long long) want_p);
-                        if (g_plan_forced)   // [claude] review 4 A2.2: the tool discards this arm
+                        if (want_p != want && g_plan_forced)   // [claude] review 4 A2.2: the tool discards this arm (only when halved)
                             std::fprintf(stderr, "strata plan: forced plan INVALID: a chunk was halved (#2090) under it\n");
                         if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
                             std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
