@@ -309,6 +309,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # [claude] planner rev 5: option C's rule port (planner_c.hpp) against rule_c.py's stored vectors; header-only, no GPU.  The
+  # vectors and pack tables live in the localLLM planner branch (results/planner-20261112/rev5/shadow): run it with their paths.
+  add_executable(planner_c_test src/program/planner_c_test.cpp)
+  target_include_directories(planner_c_test PRIVATE include)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)

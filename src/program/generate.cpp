@@ -9197,15 +9197,26 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata plan: cache %lld slots, %llu bytes\n", (long long) pf_parts[0].cache->slots(),
                                  (unsigned long long) pf_parts[0].cache->bytes());
                 }
-                // [claude] planner rev 5 (review 10) SHADOW: option C's start-up facts - the loan tables (the same grid as the print
-                // above), slots and bytes, the profile's ranking, and M1 (the link rate at the slot size, from the pinned arena into a
-                // scratch buffer); a cached result for the same key is logged at once.  Nothing here changes any plan.
+                // [claude] planner rev 5 (review 10, 11) SHADOW: option C's start-up facts - the loan tables (the same grid as the print
+                // above), slots and bytes, the profile's ranking, and M1 (the link rate at the slot size, from the pinned arena, timed
+                // like rev4/mb/mb.hip: wall clock around the enqueue and the sync); the result of an earlier load with the same key is
+                // only LOGGED next to this load's own derivation (review 11 M1: never skip it).  Nothing here changes any plan.
                 if (!o.planner_shadow.empty() && o.calibration_plans && pf_parts.size() == 1 && srcp != nullptr) {
                     namespace PC = strata::program::planner_c;
                     std::string perr;
-                    const std::string pdir = o.planner_shadow.substr(0, o.planner_shadow.find_last_of('/') == std::string::npos ? 0 : o.planner_shadow.find_last_of('/'));
-                    g_shadow.on = PC::load_pack(o.planner_shadow, pdir.empty() ? "." : pdir, g_shadow.pack, perr) &&
-                                  PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr);
+                    const size_t sl = o.planner_shadow.find_last_of('/');
+                    const std::string pdir = sl == std::string::npos ? "." : o.planner_shadow.substr(0, sl);
+                    try {   // review 11: a malformed pack turns the shadow off, it never stops the engine
+                        g_shadow.on = PC::load_pack(o.planner_shadow, pdir, g_shadow.pack, perr) &&
+                                      PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr) &&
+                                      PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr);
+                    } catch (const std::exception& ex) { g_shadow.on = false; perr = std::string("malformed pack: ") + ex.what(); }
+                    // the pack must be this model's: the engine pack it was built from (its directory name) is in the pack
+                    const size_t ps = o.pack.find_last_of('/');
+                    const std::string pack_name = ps == std::string::npos ? o.pack : o.pack.substr(ps + 1);
+                    if (g_shadow.on && !g_shadow.pack.engine_pack.empty() && g_shadow.pack.engine_pack != pack_name) {
+                        g_shadow.on = false; perr = "the pack table was built for " + g_shadow.pack.engine_pack + ", this engine loads " + pack_name;
+                    }
                     if (!g_shadow.on) std::fprintf(stderr, "strata planner shadow: OFF (%s)\n", perr.c_str());
                     if (g_shadow.on) {
                         PC::Facts& f = g_shadow.facts;
@@ -9219,55 +9230,70 @@ int main(int argc, char** argv) {
                         }
                         strata::prefill::Prefill::set_part_stream_min(0);
                         g_shadow.configured = strata::prefill::Prefill::legacy_stream_min_tokens();
-                        // M1: 384 copies of one slot's bytes (cache bytes / slots, the model's b) from pinned arena blobs into a
-                        // 32-slot scratch ring on its own stream; the median of 3 timed passes after one warm-up
+                        // M1: 384 copies of one slot's bytes (cache bytes / slots, the model's b) from pinned arena blobs - each copy at
+                        // most its own blob's size (the next blob's address in the same layer bounds it: review 11, no over-read) - into a
+                        // 32-slot scratch ring on the engine's main stream (no new stream: review 11, the queue order stays), timed as
+                        // mb.hip times it (wall clock around the enqueue and the stream sync), median of 3 passes after one warm-up
                         const size_t bytes = (size_t) (f.cache_bytes / (double) f.slots);
-                        std::vector<const uint8_t*> srcs;
+                        std::vector<std::pair<const uint8_t*, size_t>> srcs;
                         for (int64_t l = 0; l + 1 < g.n_layers && srcs.size() < 384; ++l)
-                            for (int64_t e = 0; e < g.n_expert && srcs.size() < 384; ++e)
-                                if (srcp->pinned(l, e)) if (const uint8_t* bp = srcp->blob_stable(l, e)) srcs.push_back(bp);
+                            for (int64_t e = 0; e + 1 < g.n_expert && srcs.size() < 384; ++e) {
+                                if (!srcp->pinned(l, e) || !srcp->pinned(l, e + 1)) continue;
+                                const uint8_t* bp = srcp->blob_stable(l, e);
+                                const uint8_t* bn = srcp->blob_stable(l, e + 1);
+                                if (bp == nullptr || bn == nullptr || bn <= bp) continue;
+                                srcs.emplace_back(bp, std::min(bytes, (size_t) (bn - bp)));
+                            }
                         void* scratch = nullptr;
-                        cudaStream_t ls = nullptr;
-                        if (srcs.size() == 384 && cudaMalloc(&scratch, 32 * bytes) == cudaSuccess &&
-                            cudaStreamCreateWithFlags(&ls, cudaStreamNonBlocking) == cudaSuccess) {
-                            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+                        size_t moved = 0;
+                        for (const auto& sp_ : srcs) moved += sp_.second;
+                        if (srcs.size() == 384 && cudaMalloc(&scratch, 32 * bytes) == cudaSuccess) {
                             std::vector<double> gbs;
                             for (int pass = 0; pass < 4; ++pass) {
-                                cudaEventRecord(e0, ls);
+                                cudaStreamSynchronize(main_stream);
+                                const auto t0 = std::chrono::steady_clock::now();
                                 for (size_t i = 0; i < srcs.size(); ++i)
-                                    cudaMemcpyAsync((uint8_t*) scratch + (i % 32) * bytes, srcs[i], bytes, cudaMemcpyHostToDevice, ls);
-                                cudaEventRecord(e1, ls); cudaEventSynchronize(e1);
-                                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
-                                if (pass > 0 && ms > 0) gbs.push_back((double) srcs.size() * (double) bytes / (ms / 1e3));
+                                    cudaMemcpyAsync((uint8_t*) scratch + (i % 32) * bytes, srcs[i].first, srcs[i].second, cudaMemcpyHostToDevice, main_stream);
+                                cudaStreamSynchronize(main_stream);
+                                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                                if (pass > 0 && ms > 0) gbs.push_back((double) moved / (ms / 1e3));
                             }
                             std::sort(gbs.begin(), gbs.end());
                             f.bw = gbs.empty() ? 0.0 : gbs[gbs.size() / 2];
-                            cudaEventDestroy(e0); cudaEventDestroy(e1);
                         }
                         (void) cudaGetLastError();
                         if (scratch) cudaFree(scratch);
-                        if (ls) cudaStreamDestroy(ls);
                         if (f.bw <= 0) { g_shadow.on = false; std::fprintf(stderr, "strata planner shadow: OFF (the link probe could not run)\n"); }
                     }
                     if (g_shadow.on) {
+                        // the key (review 11 M2/M3/S1/S2): host, this binary's content, the pack's content, the card and its copy mode,
+                        // slots and bytes, context and chunk
                         char hn[256] = ""; gethostname(hn, sizeof hn - 1);
-                        char kb[768];
-                        std::snprintf(kb, sizeof kb, "host=%s build=%s %s pack=%s slots=%lld bytes=%.0f context=%lld chunk=%lld", hn, __DATE__, __TIME__,
-                                      o.planner_shadow.c_str(), (long long) g_shadow.facts.slots, g_shadow.facts.cache_bytes, (long long) o.max_context, (long long) chunk);
+                        int dev = 0; cudaGetDevice(&dev);
+                        char pci[64] = "";
+#if defined(STRATA_USE_HIP)
+                        if (hipDeviceGetPCIBusId(pci, sizeof pci, dev) != hipSuccess) { (void) cudaGetLastError(); std::snprintf(pci, sizeof pci, "dev%d", dev); }
+#else
+                        if (cudaDeviceGetPCIBusId(pci, sizeof pci, dev) != cudaSuccess) { (void) cudaGetLastError(); std::snprintf(pci, sizeof pci, "dev%d", dev); }
+#endif
+                        const char* sdma = std::getenv("HSA_ENABLE_SDMA");
+                        char kb[1024];
+                        std::snprintf(kb, sizeof kb, "host=%s exe=%016llx pack=%016llx gpu=%s sdma=%s slots=%lld bytes=%.0f context=%lld chunk=%lld", hn,
+                                      (unsigned long long) PC::file_hash("/proc/self/exe"), (unsigned long long) g_shadow.pack.content_hash, pci,
+                                      sdma ? sdma : "default", (long long) g_shadow.facts.slots, g_shadow.facts.cache_bytes, (long long) o.max_context,
+                                      (long long) chunk);
                         g_shadow.key = kb;
                         g_shadow.cache_path = o.planner_shadow + ".shadow-cache";
-                        std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.3f GB/s; configured staged limit %lld; waiting for the canned start reads (PLAN_PROBE)\n",
+                        std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.4f GB/s; configured staged limit %lld; waiting for the canned start reads (PLAN_PROBE)\n",
                                      kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured);
-                        if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "r")) {   // a result for the same key: logged now
+                        if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "r")) {   // earlier loads with this key: LOGGED only
                             char line[2048];
                             while (std::fgets(line, sizeof line, cf)) {
                                 std::string ln(line); const size_t bar = ln.find(" | ");
                                 double cbw = 0;
-                                if (bar != std::string::npos && ln.compare(0, bar, g_shadow.key) == 0 && std::sscanf(ln.c_str() + bar + 3, "bw %lf", &cbw) == 1 &&
-                                    cbw > 0 && std::fabs(g_shadow.facts.bw / cbw - 1) <= 0.10) {
-                                    g_shadow.done = true;
-                                    std::fprintf(stderr, "strata planner shadow: CACHED %s", ln.c_str() + bar + 3);
-                                }
+                                if (bar != std::string::npos && ln.compare(0, bar, g_shadow.key) == 0 && std::sscanf(ln.c_str() + bar + 3, "bw %lf", &cbw) == 1 && cbw > 0)
+                                    std::fprintf(stderr, "strata planner shadow: earlier load with this key (M1 now %+.2f%% against it): %s",
+                                                 100.0 * (g_shadow.facts.bw / cbw - 1), ln.c_str() + bar + 3);
                             }
                             std::fclose(cf);
                         }
@@ -15514,23 +15540,33 @@ int main(int argc, char** argv) {
                                      rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk,
                                      (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) strata::prefill::Prefill::walk_max_tokens(),
                                      g_plan_forced ? " forced" : "", part_ms);
-                        // [claude] planner rev 5 SHADOW: a canned start read (PLAN_PROBE) that ran staged at the pack's start length
-                        if (g_shadow.probe && rf.staged > 0 && rf.stream_all == 0 && std::llabs((long long) (to - at) - (long long) (g_shadow.pack.start - 7)) < 16) {
+                        // [claude] planner rev 5 SHADOW: a canned start read (PLAN_PROBE).  It counts only if it ran staged, at the pack's
+                        // start length, under the pack's forced limit (review 11 M4); otherwise it is logged as not counted.
+                        if (g_shadow.probe) {
                             namespace PC = strata::program::planner_c;
-                            g_shadow.reads.push_back(part_ms);
-                            double conv_ms = 0; int used = 0;
-                            const bool conv = PC::converged(g_shadow.reads, g_shadow.pack, conv_ms, used);
-                            if (conv || (int) g_shadow.reads.size() >= g_shadow.pack.max_reads) {
-                                const PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
-                                char out[512];
-                                std::snprintf(out, sizeof out, "bw %.6g | X %lld acted %lld configured %lld | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d%s%s | the plan is NOT changed (shadow)\n",
-                                              g_shadow.facts.bw, (long long) r.X, (long long) r.acted, (long long) g_shadow.configured, (long long) r.crossing[0],
-                                              (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms, r.reads_used,
-                                              r.why.empty() ? "" : " | ", r.why.c_str());
-                                std::fprintf(stderr, "strata planner shadow: %s", out);
-                                g_shadow.done = true;
-                                if (r.derived)
+                            const long long part = (long long) (to - at);
+                            const long long lim = (long long) strata::prefill::Prefill::stream_all_min_tokens();
+                            std::string not_why;
+                            if (!(rf.staged > 0 && rf.stream_all == 0)) not_why = "it did not run staged";
+                            else if (std::llabs(part - (long long) (g_shadow.pack.start - 7)) >= 16) not_why = "its part is " + std::to_string(part) + " tokens";
+                            else if (!g_plan_forced || lim != (long long) g_shadow.pack.start_limit) not_why = "its staged limit is " + std::to_string(lim) + ", not the pack's forced " + std::to_string(g_shadow.pack.start_limit);
+                            if (!not_why.empty()) {
+                                std::fprintf(stderr, "strata planner shadow: probe read NOT counted (%s)\n", not_why.c_str());
+                            } else {
+                                g_shadow.reads.push_back(part_ms);
+                                double conv_ms = 0; int used = 0;
+                                const bool conv = PC::converged(g_shadow.reads, g_shadow.pack, conv_ms, used);
+                                if (conv || (int) g_shadow.reads.size() >= g_shadow.pack.max_reads) {
+                                    const PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
+                                    char out[640];
+                                    std::snprintf(out, sizeof out, "bw %.6g | X %lld acted %lld configured %lld | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d%s%s | the plan is NOT changed (shadow)\n",
+                                                  g_shadow.facts.bw, (long long) r.X, (long long) r.acted, (long long) g_shadow.configured, (long long) r.crossing[0],
+                                                  (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms, r.reads_used,
+                                                  r.why.empty() ? "" : " | ", r.why.c_str());
+                                    std::fprintf(stderr, "strata planner shadow: %s", out);
+                                    g_shadow.done = true;
                                     if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "a")) { std::fprintf(cf, "%s | %s", g_shadow.key.c_str(), out); std::fclose(cf); }
+                                }
                             }
                         }
                     }

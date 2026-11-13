@@ -7,18 +7,18 @@
 #include <fstream>
 using namespace strata::program::planner_c;
 int main(int argc, char** argv) {
-    if (argc < 4) { std::fprintf(stderr, "usage: %s PACKDIR COUNTSDIR PROFILE\n", argv[0]); return 2; }
+    if (argc < 4) { std::fprintf(stderr, "usage: %s PACKDIR COUNTSDIR PROFILE [VECTORS]\n", argv[0]); return 2; }
     const std::string pd = argv[1], cd = argv[2], prof = argv[3];
     std::map<std::string, Pack> packs; std::string err;
     for (const char* q : {"iq3", "iq4", "q4"}) {
         Pack p;
-        if (!load_pack(pd + "/pack-" + q + ".txt", cd, p, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!load_pack(pd + "/pack-" + q + ".txt", cd, p, err) || !validate(p, 48, 512, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         packs[q] = std::move(p);
     }
     std::vector<int64_t> rank;
     if (!load_rank(prof, 48, 512, rank, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     const std::map<std::string, int64_t> configured = {{"iq3", 4097}, {"iq4", 6145}, {"q4", 8193}};
-    std::ifstream vf(pd + "/vectors.txt"); std::string l1, l2, l3, l4, l5;
+    std::ifstream vf(argc > 4 ? std::string(argv[4]) : pd + "/vectors.txt"); std::string l1, l2, l3, l4, l5;
     int n = 0, bad = 0;
     while (std::getline(vf, l1) && std::getline(vf, l2) && std::getline(vf, l3) && std::getline(vf, l4) && std::getline(vf, l5)) {
         std::istringstream a(l1); std::string kw, tag, q; Facts f; a >> kw >> tag >> q >> f.slots >> f.cache_bytes >> f.bw;
