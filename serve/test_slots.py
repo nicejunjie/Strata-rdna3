@@ -420,15 +420,27 @@ class Slots(unittest.TestCase):
             self.svc.slot_save_path = saved
         self.assertEqual(s, 501, b)
 
-    def test_refused_with_parallel_requests(self):
-        """#465: batch slots do not hold the FIFO, so a session file is refused before anything reaches the engine."""
+    def test_batch_names_a_slot_and_drains_the_engine(self):
+        """#465 with --batch: the slot save runs behind session_drain() instead of being refused (501)."""
         self.engine.batch = 2
         try:
             s, b = self.post("/slots/0?action=save", {"filename": "p.bin"})
         finally:
             self.engine.batch = 0
-        self.assertEqual(s, 501, b)
-        self.assertIn("parallel", b["error"]["message"])
+        self.assertEqual(s, 200, b)
+        # the file names the slot (the engine command's last token), and admission was restored after
+        self.assertEqual(self.engine.proc.sent, [f"SAVE {Path(self.dir.name, 'p.bin')} 0\n"])
+        self.assertFalse(self.svc.draining)
+
+    def test_batch_slot_out_of_range_is_refused_before_the_engine(self):
+        """With --batch the slot must be a whole number below the batch size; nothing reaches the engine."""
+        self.engine.batch = 2
+        try:
+            s, b = self.post("/slots/9?action=save", {"filename": "p.bin"})
+        finally:
+            self.engine.batch = 0
+        self.assertEqual(s, 400, b)
+        self.assertIn("below 2", b["error"]["message"])
         self.assertEqual(self.engine.proc.sent, [])
 
     def test_waits_for_a_running_request(self):

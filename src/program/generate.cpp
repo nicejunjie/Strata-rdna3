@@ -13029,7 +13029,24 @@ int main(int argc, char** argv) {
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                std::string path = line.substr(save ? 5 : 8);
+                // SAVE/RESTORE <path> [slot]: with --batch, slot 0..N-1 names the batch slot whose conversation the
+                // file holds (absent is the main session).  The path may hold spaces: the selector is the last token
+                // only when it parses as one.
+                int64_t sel_slot = -1;
+                {
+                    const size_t sp = path.rfind(' ');
+                    if (sp != std::string::npos && sp + 1 < path.size()) {
+                        const std::string last = path.substr(sp + 1);
+                        char* se = nullptr;
+                        const long long v = std::strtoll(last.c_str(), &se, 10);
+                        if (se != nullptr && *se == '\0' && v >= 0 && v <= std::max(o.batch, 0)) {
+                            sel_slot = v;
+                            path.resize(sp);
+                            while (!path.empty() && path.back() == ' ') path.pop_back();
+                        }
+                    }
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -13061,7 +13078,23 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                // --batch used to refuse here outright.  A session file holds one owner's conversation, and with
+                // --batch the owners are the slot sessions: the named slot must be idle (its K/V is read or written
+                // whole, which a decoding slot would race).  Moving a slot's state in and out is what a request's
+                // admission and end already do (`copy_from_slot` / `copy_to_slot`), so no new protocol appears.
+                if (o.batch > 0 && sel_slot < 0) {
+                    refuse("with --batch a session file names a slot: SAVE/RESTORE <path> <slot>");
+                    continue;
+                }
+                if (o.batch > 0 && (sel_slot >= (int64_t) bs.size() || sel_slot >= (int64_t) bslot_ss.front().size())) {
+                    refuse("slot " + std::to_string(sel_slot) + " is beyond the " +
+                           std::to_string(bslot_ss.front().size()) + " slot sessions");
+                    continue;
+                }
+                if (o.batch > 0 && bs[(size_t) sel_slot].active) {
+                    refuse("slot " + std::to_string(sel_slot) + " is running a request: stop it first");
+                    continue;
+                }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -13081,6 +13114,47 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (save) {
+                    if (sel_slot >= 0) {
+                        // The slot owns this conversation: `copy_from_slot` brings it into the main session (its
+                        // checkpoints and every stage's K/V), the save below runs unchanged, and the slot is put back
+                        // as it was however the save ends (`PutBack`).
+                        if (bs[(size_t) sel_slot].ids.empty()) {
+                            refuse("slot " + std::to_string(sel_slot) + " holds no conversation to save");
+                            continue;
+                        }
+                        // A put-back runs in a destructor: it holds both values by reference and the copy lambda
+                        // by pointer, so nothing is captured into a type the compiler must synthesise.
+                        struct PutBack {
+                            const std::vector<int32_t>* ids;
+                            int slot;
+                            const decltype(copy_to_slot)* put;
+                            ~PutBack() {
+                                std::string e;
+                                if ((*put)(slot, *ids, e))
+                                    std::fprintf(stderr, "strata serve: session save: slot %d put back\n", slot);
+                                else
+                                    std::fprintf(stderr, "strata serve: session save: slot %d not put back (%s)\n",
+                                                 slot, e.c_str());
+                            }
+                        } put_back{&bs[(size_t) sel_slot].ids, (int) sel_slot, &copy_to_slot};
+                        checks.clear();   // the main session's chain described another conversation
+                        std::string e2;
+                        if (!copy_from_slot((int) sel_slot, nullptr, e2)) {
+                            // it may have half written the main session: the next request reads from the start
+                            live.clear();
+                            live_imgs.clear();
+                            checks.clear();
+                            live_ok = false;
+                            refuse(std::string("slot ") + std::to_string(sel_slot) + ": " + e2);
+                            continue;
+                        }
+                        live_imgs.clear();
+                        live_ok = true;
+                        check_clock += 1;
+                        std::fprintf(stderr, "strata serve: session save: slot %lld gave %zu tokens of its "
+                                             "conversation to the main session\n",
+                                     (long long) sel_slot, live.size());
+                    }
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
@@ -13241,6 +13315,25 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
+                    }
+                    if (sel_slot >= 0) {
+                        // The file was restored into the main session (validated against this engine); the slot that
+                        // will own it takes the same state a returning request takes, and keeps it as its cache.
+                        BSlot& bl = bs[(size_t) sel_slot];
+                        std::string e2;
+                        if (!copy_to_slot((int) sel_slot, live, e2)) {
+                            refuse(std::string("slot ") + std::to_string(sel_slot) + ": " + e2,
+                                   strata::core::SessionError::memory);
+                            continue;   // the main session holds it; the slot does not
+                        }
+                        bl.ids = live;
+                        bl.checks = checks;
+                        bl.cvec = cvec_cached;
+                        bl.img = !live_imgs.empty();
+                        bl.cached = o.prompt_cache > 0 && !bl.img && !bl.tainted;
+                        bl.partial = false;
+                        std::fprintf(stderr, "strata serve: session restore: slot %lld holds %zu tokens%s\n",
+                                     (long long) sel_slot, live.size(), bl.cached ? " as its cache" : "");
                     }
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),

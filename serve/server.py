@@ -2369,7 +2369,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, slot: str | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2384,7 +2384,9 @@ class StrataEngine:
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            # with --batch the last token names the slot whose conversation the file holds (engine: sel_slot)
+            sel = f" {slot}" if slot is not None and getattr(self, "batch", 0) else ""
+            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}{sel}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -4065,6 +4067,32 @@ class Service:
             cancel.set()
         return len(active)
 
+    @contextlib.contextmanager
+    def session_drain(self, timeout: float = 120.0):
+        """Quiesce the engine for a session file operation, then restore admission.
+
+        Under "parallel" / --batch the slots decode outside the FIFO and share the engine's control lines, so a
+        save or restore that ran beside an admission could persist or read a half-updated running state (#465).
+        Borrows the shutdown drain: new inference admission answers 503 while the flag is set, and the in-flight
+        calls (a slot's decode included) are waited for.  Unlike shutdown, the flag is put back afterwards.
+        side_effects: sets self.draining (restored in finally), refuses new inference admission with 503.
+        dependencies: begin_drain / wait_for_drain (the shutdown path's own primitives).
+        """
+        with self.admission_changed:
+            was_draining = self.draining
+        pending = self.begin_drain()
+        try:
+            left = self.wait_for_drain(timeout)
+            if left:
+                raise SessionRefused("memory", f"{left} inference call(s) did not finish within {timeout:g} s; "
+                                    "the session was not written")
+            yield
+        finally:
+            if not was_draining:
+                with self.admission_changed:
+                    self.draining = False
+                    self.admission_changed.notify_all()
+
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
@@ -4073,11 +4101,18 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
-        if getattr(self.engine, "batch", 0):
-            # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
-            # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
-            return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
-        if slot != "0":
+        # #465: parallel requests do not hold the FIFO and share the engine's control lines, so with --batch the
+        # session operation runs behind session_drain(): the engine is quiesced first instead of refusing (the
+        # slots decode outside the FIFO, so the FIFO alone would not protect it).
+        batch = int(getattr(self.engine, "batch", 0) or 0)
+        if batch:
+            # with --batch a session file names the slot whose conversation it holds (the engine moves it into the
+            # main session, saves, and puts it back); session_drain() below quiesces the other slots.
+            if slot is None or slot == "":
+                return error(400, f"this server runs {batch} parallel requests: name the slot 0..{batch - 1}")
+            if not slot.isdigit() or int(slot) >= batch:
+                return error(400, f"slot must be a whole number below {batch}")
+        elif slot != "0":
             return error(400, "this server has one slot: 0")
         if action not in ("save", "restore"):
             return error(400, "action must be save or restore")
@@ -4106,11 +4141,14 @@ class Service:
                                        else "restoring a session", started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
-                    if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
-                        from serve.session_save_retry import session_file
-                        r = session_file(self, action, path, SessionRefused)
-                    else:
-                        r = self.engine.session_file(action, path)
+                    # #465: quiesce first when the slots decode outside the FIFO, so the file holds one moment.
+                    drain = self.session_drain() if getattr(self.engine, "batch", 0) else contextlib.nullcontext()
+                    with drain:
+                        if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
+                            from serve.session_save_retry import session_file
+                            r = session_file(self, action, path, SessionRefused, slot if batch else None)
+                        else:
+                            r = self.engine.session_file(action, path, slot if batch else None)
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
