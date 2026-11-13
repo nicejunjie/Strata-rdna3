@@ -2570,6 +2570,9 @@ int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 void Prefill::set_part_stream_min(int64_t tokens) { g_stream_min_part = std::max<int64_t>(0, tokens); }
 int64_t Prefill::legacy_stream_min_tokens() { return legacy_stream_min(); }
 void Prefill::set_count_dump(std::FILE* f) { g_count_dump = f; }
+// [claude] planner rev 5 apply (review 13): the derived staged limit replaces the CPU share's (STRATA_PREFILL_CPU_SHARE_MAX) for the
+// rest of the load; a layout laid out for the old one is laid out again by the step-1b relayout (smin_mismatch).
+void Prefill::set_derived_stream_min(int64_t tokens) { if (tokens > 0 && cpu_share_on()) g_stream_min_share = tokens; }
 void Prefill::set_part_walk_max(int64_t tokens) { g_walk_max_part = std::max<int64_t>(0, tokens); }
 int64_t Prefill::walk_max_tokens() { return walk_max(); }
 int64_t Prefill::legacy_walk_max_tokens() { return legacy_walk_max(); }

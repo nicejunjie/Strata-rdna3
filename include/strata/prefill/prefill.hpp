@@ -101,6 +101,8 @@ public:
     static void set_part_stream_min(int64_t tokens);
     /// [claude] planner rev 5: a staged chunk's per-expert routed-token counts per layer go to f (developer flag --dump-prompt-counts)
     static void set_count_dump(std::FILE* f);
+    /// [claude] planner rev 5 apply: the load's derived staged limit (the CPU share's limit) from here on
+    static void set_derived_stream_min(int64_t tokens);
     static int64_t legacy_stream_min_tokens();   ///< the threshold without a part's plan (today's rule)
     static void set_part_walk_max(int64_t tokens);
     static int64_t walk_max_tokens();            ///< the routed walk's limit in force (the part's plan, else today's)

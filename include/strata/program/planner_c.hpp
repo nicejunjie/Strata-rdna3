@@ -42,6 +42,7 @@ struct Pack {
     uint64_t content_hash = 0;                             ///< FNV-1a of the pack file and the counts file (the cache key)
     double share = 0.6, guard = 1.6, conv = 0.003;
     TextTable text[3];
+    std::vector<std::vector<int32_t>> probe_tokens;      ///< the canned English start-read prompts (token ids), by variant
     std::vector<std::vector<int32_t>> counts;              ///< per chunk: layers * experts counts
     std::vector<int64_t> chunk_T;                          ///< per chunk: its chunk tokens
 };
@@ -153,6 +154,7 @@ inline bool converged_c0(const std::vector<double>& r, const Pack& p, double& ou
     return false;
 }
 
+inline Result derive_from_start(const Pack& p, const Facts& f, double start, int64_t configured);
 /// rule_c.derive: the frozen rule
 inline Result derive(const Pack& p, const Facts& f, const std::vector<double>& start_reads, int64_t configured) {
     Result res;
@@ -162,6 +164,14 @@ inline Result derive(const Pack& p, const Facts& f, const std::vector<double>& s
         res.why = "only " + std::to_string(res.reads_used) + " start reads (8 needed)";
         return res;
     }
+    Result r = derive_from_start(p, f, start, configured);
+    r.reads_used = res.reads_used;
+    return r;
+}
+/// the rule after the start read (review 13 fallback level 3 feeds it the pack's own reference: the builder's English median)
+inline Result derive_from_start(const Pack& p, const Facts& f, double start, int64_t configured) {
+    Result res;
+    res.acted = configured;
     res.start_ms = start;
     TextModel en(p, f, 0);
     const double r = start - en.copy_staged((double) (p.start - 7));
@@ -188,6 +198,25 @@ inline Result derive(const Pack& p, const Facts& f, const std::vector<double>& s
     res.derived = true;
     res.acted = std::max(configured, res.X);
     return res;
+}
+
+/// review 13: the staged limit the engine APPLIES (key present: configured >= 0; absent: -1)
+///  1  key present                -> max(configured, X)   (no X: configured)        - also the rollback
+///  2  key absent, X derived      -> X
+///  3  key absent, no X           -> the rule at the pack's own reference start read (the builder's English median), with a warning
+///  4  no valid pack              -> the engine default (a deploy test must make this unreachable)
+inline int64_t apply_limit(const Pack* p, const Facts& f, const Result* r, int64_t configured, int64_t engine_default, int& level, std::string& note) {
+    if (configured >= 0) { level = 1; note = r && r->derived ? "max(configured, X)" : "configured (no X: " + (r ? r->why : std::string("no rule")) + ")";
+                           return r && r->derived ? std::max(configured, r->X) : configured; }
+    if (r && r->derived) { level = 2; note = "X"; return r->X; }
+    if (p) {
+        std::vector<double> ms = p->text[0].builder_ms.count((int64_t) (p->start - 7)) ? p->text[0].builder_ms.at((int64_t) (p->start - 7)) : std::vector<double>();
+        if (!ms.empty()) {
+            const Result t = derive_from_start(*p, f, median(ms), -1);
+            if (t.derived) { level = 3; note = "WARNING: no X this load (" + (r ? r->why : std::string("no rule")) + "): the pack's reference value"; return t.X; }
+        }
+    }
+    level = 4; note = "WARNING: no valid pack: the engine default"; return engine_default;
 }
 
 /// FNV-1a 64 over a file's bytes (the cache key's build and pack identity); 0 when unreadable
@@ -217,6 +246,12 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
         if (k == "quant") p.quant = words.at(1);
         else if (k == "counts_file") p.counts_file = words.at(1);
         else if (k == "engine_pack") p.engine_pack = words.at(1);
+        else if (k == "probe_tokens") {   // probe_tokens <variant> id,id,...
+            const size_t v = (size_t) std::stoi(words.at(1));
+            if (p.probe_tokens.size() <= v) p.probe_tokens.resize(v + 1);
+            const std::string& ids = words.at(2); size_t a = 0;
+            while (a < ids.size()) { size_t b = ids.find(',', a); if (b == std::string::npos) b = ids.size(); p.probe_tokens[v].push_back((int32_t) std::stol(ids.substr(a, b - a))); a = b + 1; }
+        }
         else if (k == "n_chunks") p.n_chunks = std::stoi(words.at(1));
         else if (k == "win") p.win = std::stod(words.at(1));
         else if (k == "stream_compute") { p.sc_a = std::stod(words.at(1)); p.sc_b = std::stod(words.at(2)); }

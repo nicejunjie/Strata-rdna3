@@ -131,6 +131,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <algorithm>
 #include <memory>
 #include <iostream>
+#include <fcntl.h>   // [claude] planner rev 5 apply: open(/dev/null)
 #include <functional>
 #include <future>
 #include <thread>
@@ -233,6 +234,10 @@ struct PlannerShadow {
     std::vector<double> reads;
     std::string key, cache_path;
     int64_t configured = 0;
+    bool apply = false, self_probe = false;   // --planner: apply the limit; the engine issued its own start reads
+    int probe_requests = 0, saved_stdout = -1;
+    std::string ready_line;                   // READY waits until the start reads are done
+    std::function<void()> finalize;           // derive (if not yet), apply, restore stdout, print READY
 };
 PlannerShadow g_shadow;
 // [claude] planner step 2b (review 4 A2): the PLAN_* switches are honoured only by an engine the calibration tool started
@@ -642,6 +647,7 @@ struct Options {
     std::string dump_routing;
     std::string dump_prompt_counts;   // [claude] planner rev 5: --dump-prompt-counts PATH (developer)
     std::string planner_shadow;       // [claude] planner rev 5: --planner-shadow PACK.txt (developer; with --calibration-plans)
+    std::string planner;              // [claude] planner rev 5 apply: --planner PACK.txt (the engine reads its own start reads and APPLIES the limit)
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
@@ -1031,6 +1037,8 @@ void usage() {
                  "  --dump-prompt-counts PATH  (developer) append each staged prompt chunk's per-expert routed-token counts per layer\n"
                  "  --planner-shadow PACK.txt  (developer, needs --calibration-plans) derive option C's one-card staged limit and LOG it;\n"
                  "                    the plan is never changed\n"
+                 "  --planner PACK.txt  one card: read the pack's canned start prompts before READY (no trace in the caches) and APPLY\n"
+                 "                    the derived staged limit (key present: max(configured, X); absent: X; no X: the pack's value)\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -2622,6 +2630,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--dump-prompt-counts") o.dump_prompt_counts = next("--dump-prompt-counts");   // [claude] planner rev 5 (developer)
         else if (a == "--planner-shadow") o.planner_shadow = next("--planner-shadow");   // [claude] planner rev 5 (developer)
+        else if (a == "--planner") o.planner = next("--planner");   // [claude] planner rev 5 apply
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
@@ -9201,13 +9210,15 @@ int main(int argc, char** argv) {
                 // above), slots and bytes, the profile's ranking, and M1 (the link rate at the slot size, from the pinned arena, timed
                 // like rev4/mb/mb.hip: wall clock around the enqueue and the sync); the result of an earlier load with the same key is
                 // only LOGGED next to this load's own derivation (review 11 M1: never skip it).  Nothing here changes any plan.
-                if (!o.planner_shadow.empty() && o.calibration_plans && pf_parts.size() == 1 && srcp != nullptr && o.batch <= 0) {   // (review 11b: no --batch slots)
+                const std::string ppath = !o.planner.empty() ? o.planner : o.planner_shadow;
+                if (!ppath.empty() && (!o.planner.empty() || o.calibration_plans) && pf_parts.size() == 1 && srcp != nullptr && o.batch <= 0) {   // (review 11b: no --batch slots)
+                    g_shadow.apply = !o.planner.empty();
                     namespace PC = strata::program::planner_c;
                     std::string perr;
-                    const size_t sl = o.planner_shadow.find_last_of('/');
-                    const std::string pdir = sl == std::string::npos ? "." : o.planner_shadow.substr(0, sl);
+                    const size_t sl = ppath.find_last_of('/');
+                    const std::string pdir = sl == std::string::npos ? "." : ppath.substr(0, sl);
                     try {   // review 11: a malformed pack turns the shadow off, it never stops the engine
-                        g_shadow.on = PC::load_pack(o.planner_shadow, pdir, g_shadow.pack, perr) &&
+                        g_shadow.on = PC::load_pack(ppath, pdir, g_shadow.pack, perr) &&
                                       PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr) &&
                                       PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr);
                     } catch (const std::exception& ex) { g_shadow.on = false; perr = std::string("malformed pack: ") + ex.what(); }
@@ -9287,7 +9298,7 @@ int main(int argc, char** argv) {
                                       sdma ? sdma : "default", (long long) g_shadow.facts.slots, g_shadow.facts.cache_bytes, (long long) o.max_context,
                                       (long long) chunk);
                         g_shadow.key = kb;
-                        g_shadow.cache_path = o.planner_shadow + ".shadow-cache";
+                        g_shadow.cache_path = ppath + ".shadow-cache";
                         std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.4f GB/s; configured staged limit %lld; waiting for the canned start reads (PLAN_PROBE)\n",
                                      kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured);
                         if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "r")) {   // earlier loads with this key: LOGGED only
@@ -12049,6 +12060,7 @@ int main(int argc, char** argv) {
             st->cv.notify_one();
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
+            if (g_shadow.self_probe && g_shadow.probe_requests >= 8 && g_shadow.finalize) g_shadow.finalize();   // [claude] rev 5 apply
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
@@ -12251,7 +12263,53 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        // [claude] planner rev 5 apply (review 13): with --planner the engine reads the pack's canned start prompts BEFORE it says
+        // READY - injected into its own command queue (8 GEN lines: 64 tokens each, no checkpoint, the pack's forced limit, PLAN_PROBE),
+        // their output to /dev/null - then derives, applies, and only then prints READY.  The server sees one READY, later.
+        char ready_buf[64];
+        std::snprintf(ready_buf, sizeof ready_buf, "READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        if (g_shadow.on && g_shadow.apply && !g_shadow.pack.probe_tokens.empty()) {
+            g_shadow.ready_line = ready_buf;
+            g_shadow.self_probe = true;
+            std::fflush(stdout);
+            g_shadow.saved_stdout = dup(1);
+            const int dn = open("/dev/null", O_WRONLY);
+            if (dn >= 0) { dup2(dn, 1); close(dn); }
+            {
+                std::lock_guard<std::mutex> lk(in_mu);
+                for (int i = 0; i < 8; ++i) {
+                    const std::vector<int32_t>& ids = g_shadow.pack.probe_tokens[(size_t) i % g_shadow.pack.probe_tokens.size()];
+                    // 64 answer tokens, as the harness's start reads the rule was frozen on: their decode windows let the adaptive
+                    // expert tier settle between reads, and the prompt's last 7 tokens go to the windows (the part is 2041, not 2047)
+                    std::string ln = "GEN 64 ckpt=0 env=PLAN_STAGED_MAX:" + std::to_string(g_shadow.pack.start_limit) + ",PLAN_PROBE:1 ";
+                    for (size_t j = 0; j < ids.size(); ++j) { if (j) ln += ','; ln += std::to_string(ids[j]); }
+                    in_lines.push_front(ln);   // ahead of anything the server sent (it waits for READY first)
+                }
+                // push_front reversed them; the variants alternate either way
+            }
+            in_cv.notify_one();
+            g_shadow.finalize = [&o]() {
+                namespace PC = strata::program::planner_c;
+                if (!g_shadow.self_probe) return;
+                g_shadow.self_probe = false;
+                PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
+                const bool key = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
+                int level = 0; std::string note;
+                const int64_t lim = PC::apply_limit(&g_shadow.pack, g_shadow.facts, &r, key ? g_shadow.configured : -1, g_shadow.configured, level, note);
+                strata::prefill::Prefill::set_derived_stream_min(lim);
+                g_shadow.done = true;
+                std::fflush(stdout);
+                if (g_shadow.saved_stdout >= 0) { dup2(g_shadow.saved_stdout, 1); close(g_shadow.saved_stdout); g_shadow.saved_stdout = -1; }
+                std::fprintf(stderr, "strata planner: APPLIED staged limit %lld (level %d: %s) | X %lld configured %lld%s | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d/%d%s%s\n",
+                             (long long) lim, level, note.c_str(), (long long) r.X, (long long) g_shadow.configured, key ? "" : " (key absent)",
+                             (long long) r.crossing[0], (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms,
+                             (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() ? "" : " | ", r.why.c_str());
+                std::fputs(g_shadow.ready_line.c_str(), stdout);
+                std::fflush(stdout);
+            };
+        } else {
+            std::fputs(ready_buf, stdout);
+        }
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -13459,8 +13517,9 @@ int main(int argc, char** argv) {
                 // (every GEN/GENI starts from the start-up values)
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
-                apply_plan_switches(o.calibration_plans, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules)
+                apply_plan_switches(o.calibration_plans || g_shadow.self_probe, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules); rev 5 apply: the engine's own start reads may force the pack's limit
                 g_shadow.probe = g_shadow.on && !g_shadow.done && strata::core::reqsw::get_i64(strata::core::reqsw::PLAN_PROBE) > 0;   // [claude] rev 5 shadow
+                if (g_shadow.probe && g_shadow.self_probe) ++g_shadow.probe_requests;
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -15558,7 +15617,7 @@ int main(int argc, char** argv) {
                                 std::fprintf(stderr, "strata planner shadow: probe read NOT counted (%s)\n", not_why.c_str());
                             } else {
                                 g_shadow.reads.push_back(part_ms);
-                                if ((int) g_shadow.reads.size() >= 8) {   // review 12 C1: exactly 8 counted start reads, then the rule
+                                if ((int) g_shadow.reads.size() >= 8 && !g_shadow.self_probe) {   // review 12 C1: exactly 8 counted start reads, then the rule (--planner: finalize)
                                     const PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
                                     char out[640];
                                     std::snprintf(out, sizeof out, "bw %.6g | X %lld acted %lld configured %lld | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d%s%s | the plan is NOT changed (shadow)\n",
