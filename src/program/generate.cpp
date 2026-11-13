@@ -9201,7 +9201,7 @@ int main(int argc, char** argv) {
                 // above), slots and bytes, the profile's ranking, and M1 (the link rate at the slot size, from the pinned arena, timed
                 // like rev4/mb/mb.hip: wall clock around the enqueue and the sync); the result of an earlier load with the same key is
                 // only LOGGED next to this load's own derivation (review 11 M1: never skip it).  Nothing here changes any plan.
-                if (!o.planner_shadow.empty() && o.calibration_plans && pf_parts.size() == 1 && srcp != nullptr) {
+                if (!o.planner_shadow.empty() && o.calibration_plans && pf_parts.size() == 1 && srcp != nullptr && o.batch <= 0) {   // (review 11b: no --batch slots)
                     namespace PC = strata::program::planner_c;
                     std::string perr;
                     const size_t sl = o.planner_shadow.find_last_of('/');
@@ -9258,8 +9258,12 @@ int main(int argc, char** argv) {
                                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                                 if (pass > 0 && ms > 0) gbs.push_back((double) moved / (ms / 1e3));
                             }
+                            std::vector<double> passes = gbs;
                             std::sort(gbs.begin(), gbs.end());
                             f.bw = gbs.empty() ? 0.0 : gbs[gbs.size() / 2];
+                            if (passes.size() == 3)   // review 11b N3: every pass and the bytes moved
+                                std::fprintf(stderr, "strata planner shadow: M1 passes %.4f %.4f %.4f GB/s, %zu copies, %zu bytes (slot %zu)\n", passes[0] / 1e9,
+                                             passes[1] / 1e9, passes[2] / 1e9, srcs.size(), moved, bytes);
                         }
                         (void) cudaGetLastError();
                         if (scratch) cudaFree(scratch);

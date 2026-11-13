@@ -203,17 +203,17 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
         auto words = [&]() { std::vector<std::string> w; size_t i = 0; while (i < s.size()) { while (i < s.size() && isspace((unsigned char) s[i])) ++i;
                                  size_t j = i; while (j < s.size() && !isspace((unsigned char) s[j])) ++j; if (j > i) w.push_back(s.substr(i, j - i)); i = j; } return w; }();
         if (words.empty()) continue;
-        const std::string& k = words[0];
-        if (k == "quant") p.quant = words[1];
-        else if (k == "counts_file") p.counts_file = words[1];
-        else if (k == "engine_pack") p.engine_pack = words[1];
-        else if (k == "n_chunks") p.n_chunks = std::stoi(words[1]);
-        else if (k == "win") p.win = std::stod(words[1]);
-        else if (k == "stream_compute") { p.sc_a = std::stod(words[1]); p.sc_b = std::stod(words[2]); }
-        else if (k == "o_s") p.o_s = std::stod(words[1]);
+        const std::string& k = words.at(0);
+        if (k == "quant") p.quant = words.at(1);
+        else if (k == "counts_file") p.counts_file = words.at(1);
+        else if (k == "engine_pack") p.engine_pack = words.at(1);
+        else if (k == "n_chunks") p.n_chunks = std::stoi(words.at(1));
+        else if (k == "win") p.win = std::stod(words.at(1));
+        else if (k == "stream_compute") { p.sc_a = std::stod(words.at(1)); p.sc_b = std::stod(words.at(2)); }
+        else if (k == "o_s") p.o_s = std::stod(words.at(1));
         else if (k == "const") {
             for (size_t i = 1; i + 1 < words.size(); i += 2) {
-                const std::string& n = words[i]; const std::string& v = words[i + 1];
+                const std::string& n = words.at(i); const std::string& v = words.at(i + 1);
                 if (n == "layers") p.layers = std::stoi(v); else if (n == "experts") p.experts = std::stoi(v);
                 else if (n == "maxt") p.maxt = std::stoi(v); else if (n == "share") p.share = std::stod(v);
                 else if (n == "grid") p.grid = std::stoi(v); else if (n == "margin") p.margin = std::stoi(v);
@@ -223,13 +223,13 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
                 else if (n == "start_limit") p.start_limit = std::stoi(v);
             }
         } else if (k == "text") {
-            const int t = std::stoi(words[1]); const int64_t T = std::stoll(words[3]);
-            if (t < 0 || t > 2 || words.size() < 5 || words[2] != "T" || words[4] != "chunks") { err = "bad text line"; return false; }
+            const int t = std::stoi(words.at(1)); const int64_t T = std::stoll(words.at(3));
+            if (t < 0 || t > 2 || words.size() < 5 || words.at(2) != "T" || words.at(4) != "chunks") { err = "bad text line"; return false; }
             TextTable& tt = p.text[t];
             tt.lengths.push_back(T);
             size_t i = 5;   // "chunks" at 4
-            for (; i < words.size() && words[i] != "ms"; ++i) tt.chunks[T].push_back(std::stoi(words[i]));
-            for (++i; i < words.size(); ++i) tt.builder_ms[T].push_back(std::stod(words[i]));
+            for (; i < words.size() && words[i] != "ms"; ++i) tt.chunks[T].push_back(std::stoi(words.at(i)));
+            for (++i; i < words.size(); ++i) tt.builder_ms[T].push_back(std::stod(words.at(i)));
         }
     }
     for (auto& tt : p.text) std::sort(tt.lengths.begin(), tt.lengths.end());
