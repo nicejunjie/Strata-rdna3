@@ -9156,6 +9156,25 @@ int main(int argc, char** argv) {
                     p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
                     p.first_now = p.first;
                 }
+                // [claude] planner rev 5 (review 5 B1): the loan per path as a start-up fact, so the cost model reads it from the
+                // engine and not from any read's log - part_slots at a chunk grid, the chunk staged (threshold above it) and
+                // streamed (threshold 1024).  Developer engines only (--calibration-plans); no read, no allocation.
+                if (o.calibration_plans) {
+                    std::string st, sa;
+                    for (int64_t c = 1024; c <= chunk; c += (c < 16384 ? 512 : 4096)) {
+                        strata::prefill::Prefill::set_part_stream_min(c + 1);
+                        const int64_t ks = part_slots(pf_parts[0], c);
+                        strata::prefill::Prefill::set_part_stream_min(1024);
+                        const int64_t ka = part_slots(pf_parts[0], c);
+                        st += " " + std::to_string(c) + ":" + std::to_string(ks);
+                        sa += " " + std::to_string(c) + ":" + std::to_string(ka);
+                    }
+                    strata::prefill::Prefill::set_part_stream_min(0);   // back to today's rule
+                    std::fprintf(stderr, "strata plan: loan table staged (chunk:slots)%s\n", st.c_str());
+                    std::fprintf(stderr, "strata plan: loan table streamed (chunk:slots)%s\n", sa.c_str());
+                    std::fprintf(stderr, "strata plan: cache %lld slots, %llu bytes\n", (long long) pf_parts[0].cache->slots(),
+                                 (unsigned long long) pf_parts[0].cache->bytes());
+                }
                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
                 // every expert of its layers, so auto stopped short of its VRAM) keeps them as its own instead of
                 // borrowing cache slots: nothing of it is lent, streamed during the prompt or refilled after it.
@@ -15396,6 +15415,31 @@ int main(int argc, char** argv) {
                                      rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk,
                                      (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) strata::prefill::Prefill::walk_max_tokens(),
                                      g_plan_forced ? " forced" : "", part_ms);
+                        // [claude] planner rev 5 (review 5 C1, shadow): the part's routing counts from Prefill::route_hist on ANY
+                        // path - routed experts resident / not resident, and the non-resident ones with <= MAXT rows (what a staged
+                        // read's CPU share could take) - so the routing term is measured above the staged limit too.  Logged only.
+                        if (o.calibration_plans && seg_cur.cards <= 1) {
+                            static std::vector<int32_t> rh_prev;
+                            const std::vector<int32_t>& h = sp.route_hist();
+                            const size_t np = (size_t) (g.n_layers * g.n_expert);
+                            if (h.size() >= np && host_res.size() >= np) {
+                                if (rh_prev.size() != np) rh_prev.assign(np, 0);
+                                for (size_t i = 0; i < np; ++i)
+                                    if (h[i] < rh_prev[i]) { std::fill(rh_prev.begin(), rh_prev.end(), 0); break; }   // a new request
+                                long long rr = 0, rn = 0, n8 = 0, rows_n8 = 0, rows = 0;
+                                for (size_t i = 0; i < np; ++i) {
+                                    const int32_t d = h[i] - rh_prev[i];
+                                    if (d <= 0) continue;
+                                    rows += d;
+                                    if (host_res[i] >= 0) ++rr;
+                                    else { ++rn; if (d <= strata::kernels::cpu::MAXT) { ++n8; rows_n8 += d; } }
+                                }
+                                rh_prev.assign(h.begin(), h.begin() + (std::ptrdiff_t) np);
+                                std::fprintf(stderr, "strata plan: routing part %lld-%lld | routed resident %lld non-resident %lld "
+                                             "(<= %d rows: %lld experts, %lld rows) | rows %lld\n", (long long) at, (long long) to,
+                                             rr, rn, (int) strata::kernels::cpu::MAXT, n8, rows_n8, rows);
+                            }
+                        }
                     }
                     seg_cur_set = false;
                 }
