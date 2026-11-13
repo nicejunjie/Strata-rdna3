@@ -9,6 +9,7 @@
 //
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
+#include <cstdio>
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
@@ -98,6 +99,8 @@ public:
     /// The threshold a layout was laid out with is recorded (layout_stream_min) and run() refuses a part whose
     /// threshold differs from it (review 1 M1: the fused layouts keep MMQ buffers for stream_all_min - 1 rows only).
     static void set_part_stream_min(int64_t tokens);
+    /// [claude] planner rev 5: a staged chunk's per-expert routed-token counts per layer go to f (developer flag --dump-prompt-counts)
+    static void set_count_dump(std::FILE* f);
     static int64_t legacy_stream_min_tokens();   ///< the threshold without a part's plan (today's rule)
     static void set_part_walk_max(int64_t tokens);
     static int64_t walk_max_tokens();            ///< the routed walk's limit in force (the part's plan, else today's)

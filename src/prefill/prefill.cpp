@@ -201,7 +201,8 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the CPU share's default limit)
 int64_t g_stream_min_share = 0;
 int64_t g_stream_min_part = 0;   // [claude] planner step 1b: the part's plan (0: none, today's rule)
-int64_t g_walk_max_part = 0;     // [claude] planner step 1b: the routed walk's limit from the part's plan (0: none)
+int64_t g_walk_max_part = 0;
+std::FILE* g_count_dump = nullptr;   // [claude] planner rev 5: Prefill::set_count_dump     // [claude] planner step 1b: the routed walk's limit from the part's plan (0: none)
 inline int64_t legacy_stream_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
@@ -2568,6 +2569,7 @@ double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 void Prefill::set_part_stream_min(int64_t tokens) { g_stream_min_part = std::max<int64_t>(0, tokens); }
 int64_t Prefill::legacy_stream_min_tokens() { return legacy_stream_min(); }
+void Prefill::set_count_dump(std::FILE* f) { g_count_dump = f; }
 void Prefill::set_part_walk_max(int64_t tokens) { g_walk_max_part = std::max<int64_t>(0, tokens); }
 int64_t Prefill::walk_max_tokens() { return walk_max(); }
 int64_t Prefill::legacy_walk_max_tokens() { return legacy_walk_max(); }
@@ -4942,6 +4944,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
+                        // [claude] planner rev 5 (review 8): the pack routing-table builder's input - a staged chunk's per-expert
+                        // routed-token counts, from the host grouping it does anyway (no kernel, no sync).  Developer engines only
+                        // (--dump-prompt-counts PATH); record = int32 layer, int32 chunk tokens, int32 n_expert, n_expert int32 counts
+                        if (std::FILE* cf = g_count_dump) {
+                            const int32_t hdr[3] = {(int32_t) l, (int32_t) T, (int32_t) m.g->n_expert};
+                            std::fwrite(hdr, sizeof hdr, 1, cf);
+                            std::fwrite(m.cnt.data(), sizeof(int32_t), (size_t) m.g->n_expert, cf);
+                            std::fflush(cf);   // (a served engine is stopped with SIGTERM)
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
