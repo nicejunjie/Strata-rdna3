@@ -1,0 +1,29 @@
+[
+ {
+  "run": 1,
+  "nonce": "9e4390b6bd",
+  "prompt_tokens": 201715,
+  "cached": 0,
+  "wall_s": 89.32,
+  "prompt_tps": 2266.8,
+  "ttft_s": 88.99
+ },
+ {
+  "run": 2,
+  "nonce": "10dfbba756",
+  "prompt_tokens": 201714,
+  "cached": 0,
+  "wall_s": 89.9,
+  "prompt_tps": 2256.0,
+  "ttft_s": 89.41
+ },
+ {
+  "run": 3,
+  "nonce": "1bb32dcd0e",
+  "prompt_tokens": 201714,
+  "cached": 0,
+  "wall_s": 89.53,
+  "prompt_tps": 2263.7,
+  "ttft_s": 89.11
+ }
+]
