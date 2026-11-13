@@ -46,6 +46,7 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/program/planner_c.hpp"   // [claude] planner rev 5 shadow
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -224,6 +225,16 @@ const strata::program::segment_plan::Thresholds& legacy_thresholds() { return th
 // at every GEN/GENI after reqsw::apply_request: the request's forced plan values (none: today's), and the staged threshold
 // and walk limit the prompt kernels take for this request's parts (Prefill::set_part_stream_min / set_part_walk_max)
 bool g_plan_forced = false;   // the request running now forced a plan (for the plan log line)
+// [claude] planner rev 5 (review 10): option C in SHADOW - derived at start-up / from the canned start reads, logged, never applied
+struct PlannerShadow {
+    bool on = false, done = false, probe = false;
+    strata::program::planner_c::Pack pack;
+    strata::program::planner_c::Facts facts;
+    std::vector<double> reads;
+    std::string key, cache_path;
+    int64_t configured = 0;
+};
+PlannerShadow g_shadow;
 // [claude] planner step 2b (review 4 A2): the PLAN_* switches are honoured only by an engine the calibration tool started
 // with --calibration-plans (a CLI flag, never an environment variable), never under --batch slots (a slot read keeps the
 // last GEN's switches), and PLAN_STAGED_MAX never on a layer split (not audited there).  Forced values are clamped and
@@ -630,6 +641,7 @@ struct Options {
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
     std::string dump_prompt_counts;   // [claude] planner rev 5: --dump-prompt-counts PATH (developer)
+    std::string planner_shadow;       // [claude] planner rev 5: --planner-shadow PACK.txt (developer; with --calibration-plans)
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
@@ -1017,6 +1029,8 @@ void usage() {
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
                  "  --dump-prompt-counts PATH  (developer) append each staged prompt chunk's per-expert routed-token counts per layer\n"
+                 "  --planner-shadow PACK.txt  (developer, needs --calibration-plans) derive option C's one-card staged limit and LOG it;\n"
+                 "                    the plan is never changed\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -2607,6 +2621,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--dump-prompt-counts") o.dump_prompt_counts = next("--dump-prompt-counts");   // [claude] planner rev 5 (developer)
+        else if (a == "--planner-shadow") o.planner_shadow = next("--planner-shadow");   // [claude] planner rev 5 (developer)
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
@@ -9182,6 +9197,82 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata plan: cache %lld slots, %llu bytes\n", (long long) pf_parts[0].cache->slots(),
                                  (unsigned long long) pf_parts[0].cache->bytes());
                 }
+                // [claude] planner rev 5 (review 10) SHADOW: option C's start-up facts - the loan tables (the same grid as the print
+                // above), slots and bytes, the profile's ranking, and M1 (the link rate at the slot size, from the pinned arena into a
+                // scratch buffer); a cached result for the same key is logged at once.  Nothing here changes any plan.
+                if (!o.planner_shadow.empty() && o.calibration_plans && pf_parts.size() == 1 && srcp != nullptr) {
+                    namespace PC = strata::program::planner_c;
+                    std::string perr;
+                    const std::string pdir = o.planner_shadow.substr(0, o.planner_shadow.find_last_of('/') == std::string::npos ? 0 : o.planner_shadow.find_last_of('/'));
+                    g_shadow.on = PC::load_pack(o.planner_shadow, pdir.empty() ? "." : pdir, g_shadow.pack, perr) &&
+                                  PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr);
+                    if (!g_shadow.on) std::fprintf(stderr, "strata planner shadow: OFF (%s)\n", perr.c_str());
+                    if (g_shadow.on) {
+                        PC::Facts& f = g_shadow.facts;
+                        f.slots = pf_parts[0].cache->slots();
+                        f.cache_bytes = (double) pf_parts[0].cache->bytes();
+                        for (int64_t c = 1024; c <= chunk; c += (c < 16384 ? 512 : 4096)) {
+                            strata::prefill::Prefill::set_part_stream_min(c + 1);
+                            f.loan_staged[c] = (double) part_slots(pf_parts[0], c);
+                            strata::prefill::Prefill::set_part_stream_min(c);
+                            f.loan_streamed[c] = (double) part_slots(pf_parts[0], c);
+                        }
+                        strata::prefill::Prefill::set_part_stream_min(0);
+                        g_shadow.configured = strata::prefill::Prefill::legacy_stream_min_tokens();
+                        // M1: 384 copies of one slot's bytes (cache bytes / slots, the model's b) from pinned arena blobs into a
+                        // 32-slot scratch ring on its own stream; the median of 3 timed passes after one warm-up
+                        const size_t bytes = (size_t) (f.cache_bytes / (double) f.slots);
+                        std::vector<const uint8_t*> srcs;
+                        for (int64_t l = 0; l + 1 < g.n_layers && srcs.size() < 384; ++l)
+                            for (int64_t e = 0; e < g.n_expert && srcs.size() < 384; ++e)
+                                if (srcp->pinned(l, e)) if (const uint8_t* bp = srcp->blob_stable(l, e)) srcs.push_back(bp);
+                        void* scratch = nullptr;
+                        cudaStream_t ls = nullptr;
+                        if (srcs.size() == 384 && cudaMalloc(&scratch, 32 * bytes) == cudaSuccess &&
+                            cudaStreamCreateWithFlags(&ls, cudaStreamNonBlocking) == cudaSuccess) {
+                            cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+                            std::vector<double> gbs;
+                            for (int pass = 0; pass < 4; ++pass) {
+                                cudaEventRecord(e0, ls);
+                                for (size_t i = 0; i < srcs.size(); ++i)
+                                    cudaMemcpyAsync((uint8_t*) scratch + (i % 32) * bytes, srcs[i], bytes, cudaMemcpyHostToDevice, ls);
+                                cudaEventRecord(e1, ls); cudaEventSynchronize(e1);
+                                float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+                                if (pass > 0 && ms > 0) gbs.push_back((double) srcs.size() * (double) bytes / (ms / 1e3));
+                            }
+                            std::sort(gbs.begin(), gbs.end());
+                            f.bw = gbs.empty() ? 0.0 : gbs[gbs.size() / 2];
+                            cudaEventDestroy(e0); cudaEventDestroy(e1);
+                        }
+                        (void) cudaGetLastError();
+                        if (scratch) cudaFree(scratch);
+                        if (ls) cudaStreamDestroy(ls);
+                        if (f.bw <= 0) { g_shadow.on = false; std::fprintf(stderr, "strata planner shadow: OFF (the link probe could not run)\n"); }
+                    }
+                    if (g_shadow.on) {
+                        char hn[256] = ""; gethostname(hn, sizeof hn - 1);
+                        char kb[768];
+                        std::snprintf(kb, sizeof kb, "host=%s build=%s %s pack=%s slots=%lld bytes=%.0f context=%lld chunk=%lld", hn, __DATE__, __TIME__,
+                                      o.planner_shadow.c_str(), (long long) g_shadow.facts.slots, g_shadow.facts.cache_bytes, (long long) o.max_context, (long long) chunk);
+                        g_shadow.key = kb;
+                        g_shadow.cache_path = o.planner_shadow + ".shadow-cache";
+                        std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.3f GB/s; configured staged limit %lld; waiting for the canned start reads (PLAN_PROBE)\n",
+                                     kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured);
+                        if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "r")) {   // a result for the same key: logged now
+                            char line[2048];
+                            while (std::fgets(line, sizeof line, cf)) {
+                                std::string ln(line); const size_t bar = ln.find(" | ");
+                                double cbw = 0;
+                                if (bar != std::string::npos && ln.compare(0, bar, g_shadow.key) == 0 && std::sscanf(ln.c_str() + bar + 3, "bw %lf", &cbw) == 1 &&
+                                    cbw > 0 && std::fabs(g_shadow.facts.bw / cbw - 1) <= 0.10) {
+                                    g_shadow.done = true;
+                                    std::fprintf(stderr, "strata planner shadow: CACHED %s", ln.c_str() + bar + 3);
+                                }
+                            }
+                            std::fclose(cf);
+                        }
+                    }
+                }
                 // #340: a split stage whose card still has room for the chunk's buffers (its cache already holds
                 // every expert of its layers, so auto stopped short of its VRAM) keeps them as its own instead of
                 // borrowing cache slots: nothing of it is lent, streamed during the prompt or refilled after it.
@@ -13339,6 +13430,7 @@ int main(int argc, char** argv) {
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
                 apply_plan_switches(o.calibration_plans, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules)
+                g_shadow.probe = g_shadow.on && !g_shadow.done && strata::core::reqsw::get_i64(strata::core::reqsw::PLAN_PROBE) > 0;   // [claude] rev 5 shadow
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -15422,6 +15514,25 @@ int main(int argc, char** argv) {
                                      rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk,
                                      (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) strata::prefill::Prefill::walk_max_tokens(),
                                      g_plan_forced ? " forced" : "", part_ms);
+                        // [claude] planner rev 5 SHADOW: a canned start read (PLAN_PROBE) that ran staged at the pack's start length
+                        if (g_shadow.probe && rf.staged > 0 && rf.stream_all == 0 && std::llabs((long long) (to - at) - (long long) (g_shadow.pack.start - 7)) < 16) {
+                            namespace PC = strata::program::planner_c;
+                            g_shadow.reads.push_back(part_ms);
+                            double conv_ms = 0; int used = 0;
+                            const bool conv = PC::converged(g_shadow.reads, g_shadow.pack, conv_ms, used);
+                            if (conv || (int) g_shadow.reads.size() >= g_shadow.pack.max_reads) {
+                                const PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
+                                char out[512];
+                                std::snprintf(out, sizeof out, "bw %.6g | X %lld acted %lld configured %lld | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d%s%s | the plan is NOT changed (shadow)\n",
+                                              g_shadow.facts.bw, (long long) r.X, (long long) r.acted, (long long) g_shadow.configured, (long long) r.crossing[0],
+                                              (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms, r.reads_used,
+                                              r.why.empty() ? "" : " | ", r.why.c_str());
+                                std::fprintf(stderr, "strata planner shadow: %s", out);
+                                g_shadow.done = true;
+                                if (r.derived)
+                                    if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "a")) { std::fprintf(cf, "%s | %s", g_shadow.key.c_str(), out); std::fclose(cf); }
+                            }
+                        }
                     }
                     seg_cur_set = false;
                 }

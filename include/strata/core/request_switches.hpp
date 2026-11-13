@@ -33,6 +33,7 @@ enum Id : int {
     PLAN_TP_MAX,     ///< plan tp_max=<tokens>: the TP read's upper bound
     PLAN_DP_MIN,     ///< plan dp_min=<tokens>: the DP read's lower bound (the shape floor still applies)
     PLAN_TAIL_MAX,   ///< plan tail_max=<tokens>: STRATA_PREFILL_EQUAL's short-tail exception limit
+    PLAN_PROBE,      ///< [claude] planner rev 5 shadow: 1 = this request is option C's canned start-up read (logged, never acted on)
     kCount
 };
 
@@ -40,7 +41,8 @@ inline const char* name(Id id) {
     static const char* const n[kCount] = {"STRATA_REFILL_PACE", "STRATA_REFILL_RATE", "STRATA_REFILL_DEMAND",
                                           "STRATA_REFILL_DEFER", "STRATA_REFILL_JOIN",
                                           "STRATA_PLAN_STAGED_MAX", "STRATA_PLAN_WALK_MAX", "STRATA_PLAN_TP_MIN",
-                                          "STRATA_PLAN_TP_MAX", "STRATA_PLAN_DP_MIN", "STRATA_PLAN_TAIL_MAX"};
+                                          "STRATA_PLAN_TP_MAX", "STRATA_PLAN_DP_MIN", "STRATA_PLAN_TAIL_MAX",
+                                          "STRATA_PLAN_PROBE"};
     return n[id];
 }
 
@@ -55,7 +57,7 @@ inline double parse(Id id, const char* v) {
         case REFILL_DEMAND: return v != nullptr && std::atoi(v) != 0 ? 1.0 : 0.0;
         case REFILL_DEFER: return v ? (double) std::max(0, std::atoi(v)) : 0.0;
         case REFILL_JOIN: return v != nullptr && std::strcmp(v, "landed") == 0 ? 1.0 : 0.0;
-        case PLAN_STAGED_MAX: case PLAN_WALK_MAX: case PLAN_TP_MIN: case PLAN_TP_MAX: case PLAN_DP_MIN: case PLAN_TAIL_MAX:
+        case PLAN_STAGED_MAX: case PLAN_WALK_MAX: case PLAN_TP_MIN: case PLAN_TP_MAX: case PLAN_DP_MIN: case PLAN_TAIL_MAX: case PLAN_PROBE:
             return v != nullptr && *v ? (double) std::max<long long>(0, std::atoll(v)) : -1.0;
         default: return 0.0;
     }
