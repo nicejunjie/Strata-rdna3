@@ -4,7 +4,8 @@
 //                    the expert profile's ranking (the cache's initial residency: the first slots - lent pairs)
 //   the pack table : per text (english, code, chinese) and builder length T, each staged read's per-layer per-expert routed-token
 //                    counts (--dump-prompt-counts) and its part time; the decode windows' ms; the stream compute shape; o_s
-//   start reads    : the canned English 2048 staged read's part times, repeated (alternating prompts)
+//   start reads    : the canned English 2048 staged read's part times, exactly 8 (alternating prompts); the median of reads 4-8
+//                    (re-frozen, review 12 C1: localLLM planner branch 66c39be)
 // The arithmetic follows model_c.py operation for operation (double precision, the same order), so X matches bit for bit
 // (planner_c_test.cpp checks it against rule_c.py on every stored load).  Nothing here changes a plan.
 #pragma once
@@ -134,8 +135,17 @@ struct TextModel {
     }
 };
 
-/// rule_c.converged: the first read that agrees with the one before it within conv (at most max_reads)
-inline bool converged(const std::vector<double>& r, const Pack& p, double& out, int& used) {
+/// rule_c.start_read (RE-FROZEN, review 12 C1): the median of reads 4-8 of exactly 8 counted start reads; false with fewer than 8
+inline bool start_read(const std::vector<double>& r, double& out, int& used) {
+    used = (int) std::min<size_t>(r.size(), 8);
+    if (r.size() < 8) return false;
+    std::vector<double> v(r.begin() + 3, r.begin() + 8);
+    std::sort(v.begin(), v.end());
+    out = v[2];
+    return true;
+}
+/// the rule frozen at 67850ea (first of two successive reads within conv), kept for the record; not used by derive
+inline bool converged_c0(const std::vector<double>& r, const Pack& p, double& out, int& used) {
     const int n = (int) std::min<size_t>(r.size(), (size_t) p.max_reads);
     for (int i = 1; i < n; ++i)
         if (std::fabs(r[(size_t) i] / r[(size_t) i - 1] - 1) <= p.conv) { out = r[(size_t) i]; used = i + 1; return true; }
@@ -148,8 +158,8 @@ inline Result derive(const Pack& p, const Facts& f, const std::vector<double>& s
     Result res;
     res.acted = configured;
     double start = 0;
-    if (!converged(start_reads, p, start, res.reads_used)) {
-        res.why = "start read not converged in " + std::to_string(res.reads_used) + " reads";
+    if (!start_read(start_reads, start, res.reads_used)) {
+        res.why = "only " + std::to_string(res.reads_used) + " start reads (8 needed)";
         return res;
     }
     res.start_ms = start;

@@ -15558,9 +15558,7 @@ int main(int argc, char** argv) {
                                 std::fprintf(stderr, "strata planner shadow: probe read NOT counted (%s)\n", not_why.c_str());
                             } else {
                                 g_shadow.reads.push_back(part_ms);
-                                double conv_ms = 0; int used = 0;
-                                const bool conv = PC::converged(g_shadow.reads, g_shadow.pack, conv_ms, used);
-                                if (conv || (int) g_shadow.reads.size() >= g_shadow.pack.max_reads) {
+                                if ((int) g_shadow.reads.size() >= 8) {   // review 12 C1: exactly 8 counted start reads, then the rule
                                     const PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
                                     char out[640];
                                     std::snprintf(out, sizeof out, "bw %.6g | X %lld acted %lld configured %lld | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d%s%s | the plan is NOT changed (shadow)\n",
