@@ -214,7 +214,12 @@ inline bool force_pageable() {
 // of the whole process, results/stall-20261114).  They now start at a floor and grow, once, to the largest chunk a
 // read actually used (a high-water mark; no shrink).  Rollback is the previous release binary (no switch).
 constexpr int64_t kPfHostFloor = 16640;   // the production protocol's largest chunk layout (results/stall-20261114)
-inline int64_t pf_host_floor() { return kPfHostFloor; }
+// STRATA_TEST_PF_HOST_FLOOR=N (tests only, like STRATA_TEST_PAGEABLE above; not a user setting): the floor in rows, so a
+// test can force regrows at small sizes (N = 256) or run the old full size (N = 0) on the binary that ships.  Unset: kPfHostFloor.
+inline int64_t pf_host_floor() {
+    static const int64_t v = [] { const char* e = std::getenv("STRATA_TEST_PF_HOST_FLOOR"); return e != nullptr ? (int64_t) std::atoll(e) : kPfHostFloor; }();
+    return v;
+}
 inline int64_t pf_host_rows(int64_t want, int64_t max_rows) {   // a floor-sized or grown buffer's rows (4096-row steps)
     const int64_t f = pf_host_floor();
     if (f <= 0 || max_rows <= 0) return max_rows;
