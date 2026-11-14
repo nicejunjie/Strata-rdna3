@@ -208,35 +208,27 @@ inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
-// stall-20261114 stage B: the layer split's hand-off buffers (2 x chunk x D floats) and the pinned PLE row buffers
-// (2 x chunk x N floats per stage) were pinned for the largest chunk the path may ever read (1600 + 400 MiB each on
-// Q4 2-GPU), and every pinned page is GPU-mapped memory the kernel's reclaim / compaction can invalidate (a queue stop
-// of the whole process, results/stall-20261114).  They now start at a floor and grow, once, to the largest chunk a
-// read actually used (a high-water mark; no shrink).  Rollback is the previous release binary (no switch).
-constexpr int64_t kPfHostFloor = 16640;   // the production protocol's largest chunk layout (results/stall-20261114)
-// STRATA_TEST_PF_HOST_FLOOR=N (tests only, like STRATA_TEST_PAGEABLE above; not a user setting): the floor in rows, so a
-// test can force regrows at small sizes (N = 256) or run the old full size (N = 0) on the binary that ships.  Unset: kPfHostFloor.
-inline int64_t pf_host_floor() {
-    static const int64_t v = [] { const char* e = std::getenv("STRATA_TEST_PF_HOST_FLOOR"); return e != nullptr ? (int64_t) std::atoll(e) : kPfHostFloor; }();
-    return v;
+// stall-20261114 stage B: the layer split's hand-off buffers (2 x chunk x D floats: 1600 MiB each at a 40960-token chunk)
+// were pinned for the largest chunk, but with TP prefill on, a pipeline (hand-off) read is only what TP and DP do not take:
+// a segment under the TP minimum, or a DP pipe chunk.  Every pinned page is GPU-mapped memory the kernel's reclaim /
+// compaction can invalidate, stopping every GPU queue of the process (results/stall-20261114).  So the buffers start at
+// a floor derived from the routing - max(8192, the TP minimum rounded up to 256 rows), capped at the chunk; the full
+// chunk when TP prefill is off - and grow, once, if a read ever needs more (a picture prompt TP declines, a DP decline,
+// no DP link).  STRATA_TEST_PF_HOST_FLOOR=N (tests only, like STRATA_TEST_PAGEABLE above; not a user setting) overrides
+// the floor in rows: 0 = the full chunk, 256 = regrow stress.  Rollback is the previous release binary.
+inline int64_t handoff_floor_rows(int64_t chunk, const char** why) {
+    if (const char* e = std::getenv("STRATA_TEST_PF_HOST_FLOOR")) {
+        const int64_t v = std::atoll(e);
+        *why = "STRATA_TEST_PF_HOST_FLOOR";
+        return v <= 0 ? chunk : std::min(chunk, v);
+    }
+    if (!tp_prefill_on()) { *why = "TP prefill off: the full chunk"; return chunk; }
+    *why = "max(8192, the TP minimum rounded up to 256)";
+    return std::min(chunk, std::max<int64_t>(8192, (tp_min_tokens() + 255) / 256 * 256));
 }
-inline int64_t pf_host_rows(int64_t want, int64_t max_rows) {   // a floor-sized or grown buffer's rows (4096-row steps)
-    const int64_t f = pf_host_floor();
-    if (f <= 0 || max_rows <= 0) return max_rows;
-    const int64_t step = std::min<int64_t>(4096, f);   // a small test floor regrows in small steps too
-    return std::min(max_rows, std::max<int64_t>(f, (want + step - 1) / step * step));
-}
-// the row-count counter: one line each time a kind's high-water mark rises (rare: at most a few per process)
-inline void pf_host_note(const char* kind, int dev, int64_t rows, int64_t cap, int64_t max_rows, double grow_ms) {
-    static std::mutex mu;
-    static std::map<std::pair<std::string, int>, int64_t> hw;
-    std::lock_guard<std::mutex> g(mu);
-    int64_t& h = hw[{kind, dev}];
-    if (rows <= h && grow_ms < 0) return;   // every grow is logged (its cost), plus each new high-water mark
-    h = std::max(h, rows);
-    std::fprintf(stderr, "strata prefill: host rows high-water: %s on CUDA%d %lld rows (buffer %lld of at most %lld rows%s)\n",
-                 kind, dev, (long long) rows, (long long) cap, (long long) max_rows,
-                 grow_ms >= 0 ? (std::string(", grown in ") + std::to_string((int) grow_ms) + " ms").c_str() : "");
+inline int64_t handoff_grow_rows(int64_t want, int64_t max_rows) {   // a grown slot: 4096-row steps (256 below 4096)
+    const int64_t step = want < 4096 ? 256 : 4096;
+    return std::min(max_rows, std::max<int64_t>(want, (want + step - 1) / step * step));
 }
 // #1057: the Stager threads wait by sleeping (atomic wait, blocking-sync events) instead of a yield spin.  On Linux the
 // spinners starved a pinned host thread (DGX Spark IQ3_S 8K prompt 91 -> 1,222 tok/s with sleeping waits); on Windows
@@ -1177,7 +1169,6 @@ struct Prefill::Impl {
     float* ple_emb_host[2] = {};             // pinned, double-buffered: the next chunk's rows are read while this
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
-    int64_t ple_cap[2] = {};                 // stall-20261114 stage B: rows each pinned PLE buffer holds (grows on demand)
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -1688,14 +1679,19 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    if (next_ != nullptr) m.hand_max = std::max<int64_t>(m.hand_max, chunk);
-    for (int b = 0; next_ != nullptr && b < 2; ++b) {
-        const int64_t rows = pf_host_rows(0, chunk);
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            err = "prefill: the layer split's hand-off buffers";
-            return false;
+    if (next_ != nullptr && m.hand[0] == nullptr) {
+        const char* why = "";
+        const int64_t rows = handoff_floor_rows(chunk, &why);
+        m.hand_max = chunk;
+        for (int b = 0; b < 2; ++b) {
+            if (cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+                err = "prefill: the layer split's hand-off buffers";
+                return false;
+            }
+            m.hand_cap[b] = rows;
         }
-        if (m.hand_cap[b] == 0) m.hand_cap[b] = rows;
+        std::fprintf(stderr, "strata prefill: hand-off buffers 2 x %lld rows (%.0f MiB each) of a %lld-row chunk: %s\n",
+                     (long long) rows, rows * D * 4 / 1048576.0, (long long) chunk, why);
     }
     if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
@@ -1786,14 +1782,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
     }
     for (int b = 0; b < 2; ++b) {
-        const int64_t ple_rows0 = pf_host_rows(0, (int64_t) T);
         if (!m.ple_emb_host[b] &&
-            (force_pageable() || cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) ple_rows0 * N * 4, cudaHostAllocDefault) != cudaSuccess)) {
+            (force_pageable() || cudaHostAlloc((void**) &m.ple_emb_host[b], (size_t) T * N * 4, cudaHostAllocDefault) != cudaSuccess)) {
             cudaGetLastError();
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
-            m.ple_cap[b] = (int64_t) T;
-        } else if (m.ple_cap[b] == 0) m.ple_cap[b] = m.ple_pageable[b].empty() ? ple_rows0 : (int64_t) T;
+        }
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
@@ -3284,21 +3278,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             pv[0] = pv[1];
             pv[1] = tok;
         }
-        if (T > m.ple_cap[buf] && m.ple_pageable[buf].empty()) {   // stage B: grow this pinned buffer (its last upload is done first)
-            const auto tgrow = Clock::now();
-            const int64_t rows = pf_host_rows(T, std::max<int64_t>(T, m.T_max));
-            float* fresh = nullptr;
-            if (cudaEventSynchronize(m.ple_copied[buf]) != cudaSuccess ||
-                cudaHostAlloc((void**) &fresh, (size_t) rows * N * 4, cudaHostAllocDefault) != cudaSuccess) {
-                e = std::string("prefill: growing the PLE row buffer to ") + std::to_string(rows) + " rows: " +
-                    cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-            cudaFreeHost(m.ple_emb_host[buf]);
-            m.ple_emb_host[buf] = fresh;
-            m.ple_cap[buf] = rows;
-            pf_host_note("PLE rows", m.device, T, rows, m.T_max, ms_since(tgrow));
-        } else pf_host_note("PLE rows", m.device, T, m.ple_cap[buf], m.T_max, -1.0);
         const auto tg0 = Clock::now();
         const bool gok = PR.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
         if (static const bool dbg = std::getenv("STRATA_PLE_TIMING") != nullptr; dbg)   // [claude] debug: the gather's own time
@@ -6700,7 +6679,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // The current hand-off slot was used two chunks ago.
             if (T > m.hand_cap[hand_buf_]) {   // stage B: grow this slot (the successor finished with it two chunks ago)
                 const auto tgrow = Clock::now();
-                const int64_t rows = pf_host_rows(T, std::max<int64_t>(T, m.hand_max));
+                const int64_t rows = handoff_grow_rows(T, std::max<int64_t>(T, m.hand_max));
                 float* fresh = nullptr;
                 if (cudaStreamSynchronize(m.cs) != cudaSuccess ||
                     cudaHostAlloc((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
@@ -6711,8 +6690,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 cudaFreeHost(m.hand[hand_buf_]);
                 m.hand[hand_buf_] = fresh;
                 m.hand_cap[hand_buf_] = rows;
-                pf_host_note("hand-off rows", m.device, T, rows, m.hand_max, ms_since(tgrow));
-            } else pf_host_note("hand-off rows", m.device, T, m.hand_cap[hand_buf_], m.hand_max, -1.0);
+                std::fprintf(stderr, "strata prefill: hand-off buffer %d grown to %lld rows for a %lld-row chunk on CUDA%d, grown in %.0f ms\n",
+                             hand_buf_, (long long) rows, (long long) T, m.device, ms_since(tgrow));
+            }
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
             if (hp > 0) {
