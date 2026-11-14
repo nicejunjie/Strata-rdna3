@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/core/pin_budget.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/artifact/gguf_reader.hpp"   // [claude] TP prefill: block_geometry (native_rows)
@@ -1340,7 +1341,7 @@ void Prefill::release() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->hand[b]) core::host_free_guarded(impl_->hand[b]);
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
@@ -1684,7 +1685,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         const int64_t rows = handoff_floor_rows(chunk, &why);
         m.hand_max = chunk;
         for (int b = 0; b < 2; ++b) {
-            if (cudaHostAlloc((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+            if (core::host_alloc_guarded((void**) &m.hand[b], (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
                 err = "prefill: the layer split's hand-off buffers";
                 return false;
             }
@@ -6682,12 +6683,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const int64_t rows = handoff_grow_rows(T, std::max<int64_t>(T, m.hand_max));
                 float* fresh = nullptr;
                 if (cudaStreamSynchronize(m.cs) != cudaSuccess ||
-                    cudaHostAlloc((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+                    core::host_alloc_guarded((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
                     err = std::string("prefill: growing the hand-off buffer to ") + std::to_string(rows) + " rows: " +
                           cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                cudaFreeHost(m.hand[hand_buf_]);
+                core::host_free_guarded(m.hand[hand_buf_]);
                 m.hand[hand_buf_] = fresh;
                 m.hand_cap[hand_buf_] = rows;
                 std::fprintf(stderr, "strata prefill: hand-off buffer %d grown to %lld rows for a %lld-row chunk on CUDA%d, grown in %.0f ms\n",
