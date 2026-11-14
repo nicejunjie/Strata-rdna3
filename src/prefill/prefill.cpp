@@ -1183,6 +1183,7 @@ struct Prefill::Impl {
     int device = -1;
     float* hand[2] = {};
     int64_t hand_cap[2] = {};                // stall-20261114 stage B: rows each hand-off buffer holds (grows on demand)
+    std::vector<float> hand_pageable[2];     // a slot whose grow could not be pinned: pageable memory (copies stage through HIP)
     int64_t hand_max = 0;                    // the largest chunk (rows) the hand-off may ever carry (init's chunk)
     // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
     int hand_pieces = 0;
@@ -1341,7 +1342,7 @@ void Prefill::release() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) core::host_free_guarded(impl_->hand[b]);
+        if (impl_->hand[b] && impl_->hand_pageable[b].empty()) core::host_free_guarded(impl_->hand[b]);
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
@@ -6681,18 +6682,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (T > m.hand_cap[hand_buf_]) {   // stage B: grow this slot (the successor finished with it two chunks ago)
                 const auto tgrow = Clock::now();
                 const int64_t rows = handoff_grow_rows(T, std::max<int64_t>(T, m.hand_max));
-                float* fresh = nullptr;
-                if (cudaStreamSynchronize(m.cs) != cudaSuccess ||
-                    core::host_alloc_guarded((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-                    err = std::string("prefill: growing the hand-off buffer to ") + std::to_string(rows) + " rows: " +
-                          cudaGetErrorString(cudaGetLastError());
+                if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: the hand-off grow's stream sync: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                core::host_free_guarded(m.hand[hand_buf_]);
-                m.hand[hand_buf_] = fresh;
+                float* fresh = nullptr;
+                const bool pinned = m.hand_pageable[hand_buf_].empty() &&
+                                    core::host_alloc_guarded((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) == cudaSuccess;
+                if (pinned) {
+                    core::host_free_guarded(m.hand[hand_buf_]);
+                    m.hand[hand_buf_] = fresh;
+                } else {
+                    // the pin was refused (RAM or the pin budget): the slot goes pageable instead of failing the request -
+                    // the D2H / H2D copies of a pageable buffer stage through HIP (slower, the same bytes)
+                    (void) cudaGetLastError();
+                    try {
+                        if (m.hand_pageable[hand_buf_].empty()) core::host_free_guarded(m.hand[hand_buf_]);
+                        m.hand[hand_buf_] = nullptr;
+                        m.hand_pageable[hand_buf_].resize((size_t) rows * D);
+                        m.hand[hand_buf_] = m.hand_pageable[hand_buf_].data();
+                    } catch (const std::bad_alloc&) {
+                        err = "prefill: the hand-off buffer could not grow to " + std::to_string(rows) + " rows (no RAM)";
+                        return false;
+                    }
+                }
                 m.hand_cap[hand_buf_] = rows;
-                std::fprintf(stderr, "strata prefill: hand-off buffer %d grown to %lld rows for a %lld-row chunk on CUDA%d, grown in %.0f ms\n",
-                             hand_buf_, (long long) rows, (long long) T, m.device, ms_since(tgrow));
+                std::fprintf(stderr, "strata prefill: hand-off buffer %d grown to %lld rows%s for a %lld-row chunk on CUDA%d, grown in %.0f ms\n",
+                             hand_buf_, (long long) rows, pinned ? "" : " (pageable: the pin was refused)", (long long) T, m.device,
+                             ms_since(tgrow));
             }
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
