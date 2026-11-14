@@ -4464,6 +4464,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --pipeline-windows %d stays on for solo requests beside %d batch slots "
                                  "(STRATA_PW_WITH_BATCH=1); admissions and batch windows run without it\n",
                          o.pipeline_windows, o.batch);
+#if defined(STRATA_USE_HIP)
+            std::fprintf(stderr, "strata generate: HIP batch/solo opt-in reads prompts serially; solo GEN still pipelines\n");
+#endif
         } else if (!pw_auto && o.pipeline_windows >= 2 && split_devs.size() == 1) {
             // #2637: the default (above) takes two stages only with the draft layer on the first card (mtp_first); asked for by
             // hand it was taken without a word.  Recommend, never force: it stays on as asked, and the line says what it costs.
@@ -14186,7 +14189,18 @@ int main(int argc, char** argv) {
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
                 // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
-                if (pipe && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
+                // HIP's per-group MTP prefill waits even for sync=false; with
+                // stage-0 drafting its cross-card residual copy may also wait.
+                // Either can block this host thread while another prompt
+                // verifier needs its CPU doorbells serviced. Keep this opt-in
+                // combination's prompt reads serial; GEN still pipelines.
+#if defined(STRATA_USE_HIP)
+                const bool serial_batch_solo_prompt = pw_with_batch && o.batch > 0;
+#else
+                const bool serial_batch_solo_prompt = false;
+#endif
+                if (pipe && n_stages == 2 && pl_pw >= 1 && !serial_batch_solo_prompt &&
+                    std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
                 struct NoHeadSampling {

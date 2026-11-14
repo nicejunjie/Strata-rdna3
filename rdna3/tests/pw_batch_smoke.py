@@ -99,7 +99,7 @@ def run(url, model):
                 passed=all(v["valid"] for v in checks) and transition["valid"])
 
 
-def benchmark(url, model, repeats=3):
+def benchmark(url, model, repeats=3, allow_early_stop=False):
     """Same cold-prefix, fixed-output requests used for the attached short runs."""
     prompts = {
         "zh": "请编写一份完整、详细的本地大模型运维手册，必须逐项写满120个编号条目，每项包含一条具体操作和验证方法，依次涵盖模型文件校验、显存、KV缓存、并发、批处理、PCIe、内存、日志、容器、API、备份、监控与故障恢复。不要省略条目，不要提前总结。",
@@ -119,13 +119,17 @@ def benchmark(url, model, repeats=3):
                 with ThreadPoolExecutor(max_workers=n) as pool:
                     rows = list(pool.map(lane, range(n)))
                 wall = max(v["end"] for v in rows) - min(v["start"] for v in rows)
-                valid = all(v["usage"]["completion_tokens"] == 1024 and
+                valid = all((v["usage"]["completion_tokens"] == 1024 or
+                             (allow_early_stop and v['finish'] == 'stop' and v['usage']['completion_tokens'] > 0)) and
                             v["timings"].get("cache_n", v["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)) == 0
                             for v in rows)
                 bursts.append(dict(kind=kind, n=n, repeat=rep, rows=rows,
+                                   fixed_length=all(v['usage']['completion_tokens']==1024 for v in rows),
                                    aggregate_tps=sum(v["usage"]["completion_tokens"] for v in rows)/wall,
                                    wall_s=wall, valid=valid))
-    return dict(warmup=warmup, bursts=bursts, passed=all(v["valid"] for v in bursts))
+    return dict(warmup=warmup, bursts=bursts, max_output_tokens=1024,
+                length_policy='allow normal EOS; count actual tokens' if allow_early_stop else 'require 1024 tokens',
+                passed=all(v["valid"] for v in bursts))
 
 
 if __name__ == "__main__":
@@ -135,12 +139,13 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--benchmark", action="store_true", help="Also send 3 rounds of 1/2-client throughput requests")
     parser.add_argument("--repeats", type=int, default=3, help="Benchmark rounds (default: 3)")
+    parser.add_argument("--allow-early-stop", action="store_true", help="Keep normal early-EOS outputs; throughput uses their actual token count")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
     result = run(args.url, args.model)
     if args.benchmark:
-        result["benchmark"] = benchmark(args.url, args.model, repeats=args.repeats)
+        result["benchmark"] = benchmark(args.url, args.model, repeats=args.repeats, allow_early_stop=args.allow_early_stop)
         result["passed"] = result["passed"] and result["benchmark"]["passed"]
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({"passed": result["passed"],

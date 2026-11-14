@@ -1,154 +1,156 @@
-# Solo window pipelines in a two-slot RDNA3 service
+# Solo pipelines in a two-slot RDNA3 service
 
-**Draft: a watchdog exit was observed with this opt-in enabled.** After the
-throughput and long-context requests passed, a short JSON request stalled and the
-engine exited with code -6. This branch is for investigation; it is not ready for
-production use or merge. The original gate remains the default.
+A two-slot layer-split service normally disables window pipelining, including
+when only one request is active. `STRATA_PW_WITH_BATCH=1` lets a lone request
+use the solo pipeline, while admissions and active batches keep their existing
+serial slot path. The switch is off by default. This is a backport of the opt-in
+and slot-drafter device binding from
+[Niko1221/Strata#3095](https://github.com/Niko1221/Strata/pull/3095), with an
+additional HIP prompt-read safety guard.
 
-The fork's own unmodified server also stalled on the candidate's first short echo
-after a fresh load; it reported engine exit -15. Its stock control passed. The
-problem is therefore not limited to the separately maintained serving tree.
+The first version was withdrawn after reproduced hangs. The repair below passed
+the recorded HIP checks. CUDA/SYCL builds and execution are still unverified;
+the PR stays draft for those checks. These results concern this machine and a
+batch-enabled **layer split**, not the repository author's TP preset.
 
-At `f557b5440fe345757cae69ede2ed34826da5e612`, enabling two request slots turns
-`--pipeline-windows` off even when only one request is running. This patch lets
-an explicitly opted-in service keep the solo GEN pipeline while retaining batch
-admission. Requests admitted to a batch do not use the solo pipeline verifiers.
+## What hung and what changed
 
-The opt-in and slot-drafter placement are backported from
-[Niko1221/Strata#3095](https://github.com/Niko1221/Strata/pull/3095).
-This adaptation also excludes admissions and active batches after the diagnostic
-pipeline overrides have been applied. The flag is off by default.
+The pipeline calls `MtpDrafter::prefill(..., sync=false)` while its host thread
+also services verifier CPU doorbells. HIP's default per-group implementation
+ignored `sync=false` and waited on the drafter stream. An in-flight verifier
+could be waiting for that same host thread, leaving both unable to progress.
+GDB caught the main thread in `hipStreamSynchronize` inside `MtpDrafter::prefill`.
+It also reproduced with batch disabled, so this was not unique to slot admission.
 
-## Enable and roll back
+A trial that honored `sync=false` still hung in `hipMemcpyAsync` while copying
+the final stage's residual rows back to the stage-0 drafter. Replacing this with
+a direct device-kernel read was invalid on this machine's cross-device memory
+and was discarded. Neither core change is included in this branch.
 
-Build this branch with your normal HIP build and keep an existing working model
-configuration. In the Python server configuration, use `parallel: 2` and
-`max_active_requests: 2`. Keep these engine arguments:
+The final change keeps **prompt reads serial on HIP when this batch/solo opt-in
+is enabled**, using the already existing prompt loop. No other prompt verifier
+is then waiting for the host when MTP synchronizes or transfers its residuals.
+Solo **GEN still pipelines**, which is where the measured throughput benefit
+comes from. The core MTP implementation and HIP's per-group policy are unchanged.
+The checks explicitly keep `STRATA_MTP_PREFILL_SYNC=1`.
+
+The backport places each slot drafter's context, RoPE and embedding on the solo
+drafter's device. It also excludes batch admissions and active batches from
+solo verifiers after diagnostic overrides. GPU kernels, quantization, sampling
+math and MTP acceptance rules are not changed. This is a guard for the opt-in
+combination, not a general repair of the existing non-batch prompt pipeline.
+
+## Enable and disable
+
+Build the branch using the normal HIP build. In an existing, working server
+configuration, set `parallel: 2`, `max_active_requests: 2` and retain:
 
 ```text
 --pipeline-windows 2 --batch-groups 1 --spec 4
 --mtp /path/to/mtp --mtp-draft-vocab /path/to/rdna3/draft_vocab_zh60k.bin
 ```
 
-Add `STRATA_PW_WITH_BATCH=1` to the configuration's `env` object. On gfx1100, this
-test also explicitly sets `STRATA_MTP_STAGE0=1` and `STRATA_BATCH_MTP=1`.
-The server adds `--batch 2` from `parallel`; direct engine users supply it themselves.
-Use a layer split across two physical GPUs. Tensor-parallel decode disables the
-window pipeline, so this is **not** an addition to the `--tensor-parallel 2` preset.
+Add these tested environment settings to its `env` object:
 
-Remove `STRATA_PW_WITH_BATCH` or set it to `0`, then restart the isolated server to
-restore the original batch gate. No weights, quantization, kernels, sampling math,
-MTP acceptance rules, or default presets are changed by this patch.
+```json
+{
+  "STRATA_PW_WITH_BATCH": "1",
+  "STRATA_MTP_STAGE0": "1",
+  "STRATA_BATCH_MTP": "1"
+}
+```
 
-## Validation on two RX 7900 XTX cards
+The server supplies `--batch 2` from `parallel`; direct engine users supply it
+themselves. Use two physical GPUs with a layer split. Tensor-parallel decode
+disables the window pipeline. This does not add MTP to pipelined batch groups;
+groups greater than one and coupled/repetition-penalty fallbacks retain their
+existing restrictions.
+
+Remove `STRATA_PW_WITH_BATCH` or set it to `0` and restart to restore the original
+batch gate. Both the opt-in and its HIP prompt guard are then inactive.
+
+## Same-machine measurements after repair
 
 | Mode | Chinese 1 client | Python 1 client | Chinese 2 clients total | Python 2 clients total |
 |---|---:|---:|---:|---:|
-| Unmodified base | 76.49 | 99.12 | 84.30 | 94.02 |
-| Patched, flag off | 75.86 | 97.57 | 86.25 | 94.86 |
-| Patched, flag on | 107.32 | 156.12 | 85.12 | 95.26 |
+| Patched, flag off | 77.06 | 98.63 | 85.39 | 95.05 |
+| Patched, flag on | 110.48 | 159.58 | 85.37 | 95.21 |
+| Flag on, fresh process (one round) | 107.11 | 158.97 | 84.13 | 95.68 |
 
-All values are tokens/s; medians of three requests or bursts.
+Values are completion tokens divided by full request/burst wall time, including
+prefill. Off/on use three rounds; fresh-process on uses one confirmation round.
+They are not the sum of separately reported instantaneous decode rates. The
+single-client gains do not imply improved two-client throughput.
 
-Hardware: 2x Sapphire 7900 XTX 24GB (Platinum + BLOWER), 303/231W caps,
-96 GiB installed RAM, Intel ES 14-core/20-thread AVX2 CPU, Ubuntu 26.04,
-ROCm 10.1, HIP gfx1100 Release. Upstream links are PCIe 4.0 x16 and an
-external CPU M.2 PCIe 3.0 x4 link. Layer split 26/22, 1536 MiB VRAM reserve,
-int8 KV with 32768 resident tokens, prefill 16384, two 131072-token slots,
-slot MTP enabled, batch groups 1, hardware queues 6, REFILL_SDMA disabled.
+Environment: Ubuntu 26.04, Intel ES 14 cores/20 threads with AVX2, 96 GiB RAM,
+two Sapphire RX 7900 XTX 24GB (Platinum and BLOWER), 303/231W caps, ROCm 10.1,
+HIP/gfx1100 Release with MMQ and K-quants. Upstream links: PCIe 4.0 x16 and an
+external CPU M.2 PCIe 3.0 x4 link. Layer split 26/22, int8 KV with 32768 resident
+tokens, two 131072-token slots, prefill 16384, 1536 MiB reserve, batch groups 1,
+hardware queues 6 and REFILL_SDMA 0. All arms use the fork's unchanged Python
+server, the same GSQ-RCO IQ3_S weights and a fresh copy of the same expert profile.
 
-Checks: all short length/cache and long retrieval checks passed; candidate-on later stalled on the short JSON check. This is not ready for review.
+Chinese prose and Python code allow up to 1024 output tokens, temperature 0, top-k 1,
+seed 42, reasoning off, zero presence/frequency penalties and no prefix cache.
+Normal early EOS is retained and its actual token count is used; individual
+output lengths are in the record. The exact short prompts and all runs are in the smoke script and
+[repair validation record](tests/results/pw-with-batch-fixed-gfx1100-20261114.json).
+Fixed ordering and one three-round trial per primary arm limit small-difference
+claims. The profile adapts during performance runs; placement is frozen only for
+the separate output comparison.
 
-Native fork server smoke: stock passed; candidate-on stalled on its first echo and failed the CLI. See the native-fork record.
+## Checks and reproduction
 
+The native-server validation completed 280 requests across off, on,
+fresh-process on and frozen-placement comparison arms. It checks repeated exact
+echo/JSON, nonzero penalties, an admission after the first request emits,
+overlapping generation and return to solo. Each of the first three arms also
+reads actual tokenizer-measured 8192/32768/122880-token retrieval prompts, followed
+immediately by repeated short echo/JSON requests. The long requests are solo;
+two simultaneous 120K requests were not measured.
 
-The three-arm measurements used one shared, separately maintained Python serving
-tree for all engines; its server hash is in the record. They isolate the engine
-change but are not an untouched, end-to-end fork installation. A separate smoke
-run uses the fork's own unmodified `serve/server.py` and the published CLI script;
-those outcomes are recorded separately.
+Frozen-placement checks compare serial, pipeline, repeated serial and forced-miss
+pipeline output for echo, JSON, arithmetic, code and prose. See the record for
+the individual hashes and outcomes. This is a small correctness check, not a
+full quality evaluation or proof of every possible interleaving. A separate
+frozen-placement comparison checks ten stock/off output pairs.
 
-These are same-machine results for a batch-enabled **layer-split** service,
-not a comparison against the repository author's best TP configuration. Aggregate
-throughput is total completion tokens divided by elapsed wall time, including
-prefill; it is not the sum of independently reported instantaneous decode rates.
-The individual runs, timing fields, failures, checks and sanitized configuration are in
-[the validation record](tests/results/pw-with-batch-gfx1100-20261114.json).
-
-The short requests ask for 1024 output tokens with greedy sampling, seed 42,
-reasoning off, zero presence/frequency penalties and prefix/session caches disabled.
-Chinese operations prose and Python code each have three rounds with one and two
-simultaneous clients. A warm-up precedes each arm. The order is stock, patched with
-the flag off, patched with the flag on. Fixed ordering and a single server start
-per arm limit claims about small differences.
-
-Long retrieval requests use actual tokenizer-measured prompts of 8,192, 32,768
-and 122,880 tokens, each once per arm, with a 256-token output limit. Configured
-capacity is 131,072 tokens per slot; the long requests are solo, so this does not
-establish two simultaneous 120K-request performance.
-
-## Reproduce the checks
-
-Start an isolated server on a spare local port, with no unrelated clients. Stop it
-before loading the next arm on the same GPUs. Keep the same initial expert-profile
-file for all arms. Compare the unmodified base, this branch with the flag off, and
-this branch with the flag on. All other settings must stay identical.
+To repeat the standalone smoke and throughput checks, start an isolated server
+with no other clients, then run:
 
 ```sh
 python3 rdna3/tests/pw_batch_smoke.py \
   --url http://127.0.0.1:8101 \
   --model Qwen3.8-Flash-Next-IQ3_S \
-  --benchmark --output candidate-on.json
+  --benchmark --repeats 3 --allow-early-stop --output fixed-on.json
 ```
 
-The functional checks request an exact echo and a JSON object, exercise nonzero
-presence/frequency penalties, and admit a second request only after the first has
-started emitting tokens. They check overlap, distinct request markers and a fresh
-solo request after both finish. The optional benchmark uses the same short prompts
-as the validation record. This is a smoke test, not a model-quality score or proof
-that every possible interleaving is safe. Its normal order does not replay the
-full long-context failure sequence below.
+Restart with the flag off for the control, restoring the same initial expert
+profile each time. The command covers short requests and slot transitions;
+the attached record's full long-prompt sequence additionally sends the three
+retrieval prompts and repeats the smoke checks afterward.
 
-## Observed failure
+## Limits and retained failures
 
-The first run used three rounds of short single/dual-client requests, then 8K,
-32K and 122,880-token retrieval prompts, then a short exact echo and this JSON
-request, with the same greedy/cache settings as above:
+The [initial validation record](tests/results/pw-with-batch-gfx1100-20261114.json)
+retains the withdrawn candidate's watchdog failures and earlier measurements.
+Those are not passes for the repaired revision. The new record identifies both
+source hashes, binary hash, server hash, settings, output hashes and health
+counters. Daily service and GPU settings were restored after the checks.
 
-```text
-Output only this JSON object, without Markdown: {"ok":true,"count":3}
-```
+An earlier throughput trial of the same repaired executable ended one Chinese
+answer normally at 669 tokens. The strict-length harness stopped the trial, so
+its later long checks did not run. All twelve bursts from that trial are retained
+separately in the repair record. The current run allows normal EOS and uses
+actual completion lengths without changing the model's stopping rules.
 
-The echo completed. The JSON request stopped making progress. After 60 seconds
-the watchdog reported `verify window (pipelined): the CPU experts of layer 22`,
-then exited with code -6. All 27 CPU-expert jobs were done and all eight workers
-were sleeping; the host was at step 23, the GPU had rung 24, and served/plan/copy
-flags were all 23. About 28 GiB RAM was available. The sanitized failure excerpt
-is in the record.
+Only HIP/gfx1100 on ROCm 10.1 was built and exercised. CUDA/SYCL, other GPUs,
+TP mode, groups greater than one, full model-quality testing, forced-pageable
+diagnostics and allocation-failure injection were not run. Extra verifiers use
+VRAM and can reduce expert-cache capacity. This machine has an asymmetric
+external link with correctable AER events; the record includes their count.
+Measure your own workload before enabling the opt-in.
 
-The two off controls completed the full sequence. The cause of the on-path stalls
-is **unconfirmed**; these observations do not separate the new combination, existing
-pipeline/routing behavior and the machine's link errors. A
-normal smoke pass does not clear this failure. It needs investigation before the
-flag should be recommended.
-
-## Limits and remaining checks
-
-- This does not add MTP to pipelined batch groups. `--batch-groups 1` exercises
-  the slot-drafter device placement; the fork's existing restrictions on groups
-  greater than one remain.
-- Repetition-penalty/coupled-sampling paths retain their existing serial fallback.
-- Exact default-path output parity is not established. The small off-control
-  functional outputs match, but only 1/18 fixed-length outputs matched across
-  the stock/off arms. The unmodified stock also produced three distinct texts
-  for each of its three repeated solo prompts. Adaptive expert placement was
-  retained; a frozen-placement parity test is still needed. No full quality
-  evaluation or quality improvement is claimed.
-- Extra pipeline verifiers consume VRAM and can reduce expert-cache capacity;
-  measure a representative workload before enabling the flag.
-- Only HIP/gfx1100 is built and exercised here. CUDA and SYCL compilers are absent
-  on the test machine. Their builds and hardware execution remain unverified;
-  targeted validation is needed before this is ready for review.
-- The machine has an asymmetric external PCIe link with a history of correctable
-  AER events. The validation record includes counter changes. Results are local
-  observations, not predictions for symmetric x8/x8 machines or other GPUs.
+Both controls and candidate reuse the same local ggml/rocWMMA source archives.
+Their Git metadata is unavailable; the record includes file probes and hashes,
+with commits explicitly unknown. This is not a clean-room installer reproduction.
