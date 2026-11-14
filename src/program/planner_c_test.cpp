@@ -1,8 +1,10 @@
 // [claude] planner rev 5 shadow: planner_c.hpp against rule_c.py (localLLM 67850ea) on every stored load - X, acted, the three
 // per-text crossings and the guard ratio must match.  CPU only.
-//   g++ -O2 -std=c++20 -Iinclude src/program/planner_c_test.cpp -o planner_c_test && ./planner_c_test PACKDIR COUNTSDIR PROFILE [VECTORS]
+//   g++ -O2 -std=c++20 -Iinclude src/program/planner_c_test.cpp -o planner_c_test && ./planner_c_test PACKDIR COUNTSDIR PROFILE [VECTORS [READS]]
 //   (the shipped table, from the repository root: ./planner_c_test data/planner data/planner data/expert-profile.bin
-//    - VECTORS defaults to src/program/planner_c_test_vectors.txt, the rev 5 export's 279 stored loads; review 15 S6)
+//    - VECTORS defaults to src/program/planner_c_test_vectors.txt, the rev 5 export's 279 stored loads; review 15 S6
+//    - READS defaults to src/program/planner_c_test_reads.txt: review 16's engine read series (Fable's harness reads.txt, every engine
+//      log under results/planner-20261112/next/ with 8 counted reads up to 11-14 01:57), for the bracket's checks)
 #include "strata/program/planner_c.hpp"
 #include <cstdio>
 #include <sstream>
@@ -32,6 +34,8 @@ int main(int argc, char** argv) {
     const std::map<std::string, int64_t> table_X = {{"iq3", 4609}, {"iq4", 6145}, {"q4", 8705}};
     std::map<std::string, std::pair<Facts, std::vector<double>>> sample;
     std::map<std::string, std::string> sample_tag;   // per quant: one real 8-read load whose X is the table X
+    struct Vec { std::string tag, q; Facts f; std::vector<double> reads; int64_t X; };
+    std::vector<Vec> allvec;                          // review 16: every stored vector, for the bracket's checks
     std::ifstream vf(argc > 4 ? std::string(argv[4]) : std::string("src/program/planner_c_test_vectors.txt")); std::string l1, l2, l3, l4, l5;
     int n = 0, bad = 0;
     while (std::getline(vf, l1) && std::getline(vf, l2) && std::getline(vf, l3) && std::getline(vf, l4) && std::getline(vf, l5)) {
@@ -42,6 +46,7 @@ int main(int argc, char** argv) {
         std::vector<double> reads; { std::istringstream x(l4); std::string w; x >> w; double v; while (x >> v) reads.push_back(v); }
         int64_t eX, eA, ec[3]; double er; { std::istringstream x(l5); std::string w; x >> w >> eX >> eA >> ec[0] >> ec[1] >> ec[2] >> er; }
         f.rank = rank;
+        allvec.push_back({tag, q, f, reads, eX});
         const Result r = derive(packs.at(q), f, reads, configured.at(q));
         const Result rc = derive(packs.at(q), f, reads, rule_c_configured.at(q));   // rule_c's own acted (its stale constant)
         const int64_t want_acted = r.derived ? std::max(configured.at(q), r.X) : configured.at(q);
@@ -284,6 +289,223 @@ int main(int argc, char** argv) {
         Result none; none.why = "no probes"; std::string w; const bool su = stable_X(packs.at("iq4"), sample.count("iq4") ? sample["iq4"].first : Facts(), none, 6145, w);
         ++na; abad += su; std::printf("stable   %-44s %s %s\n", "no X: not cached", !su ? "OK  " : "DIFF", w.c_str());
     }
+    // ---- review 16 D8/D9 (option e): the bracket, on Fable's harness cases (results/planner-20261112/next/buildC/fable16: fix.cpp, fix.out,
+    // reads.txt).  The same selection and facts as fix.cpp: the engine loads with 8 counted reads and an X (apply1-* left out: the
+    // superseded first build), each on its quant's builder-vector facts with the load's own slots, bytes and M1; plus the stored vectors
+    // with 8 reads at production slots.  Every number checked here is fix.out's.
+    int nb = 0, bbad = 0;
+    auto bchk = [&](const std::string& what, bool ok, const std::string& detail) {
+        ++nb; bbad += !ok;
+        std::printf("bracket  %-52s %s %s\n", what.c_str(), ok ? "OK  " : "DIFF", detail.c_str());
+    };
+    {
+        std::map<std::string, Facts> base;
+        for (const Vec& v : allvec) if (v.tag == "builder-" + v.q) base[v.q] = v.f;
+        struct Load { std::string tag, q, build; int64_t slots = 0; double bytes = 0, m1 = 0; int64_t X = -1; int spec = 4; std::vector<double> r; bool vec = false; };
+        std::vector<Load> L;
+        {
+            std::ifstream in(argc > 5 ? std::string(argv[5]) : std::string("src/program/planner_c_test_reads.txt")); std::string ln;
+            int nlines = 0;
+            while (std::getline(in, ln)) {
+                if (ln.empty() || ln[0] == '#') continue;
+                ++nlines;
+                std::istringstream a(ln); Load l; int64_t conf; double st; std::string spec;
+                a >> l.tag >> l.q >> l.slots >> l.bytes >> l.m1 >> l.X >> conf >> st >> spec >> l.build;
+                l.spec = spec == "?" ? 4 : std::stoi(spec);
+                double v; while (a >> v) l.r.push_back(v);
+                if (l.r.size() != 8 || l.X <= 0) continue;
+                if (l.build == "build-hip-apply" && l.tag.rfind("apply1-", 0) == 0) continue;   // fix.cpp: the first apply build's single loads
+                L.push_back(l);
+            }
+            bchk("the read series file", nlines == 131 && L.size() == 127, std::to_string(nlines) + " lines, " + std::to_string(L.size()) + " engine loads (want 131, 127)");
+        }
+        for (const Vec& v : allvec)
+            if (base.count(v.q) && v.reads.size() == 8 && v.f.slots == base[v.q].slots && v.tag.find("outlier") == std::string::npos && v.tag.find("7reads") == std::string::npos) {
+                Load l; l.tag = "vec:" + v.tag; l.q = v.q; l.slots = v.f.slots; l.bytes = v.f.cache_bytes; l.m1 = v.f.bw / 1e9; l.X = v.X; l.r = v.reads; l.vec = true; L.push_back(l);
+            }
+        auto facts_of = [&](const Load& l) { Facts f = base.at(l.q); f.slots = l.slots; f.cache_bytes = l.bytes; f.bw = l.m1 * 1e9; return f; };
+        // fix.out's totals, per group: n, today's median X = table X (S0), bracket X = table X (S2), X_med != X_lo, cached by B (stable_X), cached now
+        struct Tot { int n = 0, par = 0, s0 = 0, s2 = 0, open = 0, cacheB = 0, cacheNew = 0; };
+        std::map<std::string, Tot> T;
+        int parity = 0, nengine = 0, clean = 0, clean_same = 0;
+        for (const Load& l : L) {
+            const Pack& p = packs.at(l.q); const Facts f = facts_of(l); const int64_t tx = table_X.at(l.q);
+            const Result r = derive(p, f, l.r, -1);
+            const Bracket b = bracket(p, f, l.r, r);
+            std::string why; const bool st = stable_X(p, f, r, -1, why);
+            const bool cache_new = st && b.closed();   // the engine's write condition (generate.cpp: closed, then stable_X)
+            const bool prod = !l.vec && l.spec != 2 && l.slots == base.at(l.q).slots;
+            const std::string grp = std::string(l.vec ? "vector:" : "engine:") + l.q + (l.spec == 2 ? ":spec2" : "") + (l.slots != base.at(l.q).slots ? ":otherslots" : "");
+            Tot& t = T[grp];
+            ++t.n; t.par += r.X == l.X; t.s0 += r.X == tx; t.s2 += b.X == tx; t.open += b.X_med != b.X_lo; t.cacheB += st; t.cacheNew += cache_new;
+            if (!l.vec) { ++nengine; parity += r.derived && r.X == l.X; }
+            // clean: X_med is the table X (the 124 engine loads at production slots with MTP, and the 60 vectors): nothing changes
+            if ((prod || l.vec) && r.X == tx) { ++clean; clean_same += b.on && b.X == r.X && cache_new == st; }
+            if (!b.on || b.X != tx || !b.closed() || !st)
+                std::printf("bracket  %-44s %s med %.1f lo2 %.1f | X_med %lld X_lo %lld X_ref %lld -> X %lld %s | B %s | now %s\n", l.tag.c_str(), l.q.c_str(), r.start_ms, b.s_lo,
+                            (long long) b.X_med, (long long) b.X_lo, (long long) b.X_ref, (long long) b.X, b.closed() ? "closed" : "OPEN",
+                            st ? "cached" : ("not cached: " + why).c_str(), cache_new ? "cached" : ("not cached: " + (b.closed() ? "unstable: " + why : b.open_why())).c_str());
+            // the named cases of review 16
+            if (l.tag == "pilot/keyabsent/runs/q4-03-absent") {
+                bchk("q4-03: X_med 8449 X_lo 8705 X_ref 8705 -> 8705, open", b.on && b.X_med == 8449 && b.X_lo == 8705 && b.X_ref == 8705 && b.X == 8705 && !b.closed(),
+                     "X " + std::to_string(b.X) + " " + b.open_why());
+                bchk("q4-03: not cached", !cache_new, b.open_why());
+                int lvl = 0; std::string note;
+                int64_t lim = apply_limit(&p, f, &r, -1, 3072, lvl, note, &b);
+                bchk("q4-03 key absent: level 2, 8705", lim == 8705 && lvl == 2, std::to_string(lim) + " level " + std::to_string(lvl));
+                lim = apply_limit(&p, f, &r, -1, 3072, lvl, note);
+                bchk("q4-03 key absent, no bracket (build B): 8449", lim == 8449 && lvl == 2, std::to_string(lim) + " level " + std::to_string(lvl));
+                lim = apply_limit(&p, f, &r, 8705, 3072, lvl, note, &b);
+                bchk("q4-03 key 8705: max(configured, X) 8705", lim == 8705 && lvl == 1, std::to_string(lim) + " level " + std::to_string(lvl));
+                lim = apply_limit(&p, f, &r, 6145, 3072, lvl, note, &b);
+                bchk("q4-03 key 6145: max(configured, X) 8705", lim == 8705 && lvl == 1, std::to_string(lim) + " level " + std::to_string(lvl));
+                lim = apply_limit(&p, f, &r, 8961, 3072, lvl, note, &b);
+                bchk("q4-03 key 8961: max(configured, X) 8961", lim == 8961 && lvl == 1, std::to_string(lim) + " level " + std::to_string(lvl));
+            }
+            if (l.tag == "pilot/item5/dec/min-cand-4")
+                bchk("min-cand-4 (--spec 2): 5889 / 6145 / 6145 -> 6145, open", b.X_med == 5889 && b.X_lo == 6145 && b.X_ref == 6145 && b.X == 6145 && !cache_new, "X " + std::to_string(b.X));
+            if (l.tag == "pilot/item5/dec/min-cand-1")
+                bchk("min-cand-1 (--spec 2): 5889 / 5889 / 6145 -> 5889, open", b.X_med == 5889 && b.X_lo == 5889 && b.X_ref == 6145 && b.X == 5889 && !cache_new, "X " + std::to_string(b.X));
+        }
+        bchk("the logged X = X_med (derive) on every engine load", parity == 127 && nengine == 127, std::to_string(parity) + " of " + std::to_string(nengine) + " (want 127 of 127)");
+        bchk("clean loads: the limit and the cache decision unchanged", clean == 184 && clean_same == 184, std::to_string(clean_same) + " of " + std::to_string(clean) + " (want 184 of 184)");
+        // fix.out's totals table (S0 / S2 / bracket open / cache B / cache new)
+        const std::map<std::string, std::vector<int>> want = {
+            {"engine:iq3", {34, 34, 34, 34, 0, 30, 30}}, {"engine:iq4", {57, 57, 57, 57, 0, 57, 57}}, {"engine:iq4:spec2:otherslots", {2, 2, 0, 1, 1, 0, 0}},
+            {"engine:q4", {34, 34, 33, 34, 1, 33, 33}}, {"vector:iq3", {20, 20, 20, 20, 0, 20, 20}}, {"vector:iq4", {20, 20, 20, 20, 0, 20, 20}},
+            {"vector:q4", {20, 20, 20, 20, 0, 18, 18}}};
+        for (const auto& [g, w] : want) {
+            const Tot t = T.count(g) ? T.at(g) : Tot();
+            const std::vector<int> got = {t.n, t.par, t.s0, t.s2, t.open, t.cacheB, t.cacheNew};
+            char d[200]; std::snprintf(d, sizeof d, "n %d parity %d | S0 %d S2 %d | open %d | cache B %d new %d", t.n, t.par, t.s0, t.s2, t.open, t.cacheB, t.cacheNew);
+            bchk("totals " + g, got == w, d);
+        }
+        bchk("no other group", T.size() == want.size(), std::to_string(T.size()) + " groups");
+        // contamination (fix.cpp sections 2 and 3): every clean engine load, every subset of k of its 5 settled reads slowed (or made faster)
+        // by D ms.  X_med and X_lo through a per-load memo of derive_from_start (the starts are reads or reads +- D); the combination is the
+        // engine's bracket_combine; bracket() itself is checked on the k = 3 subset {4,5,6} of every load against the memo + combination.
+        const char* want_lines[] = {
+            "D    20 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 49|0|0 of 340  k=4 83|5|5 of 170  k=5 34|5|5 of 34",
+            "D    20 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 9|0|0 of 570  k=4 18|0|0 of 285  k=5 9|0|0 of 57",
+            "D    20 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 0|0|0 of 330  k=3 0|0|0 of 330  k=4 0|0|0 of 165  k=5 0|0|0 of 33",
+            "D    40 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 340|0|0 of 340  k=4 170|170|170 of 170  k=5 34|34|34 of 34",
+            "D    40 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 396|0|0 of 570  k=4 285|169|169 of 285  k=5 57|57|57 of 57",
+            "D    40 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 11|0|0 of 330  k=3 109|5|5 of 330  k=4 101|36|36 of 165  k=5 27|15|15 of 33",
+            "D    80 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 340|0|0 of 340  k=4 170|170|170 of 170  k=5 34|34|34 of 34",
+            "D    80 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 570|0|0 of 570  k=4 285|285|285 of 285  k=5 57|57|57 of 57",
+            "D    80 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 24|0|0 of 330  k=3 330|16|16 of 330  k=4 165|165|165 of 165  k=5 33|33|33 of 33",
+            "D   150 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 340|0|0 of 340  k=4 170|170|170 of 170  k=5 34|34|34 of 34",
+            "D   150 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 570|0|0 of 570  k=4 285|285|285 of 285  k=5 57|57|57 of 57",
+            "D   150 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 24|0|0 of 330  k=3 330|16|16 of 330  k=4 165|165|165 of 165  k=5 33|33|33 of 33",
+            "fast D    10 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 0|0|0 of 340  k=4 0|0|0 of 170  k=5 0|0|0 of 34",
+            "fast D    10 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 0|0|0 of 570  k=4 0|0|0 of 285  k=5 0|0|0 of 57",
+            "fast D    10 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 0|0|0 of 330  k=3 0|0|0 of 330  k=4 0|0|0 of 165  k=5 0|0|0 of 33",
+            "fast D    20 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 0|0|0 of 340  k=4 0|0|0 of 170  k=5 0|0|0 of 34",
+            "fast D    20 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 0|0|0 of 570  k=4 0|0|0 of 285  k=5 0|0|0 of 57",
+            "fast D    20 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 0|10|0 of 330  k=3 2|26|2 of 330  k=4 4|22|4 of 165  k=5 2|6|2 of 33",
+            "fast D    30 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 0|0|0 of 340  k=4 0|0|0 of 170  k=5 0|0|0 of 34",
+            "fast D    30 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 0|0|0 of 570  k=4 0|0|0 of 285  k=5 0|0|0 of 57",
+            "fast D    30 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 0|94|0 of 330  k=3 36|210|36 of 330  k=4 63|147|63 of 165  k=5 27|31|27 of 33"};
+        size_t wi = 0; int full_ok = 0, full_n = 0;
+        for (int fast = 0; fast < 2; ++fast)
+            for (double D : fast ? std::vector<double>{10, 20, 30} : std::vector<double>{20, 40, 80, 150})
+                for (const char* q : {"iq3", "iq4", "q4"}) {
+                    int n = 0, f0[6] = {}, f1[6] = {}, f2[6] = {}, tot[6] = {};
+                    const Pack& p = packs.at(q); const int64_t tx = table_X.at(q);
+                    for (const Load& l : L) {
+                        if (l.vec || l.q != q || l.spec == 2 || l.slots != base.at(q).slots) continue;
+                        const Facts f = facts_of(l);
+                        std::map<double, int64_t> memo;
+                        auto X_at = [&](double s) { auto it = memo.find(s); if (it != memo.end()) return it->second;
+                                                    const Result r = derive_from_start(p, f, s, -1); return memo[s] = r.derived ? r.X : -1; };
+                        double sm = 0; int u = 0; start_read(l.r, sm, u);
+                        if (X_at(sm) != tx) continue;
+                        ++n; int64_t Xr = -1; ref_X(p, f, Xr);
+                        for (int m = 1; m < 32; ++m) {
+                            std::vector<double> r = l.r; int k = 0;
+                            for (int i = 0; i < 5; ++i) if (m >> i & 1) { r[(size_t) 3 + i] += fast ? -D : D; ++k; }
+                            double s_med = 0, s_lo = 0; start_read(r, s_med, u); start_read_lo(r, s_lo);
+                            Bracket b; b.X_med = X_at(s_med); b.X_lo = X_at(s_lo); b.X_ref = Xr;
+                            if (b.X_med < 0) { ++tot[k]; ++f0[k]; ++f2[k]; f1[k] += b.X_lo != tx; continue; }   // (no X from the median: never here)
+                            bracket_combine(b);
+                            ++tot[k]; f0[k] += b.X_med != tx; f1[k] += b.X_lo != tx; f2[k] += b.X != tx;
+                            if (m == 7) {   // bracket() itself, end to end, on this subset
+                                const Result rr = derive(p, f, r, -1); const Bracket bb = bracket(p, f, r, rr);
+                                ++full_n; full_ok += bb.on && bb.X == b.X && bb.X_med == b.X_med && bb.X_lo == b.X_lo && bb.X_ref == b.X_ref && bb.closed() == b.closed();
+                            }
+                        }
+                    }
+                    char ln[400]; int o = std::snprintf(ln, sizeof ln, "%sD %5.0f ms %s (%d clean loads):", fast ? "fast " : "", D, q, n);
+                    for (int k = 1; k <= 5; ++k) o += std::snprintf(ln + o, sizeof ln - (size_t) o, "  k=%d %d|%d|%d of %d", k, f0[k], f1[k], f2[k], tot[k]);
+                    const bool ok = wi < sizeof want_lines / sizeof *want_lines && std::string(ln) == want_lines[wi]; ++wi;
+                    ++nb; bbad += !ok;
+                    std::printf("contam   %s %s\n", ok ? "OK  " : "DIFF", ln);
+                    if (!ok && wi <= sizeof want_lines / sizeof *want_lines) std::printf("contam   want %s\n", want_lines[wi - 1]);
+                }
+        bchk("bracket() = memo + bracket_combine on the k=3 subsets", full_n > 0 && full_ok == full_n, std::to_string(full_ok) + " of " + std::to_string(full_n));
+    }
+    // the edge cases (review 16 section 4) on iq4's / iq3's sample facts
+    if (sample.count("iq4") && sample.count("iq3")) {
+        const Pack& p = packs.at("iq4"); const Facts& f = sample["iq4"].first; const std::vector<double>& reads = sample["iq4"].second;
+        int lvl = 0; std::string note; int64_t lim;
+        {   // no X from the median (7 reads): not bracketed, today's paths (level 1 configured, level 3 the reference)
+            const Result r7 = derive(p, f, std::vector<double>(reads.begin(), reads.begin() + 7), 6145);
+            const Bracket b = bracket(p, f, std::vector<double>(reads.begin(), reads.begin() + 7), r7);
+            bchk("edge: 7 reads -> not bracketed", !b.on && !b.closed(), b.open_why());
+            lim = apply_limit(&p, f, &r7, 6145, 3072, lvl, note, &b); bchk("edge: 7 reads, key: configured (level 1)", lim == 6145 && lvl == 1, std::to_string(lim) + " " + note);
+            lim = apply_limit(&p, f, &r7, -1, 3072, lvl, note, &b);   bchk("edge: 7 reads, no key: the reference (level 3)", lim == 6145 && lvl == 3, std::to_string(lim) + " " + note);
+            Result rg = derive_from_start(packs.at("iq3"), sample["iq3"].first, 1500.0, -1);   // below IQ3's regime guard: no X
+            std::vector<double> rr(8, 1500.0);
+            const Bracket bg = bracket(packs.at("iq3"), sample["iq3"].first, rr, rg);
+            bchk("edge: regime guard (no X from the median) -> not bracketed", !rg.derived && !bg.on, rg.why);
+        }
+        {   // no X_ref: X = X_med, not cached.  (A pack without the reference read cannot derive at all - TextModel reads the same builder
+            // median - so on a real load X_ref is missing only when the rule gives no X at the reference: the combination is checked alone)
+            const Result r = derive(p, f, reads, -1);
+            Bracket b; b.X_med = r.X; b.X_lo = r.X; b.X_ref = -1; bracket_combine(b);
+            bchk("edge: no X_ref -> X = X_med, open", b.on && b.X == r.X && !b.closed() && !b.note.empty(), "X " + std::to_string(b.X) + " (" + b.note + ") " + b.open_why());
+            b.X_lo = r.X + 256; bracket_combine(b);
+            bchk("edge: no X_ref, X_lo above -> X = X_med", b.X == r.X && !b.closed(), "X " + std::to_string(b.X));
+            lim = apply_limit(&p, f, &r, -1, 3072, lvl, note, &b);   bchk("edge: no X_ref, no key: X_med (level 2)", lim == r.X && lvl == 2, std::to_string(lim));
+            Facts nobw = f; nobw.bw = 0; int64_t xr = -1;
+            bchk("edge: no link rate -> no X_ref", !ref_X(p, nobw, xr) && xr == -1, "");
+        }
+        {   // no X from the 2nd-smallest (IQ3, two settled reads below the regime guard): X = X_med, not cached
+            const Pack& p3 = packs.at("iq3"); const Facts& f3 = sample["iq3"].first; std::vector<double> r3 = sample["iq3"].second;
+            r3[3] = 1500.0; r3[4] = 1500.0;
+            const Result r = derive(p3, f3, r3, -1);
+            const Bracket b = bracket(p3, f3, r3, r);
+            bchk("edge: no X_lo (2 reads below IQ3's guard) -> X = X_med, open", r.derived && b.on && b.X_lo == -1 && b.X == r.X && !b.closed(),
+                 "X_med " + std::to_string(b.X_med) + " X " + std::to_string(b.X) + " (" + b.note + ")");
+        }
+        {   // the combination: X_ref inside, below and above the range; an inverted pair (X_lo < X_med) takes min/max
+            auto comb = [&](int64_t m, int64_t lo, int64_t ref, int64_t want, const char* what) {
+                Bracket b; b.X_med = m; b.X_lo = lo; b.X_ref = ref; bracket_combine(b);
+                bchk(std::string("combine: ") + what, b.X == want, std::to_string(m) + " " + std::to_string(lo) + " ref " + std::to_string(ref) + " -> " + std::to_string(b.X));
+            };
+            comb(8449, 8705, 8705, 8705, "ref at the top of the range");
+            comb(8449, 8961, 8705, 8705, "ref inside the range");
+            comb(8449, 8705, 9217, 8705, "ref above the range: X_lo");
+            comb(8449, 8705, 8193, 8449, "ref below the range: X_med");
+            comb(6145, 6145, 5889, 6145, "closed pair, ref lower: X_med");
+            comb(4865, 4609, 4097, 4609, "inverted pair (X_lo < X_med): min/max");
+            comb(4865, 4609, 5121, 4865, "inverted pair, ref above: max");
+            Bracket c; c.X_med = c.X_lo = c.X_ref = 6145; bracket_combine(c);
+            bchk("combine: all three equal -> closed", c.closed() && c.open_why().empty(), "");
+        }
+        {   // a cache hit (no bracket: off) applies the stored X; bracket off falls back to r.X
+            Result hit; hit.derived = true; hit.X = 6145;
+            const Bracket off;
+            lim = apply_limit(&p, f, &hit, -1, 3072, lvl, note, &off); bchk("cache hit, bracket off: the stored X (level 2)", lim == 6145 && lvl == 2, std::to_string(lim));
+            lim = apply_limit(&p, f, &hit, -1, 3072, lvl, note);       bchk("cache hit, no bracket: the stored X (level 2)", lim == 6145 && lvl == 2, std::to_string(lim));
+        }
+        {   // vmstat_read (S9)
+            long long a = -1, b = -1; const bool ok = vmstat_read(a, b);
+            bchk("vmstat_read: pswpin and pgmajfault", ok && a >= 0 && b >= 0, std::to_string(a) + " " + std::to_string(b));
+        }
+    } else bchk("edge cases: the iq3/iq4 samples", false, "missing");
+    std::printf("%d bracket vectors, %d differ\n", nb, bbad);
+    abad += bbad; na += nb;
     std::printf("%d apply/validate/cache vectors, %d differ\n", na, abad);
     return bad || abad ? 1 : 0;
 }

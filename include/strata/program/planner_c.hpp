@@ -202,22 +202,90 @@ inline Result derive_from_start(const Pack& p, const Facts& f, double start, int
     return res;
 }
 
+/// the pack's reference start read: the builder's English median at start - 7 (level 3's input; review 16 X_ref's input)
+inline bool ref_start(const Pack& p, double& s) {
+    const auto it = p.text[0].builder_ms.find((int64_t) (p.start - 7));
+    if (it == p.text[0].builder_ms.end() || it->second.empty()) return false;
+    s = median(it->second);
+    return true;
+}
+/// the rule at the pack's reference start on this load's facts (level 3's value); false without the facts, a reference or an X
+inline bool ref_X(const Pack& p, const Facts& f, int64_t& X) {
+    double s = 0;
+    if (!(f.bw > 0) || f.slots <= 0 || !ref_start(p, s)) return false;   // review 14 F2: needs the start-up facts (no M1 -> no reference)
+    const Result t = derive_from_start(p, f, s, -1);
+    if (!t.derived) return false;
+    X = t.X;
+    return true;
+}
+// ---- review 16 D8/D9 (option e): bracket the limit between two statistics of the same 8 reads ----
+//   s_med = the median of reads 4-8 (derive's statistic, unchanged)      X_med = rule(s_med)  (= derive's X)
+//   s_lo  = the 2nd smallest of reads 4-8                                 X_lo  = rule(s_lo)
+//   X_ref = the rule at the pack's reference start on this load's facts (level 3's value)
+//   X     = X_ref limited to [min(X_med, X_lo), max(X_med, X_lo)]  (min/max: the IQ3 regime-guard edge cannot invert the range)
+// A slow read (swap-in, page fault) can only slow a read, so the fastest reads are the undisturbed ones; the 2nd smallest ignores one
+// freak fast read.  The limit moves down only when even the 2nd-fastest settled read says so, up only when the median says so; when
+// the two disagree the load's reads straddle a step and the reference decides.  X stays between X_med and X_lo, so a wrong reference
+// gives at worst today's X_med.  Edge cases: no X from the median -> not bracketed (today's paths); no X_ref -> X = X_med; no X from
+// the 2nd smallest (below IQ3's guard) -> X = X_med.  The cache takes X only when the bracket is CLOSED (X_med = X_lo = X_ref) and
+// stable_X holds.  derive, rule_c.py and the stored vectors are unchanged: the bracket sits in apply_limit and the cache condition.
+struct Bracket {
+    bool on = false;                                  ///< bracketed (an X from the median and 8 reads); off -> apply_limit uses Result::X
+    double s_lo = 0, s_ref = 0;                       ///< the 2nd-smallest settled read; the reference start (0: none)
+    int64_t X_med = -1, X_lo = -1, X_ref = -1, X = -1;
+    std::string note;                                 ///< why X is not the clamp of X_ref (an edge case), empty otherwise
+    bool closed() const { return on && X_med > 0 && X_med == X_lo && X_lo == X_ref; }
+    /// why the cache refuses this X (empty when closed)
+    std::string open_why() const {
+        if (closed()) return "";
+        if (!on) return "not bracketed";
+        return "bracket open: X_med " + std::to_string((long long) X_med) + ", X_lo " + std::to_string((long long) X_lo) + ", X_ref " + std::to_string((long long) X_ref);
+    }
+};
+/// the 2nd smallest of reads 4-8 (false with fewer than 8 reads)
+inline bool start_read_lo(const std::vector<double>& r, double& out) {
+    if (r.size() < 8) return false;
+    std::vector<double> v(r.begin() + 3, r.begin() + 8);
+    std::sort(v.begin(), v.end());
+    out = v[1];
+    return true;
+}
+/// the combination alone (X_med > 0; X_lo / X_ref -1 when the rule gave none)
+inline void bracket_combine(Bracket& b) {
+    b.on = true;
+    if (b.X_ref < 0) { b.X = b.X_med; b.note = "no reference X: X_med"; return; }
+    if (b.X_lo < 0) { b.X = b.X_med; b.note = "no X from the 2nd-smallest read: X_med"; return; }
+    const int64_t lo = std::min(b.X_med, b.X_lo), hi = std::max(b.X_med, b.X_lo);
+    b.X = std::min(std::max(b.X_ref, lo), hi);
+    b.note.clear();
+}
+/// the bracket of a load: r = derive(p, f, reads, ...).  Not derived (or fewer than 8 reads) -> on = false, today's paths
+inline Bracket bracket(const Pack& p, const Facts& f, const std::vector<double>& reads, const Result& r) {
+    Bracket b;
+    if (!r.derived || reads.size() < 8 || !start_read_lo(reads, b.s_lo)) return b;
+    b.X_med = r.X;
+    const Result lo = derive_from_start(p, f, b.s_lo, -1);
+    if (lo.derived) b.X_lo = lo.X;
+    if (!ref_start(p, b.s_ref)) b.s_ref = 0;
+    ref_X(p, f, b.X_ref);   // (left -1 when there is none)
+    bracket_combine(b);
+    return b;
+}
+
 /// review 13: the staged limit the engine APPLIES (key present: configured >= 0; absent: -1)
 ///  1  key present                -> max(configured, X)   (no X: configured)        - also the rollback
 ///  2  key absent, X derived      -> X
 ///  3  key absent, no X           -> the rule at the pack's own reference start read (the builder's English median), with a warning
 ///  4  no valid pack              -> the engine default (a deploy test must make this unreachable)
-inline int64_t apply_limit(const Pack* p, const Facts& f, const Result* r, int64_t configured, int64_t engine_default, int& level, std::string& note) {
+/// review 16: X is the bracketed X when b is given and on (a derivation from 8 reads), else r's X (a cache hit stores a closed X)
+inline int64_t apply_limit(const Pack* p, const Facts& f, const Result* r, int64_t configured, int64_t engine_default, int& level, std::string& note,
+                           const Bracket* b = nullptr) {
+    const int64_t X = r && r->derived && b && b->on ? b->X : r ? r->X : -1;
     if (configured >= 0) { level = 1; note = r && r->derived ? "max(configured, X)" : "configured (no X: " + (r ? r->why : std::string("no rule")) + ")";
-                           return r && r->derived ? std::max(configured, r->X) : configured; }
-    if (r && r->derived) { level = 2; note = "X"; return r->X; }
-    if (p && f.bw > 0 && f.slots > 0) {   // review 14 F2: level 3 needs the start-up facts (an M1 that could not run -> level 4)
-        std::vector<double> ms = p->text[0].builder_ms.count((int64_t) (p->start - 7)) ? p->text[0].builder_ms.at((int64_t) (p->start - 7)) : std::vector<double>();
-        if (!ms.empty()) {
-            const Result t = derive_from_start(*p, f, median(ms), -1);
-            if (t.derived) { level = 3; note = "WARNING: no X this load (" + (r ? r->why : std::string("no rule")) + "): the pack's reference value"; return t.X; }
-        }
-    }
+                           return r && r->derived ? std::max(configured, X) : configured; }
+    if (r && r->derived) { level = 2; note = "X"; return X; }
+    int64_t Xref = -1;
+    if (p && ref_X(*p, f, Xref)) { level = 3; note = "WARNING: no X this load (" + (r ? r->why : std::string("no rule")) + "): the pack's reference value"; return Xref; }
     level = 4; note = p ? "WARNING: no start-up facts (link rate): the engine default" : "WARNING: no valid pack: the engine default"; return engine_default;
 }
 
@@ -232,13 +300,14 @@ inline uint64_t file_hash(const std::string& path, uint64_t h = 1469598103934665
     std::fclose(fh);
     return h;
 }
-// ---- the derived-X cache (coordinator scope addition to review 14): one record per pack file and card, PACK.txt.<pci>.x-cache ----
+// ---- the derived-X cache (coordinator scope addition to review 14): one record per pack file, card and variant,
+//      PACK.txt.<pci>.<first 8 hex of the key's args_env>.x-cache (review 16 S8) ----
 // A load whose key matches the stored one (host, exe, pack and expert-profile content, card, copy mode, slots/bytes/context/chunk, the
 // engine's arguments and STRATA_/HSA_/GPU_ environment, boot id and kernel release, free VRAM after load in 32 MiB buckets) and whose
 // M1 is within kCacheBwTol of the stored M1 applies the stored X without the 8 start reads.  Anything else - no file, a short or garbled
 // file, another format version, a checksum that does not match, another key, M1 moved - is a MISS with its reason, and the start reads
 // run.  Written to PATH.tmp.<pid> and renamed over PATH (a reader sees the old record or the new one, never half); written only when
-// stable_X holds (review 15 D5).
+// stable_X holds (review 15 D5) and the bracket is closed (review 16 D9: X_med = X_lo = X_ref).
 constexpr int kCacheVersion = 2;          ///< review 15: 2 = the D1/D2/D3 key fields; a version-1 record reads as a miss
 constexpr double kCacheBwTol = 0.0025;    ///< review 15 D5: M1 within 0.25% of the stored M1 on a hit (was 0.5%)
 struct CacheEntry { int64_t X = -1; double start_ms = 0, bw = 0; int reads = 0; };
@@ -318,6 +387,19 @@ inline bool stable_X(const Pack& p, const Facts& f, const Result& r, int64_t con
         }
     }
     return true;
+}
+/// review 16 S9: /proc/vmstat's pswpin and pgmajfault (false when unreadable: not Linux, or a field missing)
+inline bool vmstat_read(long long& pswpin, long long& pgmajfault) {
+    pswpin = pgmajfault = -1;
+    std::FILE* fh = std::fopen("/proc/vmstat", "r");
+    if (!fh) return false;
+    char name[64]; long long v;
+    while (std::fscanf(fh, "%63s %lld", name, &v) == 2) {
+        if (std::strcmp(name, "pswpin") == 0) pswpin = v;
+        else if (std::strcmp(name, "pgmajfault") == 0) pgmajfault = v;
+    }
+    std::fclose(fh);
+    return pswpin >= 0 && pgmajfault >= 0;
 }
 /// a NUL-separated /proc file (cmdline, environ) as its strings; empty when unreadable
 inline std::vector<std::string> nul_list(const std::string& path) {

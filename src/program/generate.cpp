@@ -251,6 +251,9 @@ struct PlannerShadow {
     int64_t free_mib = -1;                    // VRAM free with everything loaded (the serve print), -1 unknown
     std::string xcache_path, xcache_key, cache_note;
     std::string pci;                          // review 15 S1: the card's PCI id (the cache file is per table and card)
+    std::string args_env;                     // review 16 S8: the key's args_env hash (16 hex): the cache file is per table, card AND variant
+    strata::program::planner_c::Bracket bracket;   // review 16 D8: the bracket of this load's 8 reads (off: a hit, or no X from the median)
+    long long vm0[2] = {-1, -1};              // review 16 S9: /proc/vmstat pswpin, pgmajfault when the probes were queued
 };
 PlannerShadow g_shadow;
 // [claude] planner rev 5 apply (review 14 F2/F6): the ONE outcome line of every --planner start, printed before READY.  Not eligible
@@ -268,16 +271,24 @@ void planner_report(const strata::program::planner_c::Pack* p, const strata::pro
     }
     const bool key = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
     int level = 0; std::string note;
-    const int64_t lim = PC::apply_limit(p, g_shadow.facts, &r, key ? g_shadow.configured : -1, g_shadow.configured, level, note);
+    const PC::Bracket* br = g_shadow.bracket.on ? &g_shadow.bracket : nullptr;   // review 16: set only after a derivation from 8 reads
+    const int64_t lim = PC::apply_limit(p, g_shadow.facts, &r, key ? g_shadow.configured : -1, g_shadow.configured, level, note, br);
     Prefill::set_derived_stream_min(lim);
     const int64_t now = Prefill::legacy_stream_min_tokens();
     char tail[512];
     std::snprintf(tail, sizeof tail, "(level %d: %s) | X %lld configured %lld%s | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d/%d%s%s",
-                  level, note.c_str(), (long long) r.X, (long long) g_shadow.configured, key ? "" : " (key absent)",
+                  level, note.c_str(), (long long) (g_shadow.bracket.on ? g_shadow.bracket.X : r.X), (long long) g_shadow.configured, key ? "" : " (key absent)",
                   (long long) r.crossing[0], (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms,
                   (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() || note.find(r.why) != std::string::npos ? "" : " | ",
                   r.why.empty() || note.find(r.why) != std::string::npos ? "" : r.why.c_str());
     std::string t = tail;
+    if (br) {   // review 16 S9: what the decision used - the three X values, the 2nd-smallest read, the bracketed X (= the X above)
+        char bt[320];
+        std::snprintf(bt, sizeof bt, " | bracket X_med %lld X_lo %lld X_ref %lld -> X %lld (%s; 2nd-smallest %.1f ms, reference %.2f ms)%s%s",
+                      (long long) br->X_med, (long long) br->X_lo, (long long) br->X_ref, (long long) br->X, br->closed() ? "closed" : "OPEN",
+                      br->s_lo, br->s_ref, br->note.empty() ? "" : ": ", br->note.c_str());
+        t += bt;
+    }
     if (!g_shadow.cache_note.empty()) t += " | " + g_shadow.cache_note;
     if (p == nullptr && now == lim) {   // no valid pack: the fallback limit, not the planner's (review 15 S2: the reason once)
         std::snprintf(tail, sizeof tail, "(level %d) | configured %lld%s", level, (long long) g_shadow.configured, key ? "" : " (key absent)");
@@ -9383,6 +9394,7 @@ int main(int argc, char** argv) {
                                       (long long) chunk, (unsigned long long) args_env, boot.c_str(), kernel.c_str());
                         g_shadow.key = kb;
                         g_shadow.pci = pci;
+                        { char ae[24]; std::snprintf(ae, sizeof ae, "%016llx", (unsigned long long) args_env); g_shadow.args_env = ae; }
                         g_shadow.cache_path = ppath + ".shadow-cache";
                         std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.4f GB/s; configured staged limit %lld; %s\n",
                                      kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured,
@@ -12389,8 +12401,12 @@ int main(int argc, char** argv) {
                 if (ln > 0 && lp[0] == '/') {
                     const std::string logp(lp, (size_t) ln), pk = !o.planner.empty() ? o.planner : o.planner_shadow;
                     const size_t a = logp.find_last_of('/'), b = pk.find_last_of('/');
-                    // review 15 S1: one file per table AND card, so a one-card profile that alternates cards keeps both records
-                    g_shadow.xcache_path = logp.substr(0, a) + "/" + (b == std::string::npos ? pk : pk.substr(b + 1)) + "." + g_shadow.pci + ".x-cache";
+                    // review 15 S1: one file per table AND card, so a one-card profile that alternates cards keeps both records;
+                    // review 16 S8: and per variant (the key's args_env hash: the arguments and environment), so two variants of one entry
+                    // (--vision or not, two contexts) keep a record each instead of overwriting each other.  Boot id and kernel are NOT in
+                    // the name: a reboot overwrites the record (the key's boot= field still makes the first load of a boot a miss)
+                    g_shadow.xcache_path = logp.substr(0, a) + "/" + (b == std::string::npos ? pk : pk.substr(b + 1)) + "." + g_shadow.pci + "." +
+                                           (g_shadow.args_env.empty() ? std::string("noargs") : g_shadow.args_env.substr(0, 8)) + ".x-cache";
                 }
             }
 #endif
@@ -12424,6 +12440,7 @@ int main(int argc, char** argv) {
                 g_shadow.ready_line = ready_buf;
                 g_shadow.self_probe = true;
                 g_shadow.probes_queued = 8;
+                strata::program::planner_c::vmstat_read(g_shadow.vm0[0], g_shadow.vm0[1]);   // review 16 S9
                 g_shadow.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);   // review 14 F4
             }
         }
@@ -12449,6 +12466,15 @@ int main(int argc, char** argv) {
                 if (!g_shadow.self_probe) return;
                 g_shadow.self_probe = false;
                 PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
+                g_shadow.bracket = PC::bracket(g_shadow.pack, g_shadow.facts, g_shadow.reads, r);   // review 16 D8 (off when r has no X)
+                {   // review 16 S9: swap-ins and major faults across the probe window (the reads' disturbance, for the record)
+                    long long sw = -1, mf = -1;
+                    char vb[160] = "";
+                    if (PC::vmstat_read(sw, mf) && g_shadow.vm0[0] >= 0)
+                        std::snprintf(vb, sizeof vb, "vmstat over the probes: pswpin +%lld pgmajfault +%lld", sw - g_shadow.vm0[0], mf - g_shadow.vm0[1]);
+                    else std::snprintf(vb, sizeof vb, "vmstat over the probes: unknown");
+                    g_shadow.cache_note += std::string("; ") + vb;
+                }
                 if (g_shadow.timed_out)
                     r.why += std::string(r.why.empty() ? "" : "; ") + "the 120 s probe deadline passed after " + std::to_string(g_shadow.probe_requests) + " probes";
                 g_shadow.done = true;
@@ -12456,10 +12482,12 @@ int main(int argc, char** argv) {
                 if (g_shadow.saved_stdout >= 0) { dup2(g_shadow.saved_stdout, 1); close(g_shadow.saved_stdout); g_shadow.saved_stdout = -1; }
                 if (r.derived && g_shadow.reads.size() == 8 && !g_shadow.timed_out && !g_shadow.xcache_path.empty()) {   // the derived-X cache: only a full 8-read derivation
                     std::string unstable;   // review 15 D5: ... and only an X the rule keeps at start +-10 ms and M1 +-0.25%
-                    if (!PC::stable_X(g_shadow.pack, g_shadow.facts, r, g_shadow.configured, unstable)) {
+                    if (!g_shadow.bracket.closed()) {   // review 16 D9: ... and only when X_med = X_lo = X_ref (the reads agree with the reference)
+                        g_shadow.cache_note += "; X not cached (" + g_shadow.bracket.open_why() + ")";
+                    } else if (!PC::stable_X(g_shadow.pack, g_shadow.facts, r, g_shadow.configured, unstable)) {
                         g_shadow.cache_note += "; X not cached (unstable: " + unstable + ")";
                     } else {
-                        PC::CacheEntry e; e.X = r.X; e.start_ms = r.start_ms; e.bw = g_shadow.facts.bw; e.reads = 8;
+                        PC::CacheEntry e; e.X = g_shadow.bracket.X; e.start_ms = r.start_ms; e.bw = g_shadow.facts.bw; e.reads = 8;   // closed: = X_med
                         std::string err;
                         g_shadow.cache_note += PC::cache_write(g_shadow.xcache_path, g_shadow.xcache_key, e, std::to_string((long long) getpid()), err)
                                                    ? "; X written to the cache" : "; cache NOT written: " + err;
