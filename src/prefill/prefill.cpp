@@ -223,7 +223,8 @@ inline int64_t pf_host_floor() {
 inline int64_t pf_host_rows(int64_t want, int64_t max_rows) {   // a floor-sized or grown buffer's rows (4096-row steps)
     const int64_t f = pf_host_floor();
     if (f <= 0 || max_rows <= 0) return max_rows;
-    return std::min(max_rows, std::max<int64_t>(f, (want + 4095) / 4096 * 4096));
+    const int64_t step = std::min<int64_t>(4096, f);   // a small test floor regrows in small steps too
+    return std::min(max_rows, std::max<int64_t>(f, (want + step - 1) / step * step));
 }
 // the row-count counter: one line each time a kind's high-water mark rises (rare: at most a few per process)
 inline void pf_host_note(const char* kind, int dev, int64_t rows, int64_t cap, int64_t max_rows, double grow_ms) {
