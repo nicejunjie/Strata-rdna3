@@ -42,6 +42,8 @@ struct Pack {
     int layers = 48, experts = 512, maxt = 8, grid = 256, margin = 128, max_reads = 8, start = 2048, lo = 3328, hi = 12288, step = 16, start_limit = 16641;
     uint64_t content_hash = 0;                             ///< FNV-1a of the pack file and the counts file (the cache key)
     uint64_t profile_hash = 0;                             ///< review 15 D1: the `profile` line - file_hash of the expert profile it was built under (0: none)
+    double ref_start_ms = 0;                               ///< review 16/17 D10: the `ref_start` line - the reference start read in the
+                                                           ///< engine's own statistic (ms); 0: none, the builder's English median is used
     double share = 0.6, guard = 1.6, conv = 0.003;
     TextTable text[3];
     std::vector<std::vector<int32_t>> probe_tokens;      ///< the canned English start-read prompts (token ids), by variant
@@ -202,8 +204,11 @@ inline Result derive_from_start(const Pack& p, const Facts& f, double start, int
     return res;
 }
 
-/// the pack's reference start read: the builder's English median at start - 7 (level 3's input; review 16 X_ref's input)
+/// the pack's reference start read (level 3's input; review 16 X_ref's input).  Review 16/17 D10: the table's `ref_start` line when it
+/// has one - the mean start read (median of reads 4-8) of the validated cold engine derivations, i.e. the engine's own statistic; the
+/// builder's English median at start - 7 (a different statistic: the builder's staged reads, 16 / 15 / 4-11 ms off) otherwise
 inline bool ref_start(const Pack& p, double& s) {
+    if (p.ref_start_ms > 0) { s = p.ref_start_ms; return true; }
     const auto it = p.text[0].builder_ms.find((int64_t) (p.start - 7));
     if (it == p.text[0].builder_ms.end() || it->second.empty()) return false;
     s = median(it->second);
@@ -455,6 +460,10 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
         else if (k == "counts_file") p.counts_file = words.at(1);
         else if (k == "engine_pack") p.engine_pack = words.at(1);
         else if (k == "profile") p.profile_hash = std::stoull(words.at(1), nullptr, 16);   // review 15 D1
+        else if (k == "ref_start") {   // review 16/17 D10
+            p.ref_start_ms = std::stod(words.at(1));
+            if (!(p.ref_start_ms > 0) || !std::isfinite(p.ref_start_ms)) { err = "bad ref_start line"; return false; }
+        }
         else if (k == "probe_tokens") {   // probe_tokens <variant> id,id,...
             const size_t v = (size_t) std::stoi(words.at(1));
             if (p.probe_tokens.size() <= v) p.probe_tokens.resize(v + 1);

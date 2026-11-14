@@ -10,6 +10,7 @@
 #include <sstream>
 #include <fstream>
 #include <iterator>
+#include <tuple>
 #include <unistd.h>
 using namespace strata::program::planner_c;
 int main(int argc, char** argv) {
@@ -327,11 +328,16 @@ int main(int argc, char** argv) {
         // fix.out's totals, per group: n, today's median X = table X (S0), bracket X = table X (S2), X_med != X_lo, cached by B (stable_X), cached now
         struct Tot { int n = 0, par = 0, s0 = 0, s2 = 0, open = 0, cacheB = 0, cacheNew = 0; };
         std::map<std::string, Tot> T;
-        int parity = 0, nengine = 0, clean = 0, clean_same = 0;
+        int parity = 0, nengine = 0, clean = 0, clean_same = 0, ref_moved = 0;
+        std::string ref_moved_tags;
         for (const Load& l : L) {
             const Pack& p = packs.at(l.q); const Facts f = facts_of(l); const int64_t tx = table_X.at(l.q);
             const Result r = derive(p, f, l.r, -1);
             const Bracket b = bracket(p, f, l.r, r);
+            {   // review 17 F1: a load whose X_ref differs between the table's ref_start and the builder median (C's reference)
+                const Result ob = derive_from_start(p, f, median(p.text[0].builder_ms.at((int64_t) (p.start - 7))), -1);
+                if ((ob.derived ? ob.X : -1) != b.X_ref) { ++ref_moved; ref_moved_tags += " " + l.tag + " (" + std::to_string(ob.derived ? ob.X : -1) + " -> " + std::to_string(b.X_ref) + ")"; }
+            }
             std::string why; const bool st = stable_X(p, f, r, -1, why);
             const bool cache_new = st && b.closed();   // the engine's write condition (generate.cpp: closed, then stable_X)
             const bool prod = !l.vec && l.spec != 2 && l.slots == base.at(l.q).slots;
@@ -368,6 +374,7 @@ int main(int argc, char** argv) {
                 bchk("min-cand-1 (--spec 2): 5889 / 5889 / 6145 -> 5889, open", b.X_med == 5889 && b.X_lo == 5889 && b.X_ref == 6145 && b.X == 5889 && !cache_new, "X " + std::to_string(b.X));
         }
         bchk("the logged X = X_med (derive) on every engine load", parity == 127 && nengine == 127, std::to_string(parity) + " of " + std::to_string(nengine) + " (want 127 of 127)");
+        std::printf("bracket  X_ref differs from C's builder-median reference on %d of %zu loads:%s\n", ref_moved, L.size(), ref_moved_tags.c_str());
         bchk("clean loads: the limit and the cache decision unchanged", clean == 184 && clean_same == 184, std::to_string(clean_same) + " of " + std::to_string(clean) + " (want 184 of 184)");
         // fix.out's totals table (S0 / S2 / bracket open / cache B / cache new)
         const std::map<std::string, std::vector<int>> want = {
@@ -504,6 +511,59 @@ int main(int argc, char** argv) {
             bchk("vmstat_read: pswpin and pgmajfault", ok && a >= 0 && b >= 0, std::to_string(a) + " " + std::to_string(b));
         }
     } else bchk("edge cases: the iq3/iq4 samples", false, "missing");
+    // ---- review 16 D10 / review 17 F1: the table's ref_start line (the engine's own statistic) is level 3's input and X_ref's ----
+    {
+        std::map<std::string, Facts> base;
+        for (const Vec& v : allvec) if (v.tag == "builder-" + v.q) base[v.q] = v.f;
+        const std::map<std::string, double> want_ref = {{"iq3", 1657.1}, {"iq4", 1885.7}, {"q4", 2426.3}};   // apply20 means (tally.txt)
+        const std::map<std::string, double> m1mean = {{"iq3", 13.5870}, {"iq4", 13.6721}, {"q4", 13.7771}};   // the engine loads' mean M1 (fix.cpp)
+        for (const char* q : {"iq3", "iq4", "q4"}) {
+            const Pack& p = packs.at(q); const int64_t tx = table_X.at(q); const std::string Q = q;
+            double s = 0; const bool has = ref_start(p, s);
+            const bool line = p.ref_start_ms > 0;
+            if (!line) { bchk(Q + " the table has no ref_start line (an older table): skipped", true, ""); continue; }
+            bchk(Q + " ref_start() = the table's line", has && s == want_ref.at(q), std::to_string(s));
+            Pack nb = p; nb.ref_start_ms = 0; double sb = 0; ref_start(nb, sb);
+            bchk(Q + " no line: ref_start() = the builder median", sb == median(p.text[0].builder_ms.at((int64_t) (p.start - 7))), std::to_string(sb));
+            for (double fct : {1.0, 1.0025, 0.9975}) {
+                if (!base.count(q)) { bchk(Q + " base facts", false, "missing"); break; }
+                Facts f = base.at(q); f.bw = m1mean.at(q) * 1e9 * fct;
+                char w[96]; std::snprintf(w, sizeof w, "%s level 3 at M1 %+.2f%% (ref_start)", q, (fct - 1) * 100);
+                Result none; none.why = "no probes"; int lvl = 0; std::string note;
+                const int64_t lim = apply_limit(&p, f, &none, -1, 3072, lvl, note);
+                const int64_t old = derive_from_start(p, f, sb, -1).X;   // what C's builder-median reference gives here (reported)
+                bchk(w, lim == tx && lvl == 3, std::to_string(lim) + " level " + std::to_string(lvl) + " (builder median: " + std::to_string(old) + ")");
+                int64_t xr = -1; ref_X(p, f, xr);
+                bchk(std::string(w) + ": X_ref", xr == tx, std::to_string(xr));
+            }
+            {   // the margins from ref_start to X's steps at the mean M1 (0.1 ms scan), reported
+                Facts f = base.at(q); f.bw = m1mean.at(q) * 1e9;
+                double dn = 0, up = 0;
+                while (dn < 200 && derive_from_start(p, f, s - dn - 0.1, -1).X == tx) dn += 0.1;
+                while (up < 200 && derive_from_start(p, f, s + up + 0.1, -1).X == tx) up += 0.1;
+                char d[160]; std::snprintf(d, sizeof d, "ref %.1f ms: X %lld holds for -%.1f / +%.1f ms at M1 %.4f", s, (long long) tx, dn, up, f.bw / 1e9);
+                bchk(Q + " margins of the reference (> 10 ms both ways)", dn > 10 && up > 10, d);
+            }
+        }
+        // load_pack: the line parses, a bad one is refused
+        {
+            const char* td0 = std::getenv("TMPDIR");
+            const std::string tp = std::string(td0 && *td0 ? td0 : "/tmp") + "/planner_c_test." + std::to_string((long long) getpid()) + ".ref.txt";
+            auto with_line = [&](const std::string& line) {
+                std::ifstream in(pd + "/qwen-iq4.txt"); std::ofstream out(tp); std::string ln; bool put = false;
+                while (std::getline(in, ln)) { if (ln.rfind("ref_start ", 0) == 0) continue; out << ln << "\n"; if (!put && ln.rfind("o_s ", 0) == 0) { if (!line.empty()) out << line << "\n"; put = true; } }
+            };
+            for (const auto& [line, ok, val] : std::vector<std::tuple<std::string, bool, double>>{{"ref_start 1885.7", true, 1885.7}, {"", true, 0.0},
+                     {"ref_start -5", false, 0.0}, {"ref_start 0", false, 0.0}, {"ref_start nan", false, 0.0}, {"ref_start inf", false, 0.0}}) {
+                with_line(line);
+                Pack e; std::string le; bool got = false;
+                try { got = load_pack(tp, cd, e, le); } catch (const std::exception& ex) { got = false; le = ex.what(); }
+                const bool good = got == ok && (!got || e.ref_start_ms == val);
+                bchk("load_pack \"" + (line.empty() ? std::string("(no line)") : line) + "\"", good, got ? "loaded, ref_start_ms " + std::to_string(e.ref_start_ms) : "refused: " + le);
+            }
+            std::remove(tp.c_str());
+        }
+    }
     std::printf("%d bracket vectors, %d differ\n", nb, bbad);
     abad += bbad; na += nb;
     std::printf("%d apply/validate/cache vectors, %d differ\n", na, abad);

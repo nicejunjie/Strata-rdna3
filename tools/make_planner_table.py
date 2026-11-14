@@ -17,6 +17,14 @@ predicted faster than streaming every expert.  What the rule needs that is not a
   profile                        the FNV-1a 64 hash of the expert profile (--expert-profile) the builder run loaded: the
                                  rule's residency and the staged times come from its ranking, so the engine refuses the
                                  table under any other profile (a new profile means a new builder run and table)
+  ref_start                      (optional, --ref-start MS) the reference start read in the ENGINE's own statistic: the mean
+                                 of the start reads (the median of reads 4-8 of `--planner`'s 8 canned reads) over validated
+                                 cold engine derivations on this host and table.  The rule at this value on a load's facts is
+                                 level 3 (key absent, no X this load) and the bracket's X_ref.  Without the line the engine
+                                 uses the builder's English median at start - 7, a different statistic (the builder's staged
+                                 reads, about 4-16 ms off the engine's).  The shipped values (1657.1 / 1885.7 / 2426.3 ms for
+                                 IQ3_S / IQ4_XS / Q4_K_XL) are the means of 20 cold `--planner` loads per quant on build
+                                 build-hip-apply (results/planner-20261112/next/apply20/tally.txt, keys present, 2026-11-13).
 
 Only the lengths the rule reads are kept: the start read's part (start - 7) and the rungs that bracket the crossing
 search [lo, hi) - the rule interpolates between neighbouring rungs, so the others never enter X.
@@ -118,8 +126,12 @@ def main():
     ap.add_argument("--profile", required=True, help="the --expert-profile file the builder run loaded (its hash goes in the table)")
     ap.add_argument("--texts", type=int, default=3, help="texts in the builder run, in order (english, code, chinese)")
     ap.add_argument("--reads-per-text", type=int, default=44)
+    ap.add_argument("--ref-start", type=float, default=None, metavar="MS",
+                    help="the reference start read in the engine's own statistic (ms): the mean start of validated cold --planner loads")
     ap.add_argument("--out", required=True, help="the table (.txt); the counts go next to it as .counts")
     a = ap.parse_args()
+    if a.ref_start is not None and not (0 < a.ref_start < 1e6):
+        raise SystemExit(f"--ref-start {a.ref_start}: not a start read in ms")
     c = dict(CONST)
     chunks = read_counts(a.counts, c["layers"], c["experts"])
     rows = plan_rows(a.log)
@@ -152,7 +164,7 @@ def main():
     cpath = out.with_suffix(".counts")
     L = [f"quant {a.quant}", f"engine_pack {a.engine_pack}", f"profile {fnv1a64(a.profile):016x}", f"counts_file {cpath.name}", f"n_chunks {len(out_chunks)}",
          f"win {repr(float(window_ms(a.log)))}", f"stream_compute {repr(a.stream_compute[0])} {repr(a.stream_compute[1])}",
-         f"o_s {repr(a.o_s)}", "const " + " ".join(f"{k} {v}" for k, v in c.items())]
+         f"o_s {repr(a.o_s)}"] + ([f"ref_start {repr(float(a.ref_start))}"] if a.ref_start is not None else []) + ["const " + " ".join(f"{k} {v}" for k, v in c.items())]
     L += [f"probe_tokens {v} {p}" for v, p in enumerate(probes)]
     out.write_text("\n".join(L + lines_text) + "\n")
     body = b"".join(struct.pack("<i", T) + classes(cnt, c["maxt"]) for T, cnt in out_chunks)
