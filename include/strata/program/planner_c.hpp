@@ -316,6 +316,21 @@ inline uint64_t file_hash(const std::string& path, uint64_t h = 1469598103934665
 constexpr int kCacheVersion = 2;          ///< review 15: 2 = the D1/D2/D3 key fields; a version-1 record reads as a miss
 constexpr double kCacheBwTol = 0.0025;    ///< review 15 D5: M1 within 0.25% of the stored M1 on a hit (was 0.5%)
 struct CacheEntry { int64_t X = -1; double start_ms = 0, bw = 0; int reads = 0; };
+/// review 17c D11 ("M1 settles"): the link probe times passes until the last three agree within tol (the hit tolerance,
+/// kCacheBwTol), at most kM1MaxPasses timed passes after the warm-up.  Settled: the median of those three (three quiet passes give
+/// exactly the median of 3, as before).  Not settled: the 2nd fastest of all passes (a disturbance only slows a pass), and the
+/// engine writes no cache record from that load.  Fewer than 3 passes: 0 (no link rate).
+constexpr int kM1MaxPasses = 9;   ///< timed passes after the warm-up; 3 when the link is quiet (a cap, not a threshold)
+inline double m1_from_passes(const std::vector<double>& g, double tol, bool& settled) {
+    settled = false;
+    const size_t n = g.size();
+    if (n < 3) return 0.0;
+    std::vector<double> v(g.end() - 3, g.end());
+    std::sort(v.begin(), v.end());
+    if (v[2] <= v[0] * (1.0 + tol)) { settled = true; return v[1]; }
+    v = g; std::sort(v.begin(), v.end());
+    return v[n - 2];
+}
 inline uint64_t fnv_str(const std::string& s, uint64_t h = 1469598103934665603ull) {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
     return h;

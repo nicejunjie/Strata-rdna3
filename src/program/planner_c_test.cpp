@@ -5,6 +5,8 @@
 //    - VECTORS defaults to src/program/planner_c_test_vectors.txt, the rev 5 export's 279 stored loads; review 15 S6
 //    - READS defaults to src/program/planner_c_test_reads.txt: review 16's engine read series (Fable's harness reads.txt, every engine
 //      log under results/planner-20261112/next/ with 8 counted reads up to 11-14 01:57), for the bracket's checks)
+//    - M1 (argv[6]) defaults to src/program/planner_c_test_m1.txt: review 17c's 171 logged loads (tag, quant, the three M1 passes, the
+//      ON line's M1), for m1_from_passes (D11)
 #include "strata/program/planner_c.hpp"
 #include <cstdio>
 #include <sstream>
@@ -567,5 +569,109 @@ int main(int argc, char** argv) {
     std::printf("%d bracket vectors, %d differ\n", nb, bbad);
     abad += bbad; na += nb;
     std::printf("%d apply/validate/cache vectors, %d differ\n", na, abad);
-    return bad || abad ? 1 : 0;
+    // ---- review 17c D11 ("M1 settles"): m1_from_passes, the port-test vectors of review 17c section 3 (values in GB/s) ----
+    int nm = 0, mbad = 0;
+    auto mchk = [&](const std::string& what, bool ok, const std::string& detail) {
+        ++nm; mbad += !ok;
+        std::printf("m1       %-52s %s %s\n", what.c_str(), ok ? "OK  " : "DIFF", detail.c_str());
+    };
+    {
+        auto m1 = [](const std::vector<double>& g, bool& st) { return m1_from_passes(g, kCacheBwTol, st); };
+        auto pr = [](const std::vector<double>& g) { std::string s; char b[32]; for (double x : g) { std::snprintf(b, sizeof b, " %.4f", x); s += b; } return s; };
+        auto v = [&](const std::string& what, const std::vector<double>& g, bool want_st, double want) {
+            bool st = true; const double x = m1(g, st);
+            char d[96]; std::snprintf(d, sizeof d, "-> %s %.4f |", st ? "settled" : "not settled", x);
+            mchk(what, st == want_st && x == want, d + pr(g));
+        };
+        const std::vector<double> P3 = {13.6697, 13.1692, 13.5972};
+        auto P3p = [&](std::vector<double> more) { std::vector<double> g = P3; g.insert(g.end(), more.begin(), more.end()); return g; };
+        v(" 1 P4: three quiet passes", {13.6714, 13.6728, 13.6725}, true, 13.6725);
+        v(" 2 P3: not settled (today's median)", P3, false, 13.5972);
+        v(" 3 P3 + 1", P3p({13.6720}), false, 13.6697);
+        v(" 4 P3 + 2", P3p({13.6720, 13.6731}), false, 13.6720);
+        v(" 5 P3 + 3: settled", P3p({13.6720, 13.6731, 13.6725}), true, 13.6725);
+        v(" 6 iq3-07 (0.27%)", {13.5536, 13.5723, 13.5903}, false, 13.5723);
+        v(" 7 one fast pass (0.21%)", {13.6702, 13.6755, 13.6991}, true, 13.6755);
+        v(" 8 q4-05 (0.22%)", {13.7492, 13.7796, 13.7779}, true, 13.7779);
+        v(" 9 100 100.24 100.1 (0.24%)", {100, 100.24, 100.1}, true, 100.1);
+        v(" 9 100 100.26 100.1 (0.26%)", {100, 100.26, 100.1}, false, 100.1);
+        { std::vector<double> g; for (int i = 0; i < kM1MaxPasses; ++i) g.push_back(i % 2 ? 13.20 : 13.67);
+          v("10 13.67 / 13.20 alternating, 9 passes", g, false, 13.67); }
+        v("11 uniform shift", {13.60, 13.60, 13.61}, true, 13.60);
+        v("12 no pass", {}, false, 0.0);
+        v("12 one pass", {13.67}, false, 0.0);
+        v("12 two passes", {13.67, 13.67}, false, 0.0);
+        {   // the engine's loop (generate.cpp): a pass at a time, stopping at the first settled call - P3's sequence settles at pass 6
+            const std::vector<double> seq = P3p({13.6720, 13.6731, 13.6725, 13.10, 13.10});
+            std::vector<double> g; bool st = false; double x = 0;
+            for (size_t i = 0; i < seq.size() && (int) g.size() < kM1MaxPasses && !st; ++i) { g.push_back(seq[i]); x = m1(g, st); }
+            char d[64]; std::snprintf(d, sizeof d, "%zu passes, %s %.4f", g.size(), st ? "settled" : "not settled", x);
+            mchk(" 5 the engine's loop stops at pass 6", st && g.size() == 6 && x == 13.6725, d);
+            std::vector<double> h; st = false;
+            for (int i = 0; i < 20 && (int) h.size() < kM1MaxPasses && !st; ++i) { h.push_back(i % 2 ? 13.20 : 13.67); x = m1(h, st); }
+            std::snprintf(d, sizeof d, "%zu passes, %s %.4f", h.size(), st ? "settled" : "not settled", x);
+            mchk("10 the engine's loop stops at the cap (9)", !st && h.size() == 9 && x == 13.67, d);
+        }
+        {   // 13: every logged load (results/planner-20261112/next/buildC3/r17c/loads.txt: 171 loads with logged passes up to 11-14 05:10:52),
+            // its three passes and the ON line's `M1 x.xxxx`: settled on 169, M1 = the logged M1 on all 171
+            std::ifstream in(argc > 6 ? std::string(argv[6]) : std::string("src/program/planner_c_test_m1.txt")); std::string ln;
+            int nl = 0, nst = 0, same = 0; std::string unsettled, differ;
+            while (std::getline(in, ln)) {
+                if (ln.empty() || ln[0] == '#') continue;
+                std::istringstream a(ln); std::string tag, q; double p0, p1, p2; std::string logged;
+                if (!(a >> tag >> q >> p0 >> p1 >> p2 >> logged)) continue;
+                ++nl; bool st = false; const double x = m1({p0, p1, p2}, st);
+                char b[32]; std::snprintf(b, sizeof b, "%.4f", x);
+                nst += st; if (!st) unsettled += " " + tag;
+                if (logged == b) ++same; else differ += " " + tag + " (" + b + " != " + logged + ")";
+            }
+            mchk("13 logged loads: settled", nl == 171 && nst == 169, std::to_string(nst) + " of " + std::to_string(nl) + " (want 169 of 171); not settled:" + unsettled);
+            mchk("13 logged loads: M1 = the logged M1", nl == 171 && same == 171, std::to_string(same) + " of " + std::to_string(nl) + differ);
+        }
+        {   // 14: check 2 replayed - a record written at P1's M1; P5-like (vector 5) hits, P3 (vector 2) and a uniform shift (vector 11) miss
+            const char* td = std::getenv("TMPDIR");
+            const std::string path = std::string(td && *td ? td : "/tmp") + "/planner_c_test." + std::to_string((long long) getpid()) + ".m1.x-cache";
+            const std::string key = "host=h exe=0123 pack=4567 gpu=0000:07:00.0 boot=b kernel=k vram_free_mib32=320";
+            CacheEntry e; e.X = 6145; e.start_ms = 1885.6; e.bw = 13.6726e9; e.reads = 8;
+            std::string err; std::remove(path.c_str());
+            const bool w = cache_write(path, key, e, "t", err);
+            auto get = [&]() { std::ifstream f(path, std::ios::binary); return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); };
+            const std::string before = get();
+            bool st = false;
+            const double m5 = m1(P3p({13.6720, 13.6731, 13.6725}), st), m2 = m1(P3, st), m11 = m1({13.60, 13.60, 13.61}, st);
+            auto c = [&](const std::string& what, double bw, bool want, const std::string& must) {
+                CacheEntry g; std::string why; const bool hit = cache_read(path, key, bw * 1e9, kCacheBwTol, packs.at("iq4"), g, why);
+                const bool ok = w && hit == want && (!hit || g.X == 6145) && (must.empty() || why.find(must) != std::string::npos);
+                mchk(what, ok, hit ? "hit X " + std::to_string(g.X) : "miss: " + why);
+            };
+            c("14 record at 13.6726: vector 5's M1 hits", m5, true, "");
+            mchk("14 the hit leaves the file's bytes unchanged", get() == before && !before.empty(), std::to_string(before.size()) + " bytes");
+            c("14 vector 2's M1 (P3) misses", m2, false, "GB/s stored");
+            c("14 vector 11's M1 (uniform shift) misses", m11, false, "GB/s stored");
+            std::remove(path.c_str());
+        }
+        // 15: why the write guard exists - the rule on a disturbed M1 (each quant's sample load: facts and reads, M1 scaled)
+        auto at = [&](const char* q, double fct, int64_t& xm, int64_t& xl, int64_t& xr, int64_t& xa, bool& cl, bool& st, std::string& tag) {
+            Facts f = sample.at(q).first; f.bw *= fct; const std::vector<double>& rd = sample.at(q).second; tag = sample_tag.at(q);
+            const Result r = derive(packs.at(q), f, rd, -1); const Bracket b = bracket(packs.at(q), f, rd, r);
+            xm = b.X_med; xl = b.X_lo; xr = b.X_ref; xa = b.on ? b.X : r.X; cl = b.closed(); std::string why; st = stable_X(packs.at(q), f, r, -1, why);
+        };
+        for (const auto& [q, fct, want, want_closed, want_stable] : std::vector<std::tuple<const char*, double, int64_t, int, int>>{
+                 {"q4", 0.99, 8961, 1, 1}, {"iq4", 0.963, 6401, -1, -1}, {"iq4", 0.9945, 6145, 1, -1}}) {
+            if (!sample.count(q)) { mchk(std::string("15 ") + q + " sample", false, "missing"); continue; }
+            int64_t xm, xl, xr, xa; bool cl, st; std::string tag; at(q, fct, xm, xl, xr, xa, cl, st, tag);
+            const bool ok = xm == want && xl == want && xr == want && xa == want && (want_closed < 0 || cl == (bool) want_closed) && (want_stable < 0 || st == (bool) want_stable);
+            char w[96], d[200];
+            std::snprintf(w, sizeof w, "15 %s at M1 %+.2f%%: X %lld%s%s", q, (fct - 1) * 100, (long long) want, want_closed > 0 ? ", closed" : "", want_stable > 0 ? ", stable_X" : "");
+            std::snprintf(d, sizeof d, "%s: X_med %lld X_lo %lld X_ref %lld applied %lld, %s, stable_X %s", tag.c_str(), (long long) xm, (long long) xl, (long long) xr,
+                          (long long) xa, cl ? "closed" : "open", st ? "true" : "false");
+            // review 17c: "if the sample load is one of the exceptions, report its values; do not move the factor".  The samples are stored
+            // vectors (shadow-<q>-1), not engine loads: IQ4's M1 is 13.6225, 0.36% below the engine loads' mean 13.6721, so -3.70% from it
+            // is -4.05% from the mean, past IQ4's next step (6657).  Fable's 64 of 65 engine loads at 6401 is reproduced offline (h.out).
+            if (!ok && fct == 0.963) { std::printf("m1       %-52s REPORT %s (the sample is an exception; not counted)\n", w, d); continue; }
+            mchk(w, ok, d);
+        }
+    }
+    std::printf("%d M1-settle vectors, %d differ\n", nm, mbad);
+    return bad || abad || mbad ? 1 : 0;
 }

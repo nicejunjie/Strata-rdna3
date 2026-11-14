@@ -254,6 +254,7 @@ struct PlannerShadow {
     std::string args_env;                     // review 16 S8: the key's args_env hash (16 hex): the cache file is per table, card AND variant
     strata::program::planner_c::Bracket bracket;   // review 16 D8: the bracket of this load's 8 reads (off: a hit, or no X from the median)
     long long vm0[2] = {-1, -1};              // review 16 S9: /proc/vmstat pswpin, pgmajfault when the probes were queued
+    bool m1_settled = false;                  // review 17c D11: the link probe's last three passes agreed (else no cache record is written)
 };
 PlannerShadow g_shadow;
 // [claude] planner rev 5 apply (review 14 F2/F6): the ONE outcome line of every --planner start, printed before READY.  Not eligible
@@ -9322,7 +9323,9 @@ int main(int argc, char** argv) {
                         // M1: 384 copies of one slot's bytes (cache bytes / slots, the model's b) from pinned arena blobs - each copy at
                         // most its own blob's size (the next blob's address in the same layer bounds it: review 11, no over-read) - into a
                         // 32-slot scratch ring on the engine's main stream (no new stream: review 11, the queue order stays), timed as
-                        // mb.hip times it (wall clock around the enqueue and the stream sync), median of 3 passes after one warm-up
+                        // mb.hip times it (wall clock around the enqueue and the stream sync).  Review 17c D11: after one warm-up, timed
+                        // passes until the last three agree within kCacheBwTol (their median; 3 passes when quiet), at most kM1MaxPasses
+                        // (then the 2nd fastest pass, and no cache record from this load) - PC::m1_from_passes
                         const size_t bytes = (size_t) (f.cache_bytes / (double) f.slots);
                         std::vector<std::pair<const uint8_t*, size_t>> srcs;
                         for (int64_t l = 0; l + 1 < g.n_layers && srcs.size() < 384; ++l)
@@ -9338,7 +9341,8 @@ int main(int argc, char** argv) {
                         for (const auto& sp_ : srcs) moved += sp_.second;
                         if (srcs.size() == 384 && cudaMalloc(&scratch, 32 * bytes) == cudaSuccess) {
                             std::vector<double> gbs;
-                            for (int pass = 0; pass < 4; ++pass) {
+                            bool settled = false;
+                            for (int pass = 0; pass <= PC::kM1MaxPasses && !settled; ++pass) {
                                 cudaStreamSynchronize(main_stream);
                                 const auto t0 = std::chrono::steady_clock::now();
                                 for (size_t i = 0; i < srcs.size(); ++i)
@@ -9346,13 +9350,16 @@ int main(int argc, char** argv) {
                                 cudaStreamSynchronize(main_stream);
                                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                                 if (pass > 0 && ms > 0) gbs.push_back((double) moved / (ms / 1e3));
+                                if (pass > 0) f.bw = PC::m1_from_passes(gbs, PC::kCacheBwTol, settled);
                             }
-                            std::vector<double> passes = gbs;
-                            std::sort(gbs.begin(), gbs.end());
-                            f.bw = gbs.empty() ? 0.0 : gbs[gbs.size() / 2];
-                            if (passes.size() == 3)   // review 11b N3: every pass and the bytes moved
-                                std::fprintf(stderr, "strata planner shadow: M1 passes %.4f %.4f %.4f GB/s, %zu copies, %zu bytes (slot %zu)\n", passes[0] / 1e9,
-                                             passes[1] / 1e9, passes[2] / 1e9, srcs.size(), moved, bytes);
+                            g_shadow.m1_settled = settled;
+                            if (gbs.size() >= 3) {   // review 11b N3 / 17c D11: every pass, settled or not, and the bytes moved
+                                std::string pl;
+                                char pb[32];
+                                for (double x : gbs) { std::snprintf(pb, sizeof pb, " %.4f", x / 1e9); pl += pb; }
+                                std::fprintf(stderr, "strata planner shadow: M1 passes%s GB/s, %s after %zu, %zu copies, %zu bytes (slot %zu)\n", pl.c_str(),
+                                             settled ? "settled" : "NOT settled", gbs.size(), srcs.size(), moved, bytes);
+                            }
                         }
                         (void) cudaGetLastError();
                         if (scratch) cudaFree(scratch);
@@ -12482,7 +12489,9 @@ int main(int argc, char** argv) {
                 if (g_shadow.saved_stdout >= 0) { dup2(g_shadow.saved_stdout, 1); close(g_shadow.saved_stdout); g_shadow.saved_stdout = -1; }
                 if (r.derived && g_shadow.reads.size() == 8 && !g_shadow.timed_out && !g_shadow.xcache_path.empty()) {   // the derived-X cache: only a full 8-read derivation
                     std::string unstable;   // review 15 D5: ... and only an X the rule keeps at start +-10 ms and M1 +-0.25%
-                    if (!g_shadow.bracket.closed()) {   // review 16 D9: ... and only when X_med = X_lo = X_ref (the reads agree with the reference)
+                    if (!g_shadow.m1_settled) {   // review 17c D11: ... and only from a load whose M1 settled (no record carries a disturbed M1)
+                        g_shadow.cache_note += "; X not cached (M1 not settled)";
+                    } else if (!g_shadow.bracket.closed()) {   // review 16 D9: ... and only when X_med = X_lo = X_ref (the reads agree with the reference)
                         g_shadow.cache_note += "; X not cached (" + g_shadow.bracket.open_why() + ")";
                     } else if (!PC::stable_X(g_shadow.pack, g_shadow.facts, r, g_shadow.configured, unstable)) {
                         g_shadow.cache_note += "; X not cached (unstable: " + unstable + ")";

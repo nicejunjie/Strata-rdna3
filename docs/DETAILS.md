@@ -1907,6 +1907,13 @@ every reboot reads. A limit is written only when the rule gives the same one at 
 rate +-0.25%; otherwise the line says `X not cached (unstable: ...)` and every start reads. A start that derives nothing
 and keeps `STRATA_PREFILL_CPU_SHARE_MAX` says `KEPT staged limit N`.
 
+The link rate (M1) is the rule's input on every load and decides a cache hit. Its probe times one warm-up pass of the
+384 copies, then timed passes (about 65 ms each) until the last three agree within 0.25% (the hit tolerance): the
+link rate is their median, so a quiet link gives three passes and the same value as before. A burst of host traffic
+only slows a pass, so after 9 timed passes without three in a row agreeing the link rate is the 2nd fastest pass and
+no record is written from that load (`X not cached (M1 not settled)`); the cache is still read and the limit derived.
+The line `strata planner shadow: M1 passes a b c ... GB/s, settled after N` (or `NOT settled after 9`) lists every pass.
+
 The shipped tables (`data/planner/qwen-<quant>.txt` and `.counts`, Qwen3.8-Flash-Next IQ3_S / IQ4_XS / Q4_K_XL, one
 RX 7900 XTX) are built by `tools/make_planner_table.py` from one builder run per model: the model's one-card config with
 `--calibration-plans`, `STRATA_PREFILL_CPU_SHARE_MAX` unset and `--dump-prompt-counts COUNTS.bin`, reading the
