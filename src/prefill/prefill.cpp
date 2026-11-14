@@ -212,11 +212,9 @@ inline bool force_pageable() {
 // (2 x chunk x N floats per stage) were pinned for the largest chunk the path may ever read (1600 + 400 MiB each on
 // Q4 2-GPU), and every pinned page is GPU-mapped memory the kernel's reclaim / compaction can invalidate (a queue stop
 // of the whole process, results/stall-20261114).  They now start at a floor and grow, once, to the largest chunk a
-// read actually used (a high-water mark; no shrink).  STRATA_PF_HOST_FLOOR=0 restores the full size at start.
-inline int64_t pf_host_floor() {
-    static const int64_t v = [] { const char* e = std::getenv("STRATA_PF_HOST_FLOOR"); return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 16640; }();
-    return v;
-}
+// read actually used (a high-water mark; no shrink).  Rollback is the previous release binary (no switch).
+constexpr int64_t kPfHostFloor = 16640;   // the production protocol's largest chunk layout (results/stall-20261114)
+inline int64_t pf_host_floor() { return kPfHostFloor; }
 inline int64_t pf_host_rows(int64_t want, int64_t max_rows) {   // a floor-sized or grown buffer's rows (4096-row steps)
     const int64_t f = pf_host_floor();
     if (f <= 0 || max_rows <= 0) return max_rows;
