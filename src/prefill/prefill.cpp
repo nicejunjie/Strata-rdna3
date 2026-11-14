@@ -232,8 +232,8 @@ inline void pf_host_note(const char* kind, int dev, int64_t rows, int64_t cap, i
     static std::map<std::pair<std::string, int>, int64_t> hw;
     std::lock_guard<std::mutex> g(mu);
     int64_t& h = hw[{kind, dev}];
-    if (rows <= h) return;
-    h = rows;
+    if (rows <= h && grow_ms < 0) return;   // every grow is logged (its cost), plus each new high-water mark
+    h = std::max(h, rows);
     std::fprintf(stderr, "strata prefill: host rows high-water: %s on CUDA%d %lld rows (buffer %lld of at most %lld rows%s)\n",
                  kind, dev, (long long) rows, (long long) cap, (long long) max_rows,
                  grow_ms >= 0 ? (std::string(", grown in ") + std::to_string((int) grow_ms) + " ms").c_str() : "");
