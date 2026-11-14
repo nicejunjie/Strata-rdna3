@@ -9377,6 +9377,12 @@ int main(int argc, char** argv) {
 #else
                         if (cudaDeviceGetPCIBusId(pci, sizeof pci, dev) != cudaSuccess) { (void) cudaGetLastError(); std::snprintf(pci, sizeof pci, "dev%d", dev); }
 #endif
+                        if (!g_shadow.pack.host.empty()) {   // review 18a R2: the table names the host it was measured on; another host -> a warning
+                            const std::string here = PC::host_facts(pci);
+                            if (here != g_shadow.pack.host)
+                                std::fprintf(stderr, "strata planner: WARNING: the table was built on another host (table: %s; this host: %s): its reference "
+                                             "start and measured times may not hold here - rebuild the table on this host\n", g_shadow.pack.host.c_str(), here.c_str());
+                        }
                         const char* sdma = std::getenv("HSA_ENABLE_SDMA");
                         // review 15: profile= (D1, the table's profile line was checked above), args_env= (D2: PC::args_env_hash - the
                         // command line less argv[0], and the STRATA_/HSA_/GPU_ environment as launched, sorted), boot= and kernel= (D3: the

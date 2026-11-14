@@ -10,9 +10,11 @@
 // (planner_c_test.cpp checks it against rule_c.py on every stored load).  Nothing here changes a plan.
 #pragma once
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -44,6 +46,9 @@ struct Pack {
     uint64_t profile_hash = 0;                             ///< review 15 D1: the `profile` line - file_hash of the expert profile it was built under (0: none)
     double ref_start_ms = 0;                               ///< review 16/17 D10: the `ref_start` line - the reference start read in the
                                                            ///< engine's own statistic (ms); 0: none, the builder's English median is used
+    double ref_m1_gbs = 0;                                 ///< review 18a A1: the `ref_start` line's optional 2nd field - the mean M1 (GB/s)
+                                                           ///< of the loads behind ref_start_ms; 0: none (the reference is used as measured)
+    std::string host;                                      ///< review 18a R2: the `host` line (the builder host's facts, host_facts()); empty: none
     double share = 0.6, guard = 1.6, conv = 0.003;
     TextTable text[3];
     std::vector<std::vector<int32_t>> probe_tokens;      ///< the canned English start-read prompts (token ids), by variant
@@ -206,9 +211,21 @@ inline Result derive_from_start(const Pack& p, const Facts& f, double start, int
 
 /// the pack's reference start read (level 3's input; review 16 X_ref's input).  Review 16/17 D10: the table's `ref_start` line when it
 /// has one - the mean start read (median of reads 4-8) of the validated cold engine derivations, i.e. the engine's own statistic; the
-/// builder's English median at start - 7 (a different statistic: the builder's staged reads, 16 / 15 / 4-11 ms off) otherwise
-inline bool ref_start(const Pack& p, double& s) {
-    if (p.ref_start_ms > 0) { s = p.ref_start_ms; return true; }
+/// builder's English median at start - 7 (a different statistic: the builder's staged reads, 16 / 15 / 4-11 ms off) otherwise.
+/// Review 18a A1: when the line carries the M1 its loads were measured at (`ref_start MS GB/s`), the reference is carried to THIS
+/// load's M1: MS + copy_staged(start - 7) * (1 - M1 / M1_ref) - the start read's copy part at this load's link rate instead of the
+/// reference loads' (without it a link that is x% slower books x% of the copy as staged compute).  Needs the load's facts (false
+/// without a link rate or slots); with one field the line is used as measured (C2/C3's behaviour).
+inline bool ref_start(const Pack& p, const Facts& f, double& s) {
+    if (p.ref_start_ms > 0) {
+        s = p.ref_start_ms;
+        if (p.ref_m1_gbs > 0) {
+            if (!(f.bw > 0) || f.slots <= 0) return false;
+            const TextModel en(p, f, 0);
+            s += en.copy_staged((double) (p.start - 7)) * (1.0 - f.bw / (p.ref_m1_gbs * 1e9));
+        }
+        return true;
+    }
     const auto it = p.text[0].builder_ms.find((int64_t) (p.start - 7));
     if (it == p.text[0].builder_ms.end() || it->second.empty()) return false;
     s = median(it->second);
@@ -217,28 +234,31 @@ inline bool ref_start(const Pack& p, double& s) {
 /// the rule at the pack's reference start on this load's facts (level 3's value); false without the facts, a reference or an X
 inline bool ref_X(const Pack& p, const Facts& f, int64_t& X) {
     double s = 0;
-    if (!(f.bw > 0) || f.slots <= 0 || !ref_start(p, s)) return false;   // review 14 F2: needs the start-up facts (no M1 -> no reference)
+    if (!(f.bw > 0) || f.slots <= 0 || !ref_start(p, f, s)) return false;   // review 14 F2: needs the start-up facts (no M1 -> no reference)
     const Result t = derive_from_start(p, f, s, -1);
     if (!t.derived) return false;
     X = t.X;
     return true;
 }
-// ---- review 16 D8/D9 (option e): bracket the limit between two statistics of the same 8 reads ----
+// ---- review 16 D8/D9, review 18a (option e, "the reference is a floor"): bracket the limit between two statistics of the same 8 reads ----
 //   s_med = the median of reads 4-8 (derive's statistic, unchanged)      X_med = rule(s_med)  (= derive's X)
 //   s_lo  = the 2nd smallest of reads 4-8                                 X_lo  = rule(s_lo)
-//   X_ref = the rule at the pack's reference start on this load's facts (level 3's value)
-//   X     = X_ref limited to [min(X_med, X_lo), max(X_med, X_lo)]  (min/max: the IQ3 regime-guard edge cannot invert the range)
-// A slow read (swap-in, page fault) can only slow a read, so the fastest reads are the undisturbed ones; the 2nd smallest ignores one
-// freak fast read.  The limit moves down only when even the 2nd-fastest settled read says so, up only when the median says so; when
-// the two disagree the load's reads straddle a step and the reference decides.  X stays between X_med and X_lo, so a wrong reference
-// gives at worst today's X_med.  Edge cases: no X from the median -> not bracketed (today's paths); no X_ref -> X = X_med; no X from
-// the 2nd smallest (below IQ3's guard) -> X = X_med.  The cache takes X only when the bracket is CLOSED (X_med = X_lo = X_ref) and
-// stable_X holds.  derive, rule_c.py and the stored vectors are unchanged: the bracket sits in apply_limit and the cache condition.
+//   X_ref = the rule at the pack's reference start on this load's facts (level 3's value; A1: the reference at this load's M1)
+//   X     = max(X_ref, min(X_med, X_lo))   (no X_lo: max(X_ref, X_med); no X_ref: X_med)
+// A disturbance (swap-in, page fault) can only slow a read, so the reads can raise X above the reference - when both statistics agree
+// it is faster - but never push it below: a burst that slows the settled reads cannot lower the limit (review 18a: 0 wrong-low on every
+// injected burst, by construction).  The cost: a real lasting slow-down of the staged path no longer lowers X either; it shows as an OPEN
+// bracket with X_med = X_lo below X_ref on every cold start (no record is written, every start reads) - the stale-reference rule
+// (DETAILS.md) turns that into a re-measure of ref_start.  With the key present, level 1 is max(key, X); while X_ref equals the key (as
+// at today's M1) this is the same X as C3 with the key on every set of reads (q4keyless design 3.5).  Edge cases: no X from the median ->
+// not bracketed (today's paths); no X_ref -> X = X_med; no X from the 2nd smallest (below IQ3's guard) -> max(X_ref, X_med).  The cache
+// takes X only when the bracket is CLOSED (X_med = X_lo = X_ref, so X = X_ref) and stable_X holds: a raised or floor-held X is never
+// written.  derive, rule_c.py and the stored vectors are unchanged: the bracket sits in apply_limit and the cache condition.
 struct Bracket {
     bool on = false;                                  ///< bracketed (an X from the median and 8 reads); off -> apply_limit uses Result::X
     double s_lo = 0, s_ref = 0;                       ///< the 2nd-smallest settled read; the reference start (0: none)
     int64_t X_med = -1, X_lo = -1, X_ref = -1, X = -1;
-    std::string note;                                 ///< why X is not the clamp of X_ref (an edge case), empty otherwise
+    std::string note;                                 ///< an edge case, or why X is not X_ref (floor held / raised); empty when X = X_ref from the reads
     bool closed() const { return on && X_med > 0 && X_med == X_lo && X_lo == X_ref; }
     /// why the cache refuses this X (empty when closed)
     std::string open_why() const {
@@ -255,14 +275,16 @@ inline bool start_read_lo(const std::vector<double>& r, double& out) {
     out = v[1];
     return true;
 }
-/// the combination alone (X_med > 0; X_lo / X_ref -1 when the rule gave none)
+/// the combination alone (X_med > 0; X_lo / X_ref -1 when the rule gave none).  Review 18a option (e): X = max(X_ref, min(X_med, X_lo))
 inline void bracket_combine(Bracket& b) {
     b.on = true;
     if (b.X_ref < 0) { b.X = b.X_med; b.note = "no reference X: X_med"; return; }
-    if (b.X_lo < 0) { b.X = b.X_med; b.note = "no X from the 2nd-smallest read: X_med"; return; }
-    const int64_t lo = std::min(b.X_med, b.X_lo), hi = std::max(b.X_med, b.X_lo);
-    b.X = std::min(std::max(b.X_ref, lo), hi);
-    b.note.clear();
+    const int64_t lo = b.X_lo < 0 ? b.X_med : std::min(b.X_med, b.X_lo);
+    b.X = std::max(b.X_ref, lo);   // the reads may raise X above the reference (both statistics agree), never lower it
+    if (b.X_lo < 0) b.note = "no X from the 2nd-smallest read: max(X_ref, X_med)";
+    else if (b.X > b.X_ref) b.note = "raised: both statistics above X_ref";
+    else if (b.X_med < b.X_ref && b.X_lo < b.X_ref) b.note = "floor: both statistics below X_ref, X_ref holds";
+    else b.note.clear();
 }
 /// the bracket of a load: r = derive(p, f, reads, ...).  Not derived (or fewer than 8 reads) -> on = false, today's paths
 inline Bracket bracket(const Pack& p, const Facts& f, const std::vector<double>& reads, const Result& r) {
@@ -271,7 +293,7 @@ inline Bracket bracket(const Pack& p, const Facts& f, const std::vector<double>&
     b.X_med = r.X;
     const Result lo = derive_from_start(p, f, b.s_lo, -1);
     if (lo.derived) b.X_lo = lo.X;
-    if (!ref_start(p, b.s_ref)) b.s_ref = 0;
+    if (!ref_start(p, f, b.s_ref)) b.s_ref = 0;
     ref_X(p, f, b.X_ref);   // (left -1 when there is none)
     bracket_combine(b);
     return b;
@@ -458,6 +480,67 @@ inline uint64_t args_env_hash(const std::vector<std::string>& cmdline, const std
     for (const std::string& kv : env) { h = fnv_str(kv, h); h = fnv_str(std::string(1, '\0'), h); }
     return h;
 }
+/// a whole word as a positive finite number (no trailing characters); false otherwise
+inline bool pos_number(const std::string& w, double& out) {
+    if (w.empty()) return false;
+    char* end = nullptr;
+    const double v = std::strtod(w.c_str(), &end);
+    if (end == w.c_str() || *end != '\0' || !std::isfinite(v) || !(v > 0)) return false;
+    out = v;
+    return true;
+}
+/// review 18a R2: this host's facts for a table's `host` line - `cpu=<model name> gpu=<vendor:device:revision> link=<GT/s>_x<width>`
+/// (spaces in the CPU name as '_').  cpu: /proc/cpuinfo's first "model name".  gpu: the card's PCI ids (sysfs).  link: the card's
+/// top PCIe link - between the root port and the first device below it on the card's sysfs path (on a card with its own switch, the
+/// switch's upstream port) - as the lower of the two ends' max_link_speed and max_link_width (static: current_link_* drop at idle).
+/// tools/make_planner_table.py's host_facts() computes the same string.  root: a prefix for /proc and /sys (tests); unknown -> "?".
+inline std::string host_facts(const std::string& pci, const std::string& root = "") {
+    auto read1 = [](const std::string& path) { std::string v; if (std::FILE* fh = std::fopen(path.c_str(), "r")) { char b[256] = "";
+        if (std::fgets(b, sizeof b, fh)) v = b; std::fclose(fh); } while (!v.empty() && isspace((unsigned char) v.back())) v.pop_back(); return v; };
+    std::string cpu = "?";
+    if (std::FILE* fh = std::fopen((root + "/proc/cpuinfo").c_str(), "r")) {
+        char b[1024];
+        while (std::fgets(b, sizeof b, fh)) {
+            std::string l = b;
+            if (l.compare(0, 10, "model name") != 0) continue;
+            const size_t c = l.find(':'); if (c == std::string::npos) continue;
+            size_t a = l.find_first_not_of(" \t", c + 1); if (a == std::string::npos) continue;
+            l = l.substr(a); while (!l.empty() && isspace((unsigned char) l.back())) l.pop_back();
+            std::string o; bool sp = false;
+            for (char ch : l) { if (isspace((unsigned char) ch)) { sp = true; continue; } if (sp && !o.empty()) o += '_'; sp = false; o += ch; }
+            if (!o.empty()) cpu = o;
+            break;
+        }
+        std::fclose(fh);
+    }
+    std::string id = pci; for (char& ch : id) ch = (char) tolower((unsigned char) ch);
+    const std::string dev = root + "/sys/bus/pci/devices/" + id;
+    auto hex = [&](const std::string& f) { std::string v = read1(dev + "/" + f); if (v.compare(0, 2, "0x") == 0) v = v.substr(2); return v; };
+    const std::string ven = hex("vendor"), did = hex("device"), rev = hex("revision");
+    const std::string gpu = ven.empty() || did.empty() || rev.empty() ? "?" : ven + ":" + did + ":" + rev;
+    std::string link = "?";
+    {
+        // the device's real path: /sys/devices/pci0000:00/<root port>/<first device below it>/.../<card>
+        std::string real;
+#if !defined(_WIN32)
+        char rp[4096];
+        if (realpath(dev.c_str(), rp)) real = rp;
+#endif
+        const size_t k0 = real.find("/sys/devices/pci"), k = k0 == std::string::npos ? k0 : k0 + 12;   // k: the "/pciDDDD:BB" part
+        if (k != std::string::npos) {
+            std::vector<std::string> parts; size_t i = real.find('/', k + 1);
+            while (i != std::string::npos) { const size_t j = real.find('/', i + 1); parts.push_back(real.substr(i + 1, j == std::string::npos ? std::string::npos : j - i - 1)); i = j; }
+            if (parts.size() >= 2) {
+                const std::string base = real.substr(0, real.find('/', k + 1));
+                const std::string a = base + "/" + parts[0], b = a + "/" + parts[1];
+                const double sa = std::atof(read1(a + "/max_link_speed").c_str()), sb = std::atof(read1(b + "/max_link_speed").c_str());
+                const int wa = std::atoi(read1(a + "/max_link_width").c_str()), wb = std::atoi(read1(b + "/max_link_width").c_str());
+                if (sa > 0 && sb > 0 && wa > 0 && wb > 0) { char lb[64]; std::snprintf(lb, sizeof lb, "%.1fGT/s_x%d", std::min(sa, sb), std::min(wa, wb)); link = lb; }
+            }
+        }
+    }
+    return "cpu=" + cpu + " gpu=" + gpu + " link=" + link;
+}
 // ---- loading (the pack's line format, pack_export.py) ----
 inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, std::string& err) {
     std::FILE* fh = std::fopen(path.c_str(), "r");
@@ -475,9 +558,15 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
         else if (k == "counts_file") p.counts_file = words.at(1);
         else if (k == "engine_pack") p.engine_pack = words.at(1);
         else if (k == "profile") p.profile_hash = std::stoull(words.at(1), nullptr, 16);   // review 15 D1
-        else if (k == "ref_start") {   // review 16/17 D10
-            p.ref_start_ms = std::stod(words.at(1));
-            if (!(p.ref_start_ms > 0) || !std::isfinite(p.ref_start_ms)) { err = "bad ref_start line"; return false; }
+        else if (k == "ref_start") {   // review 16/17 D10; review 18a A1: `ref_start MS [GB/s]` - one or two positive finite numbers
+            if (words.size() < 2 || words.size() > 3 || !pos_number(words[1], p.ref_start_ms) || (words.size() == 3 && !pos_number(words[2], p.ref_m1_gbs))) {
+                err = "bad ref_start line (want: ref_start MS [GB/s], positive numbers)"; return false;
+            }
+        }
+        else if (k == "host") {   // review 18a R2: the builder host's facts (compared with host_facts() at load; a difference is a warning)
+            const size_t a = s.find_first_not_of(" \t", s.find("host") + 4);
+            p.host = a == std::string::npos ? "" : s.substr(a);
+            while (!p.host.empty() && (p.host.back() == '\n' || p.host.back() == '\r' || p.host.back() == ' ' || p.host.back() == '\t')) p.host.pop_back();
         }
         else if (k == "probe_tokens") {   // probe_tokens <variant> id,id,...
             const size_t v = (size_t) std::stoi(words.at(1));

@@ -17,15 +17,30 @@ predicted faster than streaming every expert.  What the rule needs that is not a
   profile                        the FNV-1a 64 hash of the expert profile (--expert-profile) the builder run loaded: the
                                  rule's residency and the staged times come from its ranking, so the engine refuses the
                                  table under any other profile (a new profile means a new builder run and table)
-  ref_start                      (optional, --ref-start MS) the reference start read in the ENGINE's own statistic: the mean
-                                 of the start reads (the median of reads 4-8 of `--planner`'s 8 canned reads) over validated
-                                 cold engine derivations on this host and table.  The rule at this value on a load's facts is
-                                 level 3 (key absent, no X this load) and the bracket's X_ref.  Without the line the engine
-                                 uses the builder's English median at start - 7, a different statistic (the builder's staged
-                                 reads, about 4-16 ms off the engine's).  The shipped values (1657.1 / 1885.7 / 2426.3 ms for
-                                 IQ3_S / IQ4_XS / Q4_K_XL) are the means of 20 cold `--planner` loads per quant on build
-                                 build-hip-apply (results/planner-20261112/next/apply20/tally.txt, keys present, 2026-11-13).
-
+  ref_start MS GB/s               (optional, --ref-logs LOG...) the reference start read in the ENGINE's own statistic and
+                                 the link rate it was measured at, both COMPUTED here from named engine logs (review 18a R1:
+                                 no typed number): MS = the mean of the start reads (the outcome line's `start`, the median of
+                                 reads 4-8 of `--planner`'s 8 canned reads) and GB/s = the mean M1 (the ON line's `M1`) of at
+                                 least 20 cold --planner loads of this quant on this host.  Refused: fewer than 20 loads, a
+                                 cache hit or anything but 8 reads, a bracket logged OPEN, an M1 that did not settle (review
+                                 17c D11: logged, or the same test on the logged passes for builds before C3), loads that do
+                                 not share one X, one engine binary (exe=), card, slots and bytes, a log of another --pack or
+                                 another host.  A comment line above it records the count, the engine hash and the checks.
+                                 The engine evaluates the rule at this value on a load's facts - level 3 (key absent, no X
+                                 this load) and the bracket's X_ref, the floor under option (e) (review 18a) - with the start
+                                 read's copy part moved to the load's M1 (A1: MS + copy_staged(start - 7) * (1 - M1 / GB/s)).
+                                 Without the line the engine uses the builder's English median at start - 7, a different
+                                 statistic (the builder's staged reads, about 4-16 ms off the engine's).  The one-field form
+                                 `ref_start MS` (the reference used as measured, at any M1) still loads: the shipped IQ4
+                                 table keeps it (1885.7 ms) until its reference is re-measured.  The apply20 logs
+                                 (results/planner-20261112/next/apply20, 20 cold loads per quant, build-hip-apply, keys
+                                 present, 2026-11-13) give 1657.1 / 1885.7 / 2426.3 ms for IQ3_S / IQ4_XS / Q4_K_XL.
+                                 Stale-reference rule (review 18a R2): under option (e) a reference that no longer holds shows
+                                 as OPEN brackets with X_med = X_lo below X_ref; two such misses on different starts of one
+                                 entry -> re-measure (20 cold loads) and rebuild the table with --ref-logs.
+  host                           (always) this host's facts - `cpu=<model name> gpu=<vendor:device:revision> link=<GT/s>_x<w>`
+                                 (planner_c::host_facts, the same string): the builder's and the reference loads' host.  The
+                                 engine logs a WARNING at load when its host differs; a table is rebuilt on each host.
 Only the lengths the rule reads are kept: the start read's part (start - 7) and the rungs that bracket the crossing
 search [lo, hi) - the rule interpolates between neighbouring rungs, so the others never enter X.
 
@@ -36,12 +51,14 @@ reads must come in text order, `--reads-per-text` staged reads each (the shipped
 
     python tools/make_planner_table.py --log ENGINE.LOG --counts COUNTS.bin --quant iq4 --engine-pack unsloth-ud-iq4_xs \\
         --stream-compute A B --o-s X --probe-tokens PROBES.txt --profile data/expert-profile.bin \\
-        --out data/planner/qwen-iq4.txt
+        --ref-logs RUN1/engine.log ... RUN20/engine.log --out data/planner/qwen-iq4.txt
 
 writes OUT and OUT with `.txt` replaced by `.counts`.  PROBES.txt: one line per variant, comma-separated ids.
 """
 import argparse
+import os
 import re
+import socket
 import statistics
 import struct
 from pathlib import Path
@@ -114,6 +131,116 @@ def classes(counts, maxt):
     return bytes(flat[i] | flat[i + 1] << 2 | flat[i + 2] << 4 | flat[i + 3] << 6 for i in range(0, len(flat), 4))
 
 
+def host_facts(pci, root=""):
+    """planner_c::host_facts: `cpu=<model name, spaces as _> gpu=<vendor:device:revision> link=<GT/s>_x<width>`; the link is
+    the card's top PCIe link (root port and the first device below it on the card's sysfs path), the lower of the two ends'
+    max_link_speed / max_link_width; '?' for a fact that cannot be read"""
+    def read1(path):
+        try:
+            return Path(path).read_text().strip()
+        except OSError:
+            return ""
+    cpu = "?"
+    for ln in read1(root + "/proc/cpuinfo").splitlines():
+        if ln.startswith("model name") and ":" in ln:
+            v = "_".join(ln.split(":", 1)[1].split())
+            if v:
+                cpu = v
+                break
+    dev = f"{root}/sys/bus/pci/devices/{pci.lower()}"
+    ids = [read1(f"{dev}/{f}") for f in ("vendor", "device", "revision")]
+    ids = [i[2:] if i.startswith("0x") else i for i in ids]
+    gpu = ":".join(ids) if all(ids) else "?"
+    link = "?"
+    real = os.path.realpath(dev) if os.path.exists(dev) else ""
+    k0 = real.find("/sys/devices/pci")
+    if k0 >= 0:
+        k = k0 + 12
+        base_end = real.find("/", k + 1)
+        parts = real[base_end + 1:].split("/") if base_end >= 0 else []
+        if len(parts) >= 2:
+            a = real[:base_end] + "/" + parts[0]
+            b = a + "/" + parts[1]
+            def num(x, f):
+                m = re.match(r"\s*([\d.]+)", read1(x))
+                return f(m.group(1)) if m else 0
+            sa, sb = num(a + "/max_link_speed", float), num(b + "/max_link_speed", float)
+            wa, wb = num(a + "/max_link_width", int), num(b + "/max_link_width", int)
+            if sa > 0 and sb > 0 and wa > 0 and wb > 0:
+                link = f"{min(sa, sb):.1f}GT/s_x{min(wa, wb)}"
+    return f"cpu={cpu} gpu={gpu} link={link}"
+
+
+def m1_settled(passes, tol=0.0025):
+    """review 17c D11 (planner_c::m1_from_passes): the last three passes within tol of each other"""
+    if len(passes) < 3:
+        return False
+    v = sorted(passes[-3:])
+    return v[2] <= v[0] * (1.0 + tol)
+
+
+def ref_from_logs(paths, engine_pack, minimum=20):
+    """review 18a R1: the reference start read and its M1 from named cold --planner engine logs (see the docstring's
+    ref_start).  -> (mean start ms, mean M1 GB/s, the comment line, the card's PCI id)"""
+    rows, seen = [], set()
+    for p in paths:
+        rp = os.path.realpath(p)
+        if rp in seen:
+            raise SystemExit(f"{p}: named twice")
+        seen.add(rp)
+        s = Path(p).read_text(errors="replace")
+        outs = re.findall(r"^strata planner: (?:APPLIED|KEPT) .*$", s, re.M)
+        if len(outs) != 1:
+            raise SystemExit(f"{p}: {len(outs)} planner outcome lines (one --planner load per log)")
+        o = outs[0]
+        pk = re.search(r"--pack \S*?([^/\s]+)(?:\s|$)", s)
+        if not pk or pk.group(1) != engine_pack:
+            raise SystemExit(f"{p}: a load of --pack {pk.group(1) if pk else '?'}, not {engine_pack}")
+        if "cache hit" in o:
+            raise SystemExit(f"{p}: a cache hit, not a cold load (no start reads)")
+        st = re.search(r"start ([\d.]+) ms reads (\d+)/(\d+)", o)
+        if not st or st.group(2) != "8":
+            raise SystemExit(f"{p}: not an 8-read derivation ({st.group(0) if st else 'no start read'})")
+        start = float(st.group(1))
+        reads = [float(x) for x in re.findall(r"strata plan: part 0-2047 .*?\| ([\d.]+) ms", s[:s.index(o)])]
+        if len(reads) != 8 or abs(statistics.median(reads[3:8]) - start) > 0.051:
+            raise SystemExit(f"{p}: {len(reads)} start-read plan lines whose median of reads 4-8 is not the logged start {start}")
+        on = re.search(r"strata planner shadow: ON - host=(\S+) exe=(\w+) pack=\w+.*? gpu=(\S+) .*?slots=(\d+) bytes=(\d+).*?; M1 ([\d.]+) GB/s", s)
+        if not on:
+            raise SystemExit(f"{p}: no planner ON line (host, exe, card, slots, M1)")
+        mp = re.search(r"M1 passes([\d. ]+) GB/s(?:, (NOT settled|settled) after \d+)?", s)
+        passes = [float(x) for x in mp.group(1).split()] if mp else []
+        settled = (mp.group(2) == "settled") if mp and mp.group(2) else m1_settled(passes)
+        if not settled:
+            raise SystemExit(f"{p}: M1 did not settle (passes {' '.join(map(str, passes)) or 'not logged'})")
+        br = re.search(r"bracket X_med (-?\d+) X_lo (-?\d+) X_ref (-?\d+) -> X (-?\d+) \((closed|OPEN)", o)
+        if br and br.group(5) != "closed":
+            raise SystemExit(f"{p}: the bracket is OPEN ({br.group(0)})")
+        xm = re.search(r"\| X (-?\d+) configured", o)
+        X = int(br.group(1)) if br else int(xm.group(1)) if xm else -1
+        rows.append(dict(path=p, start=start, m1=float(on.group(6)), host=on.group(1), exe=on.group(2), gpu=on.group(3),
+                         slots=on.group(4), bytes=on.group(5), X=X, closed=bool(br)))
+    if len(rows) < minimum:
+        raise SystemExit(f"--ref-logs: {len(rows)} loads, at least {minimum} needed")
+    for k in ("X", "exe", "gpu", "slots", "bytes", "host"):
+        vals = sorted({str(r[k]) for r in rows})
+        if len(vals) != 1:
+            raise SystemExit(f"--ref-logs: the loads do not share one {k}: {', '.join(vals)}")
+    if rows[0]["X"] <= 0:
+        raise SystemExit("--ref-logs: the loads derived no X")
+    here = socket.gethostname()
+    if rows[0]["host"] != here:
+        raise SystemExit(f"--ref-logs: the loads ran on {rows[0]['host']}, this is {here} (the table's host line is this host's)")
+    ms = statistics.fmean(r["start"] for r in rows)
+    m1 = statistics.fmean(r["m1"] for r in rows)
+    nc = sum(r["closed"] for r in rows)
+    lo, hi = min(r["start"] for r in rows), max(r["start"] for r in rows)
+    note = (f"# ref_start: computed by make_planner_table.py --ref-logs from {len(rows)} cold --planner loads (engine exe {rows[0]['exe']}, "
+            f"card {rows[0]['gpu']}, slots {rows[0]['slots']}, X {rows[0]['X']} on all; bracket closed on {nc}, not logged on {len(rows) - nc} "
+            f"(builds before C); M1 settled on all): mean start {ms:.2f} ms [{lo}, {hi}], mean M1 {m1:.4f} GB/s")
+    return ms, m1, note, rows[0]["gpu"]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--log", required=True, help="the builder run's engine log")
@@ -126,12 +253,14 @@ def main():
     ap.add_argument("--profile", required=True, help="the --expert-profile file the builder run loaded (its hash goes in the table)")
     ap.add_argument("--texts", type=int, default=3, help="texts in the builder run, in order (english, code, chinese)")
     ap.add_argument("--reads-per-text", type=int, default=44)
-    ap.add_argument("--ref-start", type=float, default=None, metavar="MS",
-                    help="the reference start read in the engine's own statistic (ms): the mean start of validated cold --planner loads")
+    ap.add_argument("--ref-logs", nargs="+", default=None, metavar="LOG",
+                    help="engine logs of >= 20 cold --planner loads of this quant on this host: ref_start = their mean start and M1")
+    ap.add_argument("--card", default=None, help="the card's PCI id for the host line (default: the --ref-logs loads' card, else 0000:03:00.0)")
     ap.add_argument("--out", required=True, help="the table (.txt); the counts go next to it as .counts")
     a = ap.parse_args()
-    if a.ref_start is not None and not (0 < a.ref_start < 1e6):
-        raise SystemExit(f"--ref-start {a.ref_start}: not a start read in ms")
+    ref = ref_from_logs(a.ref_logs, a.engine_pack) if a.ref_logs else None
+    card = a.card or (ref[3] if ref else "0000:03:00.0")
+    host = host_facts(card)
     c = dict(CONST)
     chunks = read_counts(a.counts, c["layers"], c["experts"])
     rows = plan_rows(a.log)
@@ -162,9 +291,9 @@ def main():
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     cpath = out.with_suffix(".counts")
-    L = [f"quant {a.quant}", f"engine_pack {a.engine_pack}", f"profile {fnv1a64(a.profile):016x}", f"counts_file {cpath.name}", f"n_chunks {len(out_chunks)}",
-         f"win {repr(float(window_ms(a.log)))}", f"stream_compute {repr(a.stream_compute[0])} {repr(a.stream_compute[1])}",
-         f"o_s {repr(a.o_s)}"] + ([f"ref_start {repr(float(a.ref_start))}"] if a.ref_start is not None else []) + ["const " + " ".join(f"{k} {v}" for k, v in c.items())]
+    L = [f"quant {a.quant}", f"engine_pack {a.engine_pack}", f"profile {fnv1a64(a.profile):016x}", f"host {host}", f"counts_file {cpath.name}",
+         f"n_chunks {len(out_chunks)}", f"win {repr(float(window_ms(a.log)))}", f"stream_compute {repr(a.stream_compute[0])} {repr(a.stream_compute[1])}",
+         f"o_s {repr(a.o_s)}"] + ([ref[2], f"ref_start {ref[0]:.1f} {ref[1]:.4f}"] if ref else []) + ["const " + " ".join(f"{k} {v}" for k, v in c.items())]
     L += [f"probe_tokens {v} {p}" for v, p in enumerate(probes)]
     out.write_text("\n".join(L + lines_text) + "\n")
     body = b"".join(struct.pack("<i", T) + classes(cnt, c["maxt"]) for T, cnt in out_chunks)

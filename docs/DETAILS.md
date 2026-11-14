@@ -1879,20 +1879,43 @@ derived limit: the rule at the table's own reference start read (a warning); no 
 not an error): the engine default. Every start prints one line, `strata planner: APPLIED staged limit N (level ...)`
 or `NOT APPLIED (why), limit N in force`, with the limit read back from the prompt path.
 
-A slow read (a swap-in, a page fault) can only slow a read, so the derived limit is bracketed by two statistics of the
-same 8 reads: X_med (the rule at the median of reads 4-8), X_lo (at the 2nd smallest of reads 4-8) and X_ref (at the
-table's reference start read, on this load's facts). The limit is X_ref held between X_med and X_lo: it moves down
-only when even the 2nd-fastest settled read says so. The line's `X` is that limit, and the segment
-`| bracket X_med a X_lo b X_ref c -> X d (closed|OPEN; 2nd-smallest s ms, reference r ms)` shows the three; `OPEN`
-means they differ (the reads straddle a step, or the reference disagrees), and such an X is applied for that load
-only, never cached. `vmstat over the probes: pswpin +n pgmajfault +m` is the host's swap-ins and major faults during
-the 8 reads.
+A slow read (a swap-in, a page fault) can only slow a read, so the derived limit uses two statistics of the same 8
+reads: X_med (the rule at the median of reads 4-8) and X_lo (at the 2nd smallest of reads 4-8), and X_ref (the rule at
+the table's reference start read, on this load's facts). **The reference is a floor**: the limit is
+max(X_ref, min(X_med, X_lo)) (no X_lo: max(X_ref, X_med); no X_ref: X_med). The reads can raise it above X_ref, when
+both statistics say the staged path is faster, but never push it below: a burst that slows the settled reads cannot
+lower the limit. The line's `X` is that limit, and the segment
+`| bracket X_med a X_lo b X_ref c -> X d (closed|OPEN; 2nd-smallest s ms, reference r ms)` shows the three; `closed`
+means all three agree (X = X_ref), and only then is X cached. `OPEN` means they differ, and the X is applied for that
+load only, never cached, so every start reads its 8 reads again: either the reads straddle a step, or a burst slowed
+them (`floor: both statistics below X_ref, X_ref holds`), or the reads are faster (`raised: both statistics above
+X_ref`), or **the reference no longer holds for this host or engine** - a slower staged path (a CPU, memory or engine
+change) no longer lowers the limit; it shows only as `OPEN` with X_med = X_lo below X_ref on every cold start. With
+`STRATA_PREFILL_CPU_SHARE_MAX` set the limit is the larger of the key and X, so while X_ref equals the key (as the
+shipped tables do at their own link rate) a table with the key and one without give the same limit on any reads.
+`vmstat over the probes: pswpin +n pgmajfault +m` is the host's swap-ins and major faults during the 8 reads.
 
-The reference start read is the table's `ref_start` line: the mean start read (median of reads 4-8) of validated cold
-`--planner` loads on the host the table was built on, i.e. the engine's own statistic (shipped tables: 1657.1 / 1885.7
-/ 2426.3 ms for IQ3_S / IQ4_XS / Q4_K_XL, each the mean of 20 cold loads, keys present). A table without the line uses
-the builder's English median at 2041 tokens, a different statistic (the builder's staged reads, 4-16 ms off the
-engine's). The reference is also the limit when a load derives none (key unset).
+**The stale-reference rule** (for an entry that runs without the key): a cache miss whose bracket is `OPEN` with
+X_med = X_lo != X_ref is a note (record the 2nd-smallest read and the reference). Two such misses on different starts
+of one entry: stop, re-measure the reference (20 cold loads) and rebuild the table with `--ref-logs`. Three starts in a
+row that do not cache, for any reason: report. A new engine binary on such an entry needs one cold start in staging
+whose bracket is closed; an open one blocks it until the reference is re-measured.
+
+The reference start read is the table's `ref_start MS [GB/s]` line: the mean start read (median of reads 4-8) of
+validated cold `--planner` loads on the host the table was built on, i.e. the engine's own statistic (shipped tables:
+1657.1 / 1885.7 / 2426.3 ms for IQ3_S / IQ4_XS / Q4_K_XL, each the mean of 20 cold loads, keys present), and,
+optionally, the mean link rate of those loads. With the link rate, the engine carries the reference to this load's
+link rate: MS + copy_staged(2041) * (1 - M1 / GB/s), the start read's copy part at this load's rate (without it a link
+x% slower than the reference loads' books x% of that copy, 11-21 ms per 1%, as staged compute). A line with one field
+is used as measured (the shipped IQ4 table, until its reference is re-measured); a second field that is not a positive
+rate refuses the table. A table without the line uses the builder's English median at 2041 tokens, a different
+statistic (the builder's staged reads, 4-16 ms off the engine's). The reference is also the limit when a load derives
+none (key unset).
+
+A table also carries a `host cpu=... gpu=... link=...` line: the builder host's CPU model, the card's PCI vendor, device
+and revision, and its top PCIe link (the lower of the two ends' maximum speed and width). The engine compares it with
+its own host and card and prints `strata planner: WARNING: the table was built on another host (...)` when they differ;
+the table is still used. Tables without the line (the shipped ones) print nothing.
 
 The 8 reads cost about 18-28 s of load. The result is cached in the directory of the engine's log (its stderr, when
 that is a file), as `TABLE.<PCI id>.<8 hex>.x-cache` (one record per table, card and variant - the 8 hex digits
@@ -1929,13 +1952,19 @@ means a new builder run and table.** The shipped files (built under `data/expert
 
     python tools/make_planner_table.py --log b-iq4/flash-iq4-1gpu/engine.log --counts counts-iq4.bin --quant iq4 \
         --engine-pack unsloth-ud-iq4_xs --stream-compute 293.1085792824071 0.2311197916666667 --o-s 115.30553535527179 \
-        --probe-tokens probe-iq4.txt --profile data/expert-profile.bin --ref-start 1885.7 --out data/planner/qwen-iq4.txt
+        --probe-tokens probe-iq4.txt --profile data/expert-profile.bin --ref-logs apply20/iq4-*/flash-iq4-1gpu/engine.log \
+        --out data/planner/qwen-iq4.txt
 
-(IQ3_S: `--engine-pack qwen-iq3_s`, `--ref-start 1657.1`, Q4_K_XL: `unsloth-ud-q4_k_xl`, `--ref-start 2426.3`, their own
-`--stream-compute` / `--o-s` as in the tables' header lines.) `--ref-start` is measured after the table exists: start
-the engine with the table (without the line) a number of times cold, take the `start ... ms` of each outcome line, and
-pass their mean; without `--ref-start` the table has no line. A table is specific to the host it was measured on; on another machine build your own from a
-builder run of your own prompts, or leave `--planner` off.
+(IQ3_S: `--engine-pack qwen-iq3_s`, Q4_K_XL: `unsloth-ud-q4_k_xl`, their own `--stream-compute` / `--o-s` as in the
+tables' header lines.) The reference is measured after the table exists: start the engine with the table (without the
+line) at least 20 times cold, then rebuild with `--ref-logs` naming those engine logs. The builder computes the line
+from them - the mean of the outcome lines' `start ... ms` and of the `M1` - and writes a comment above it with the
+count and the engine hash; it refuses fewer than 20 loads, a cache hit, a load without 8 reads, an `OPEN` bracket, an
+M1 that did not settle, loads that disagree on X, binary, card, slots or bytes, and logs of another `--pack` or host.
+Without `--ref-logs` the table has no line. (The shipped IQ4 table keeps its one-field line, 1885.7, made from the
+same 20 logs before the builder computed it; `--ref-logs` on those logs gives `ref_start 1885.7 13.6721`, and 1657.1
+13.5870 / 2426.3 13.7771 for IQ3_S / Q4_K_XL.) A table is specific to the host it was measured on; on another
+machine build your own from a builder run of your own prompts, or leave `--planner` off.
 
 ## Missed experts in a verify window: the tail is skipped (on by default on CUDA, `STRATA_ROUTE_TAIL_SKIP`)
 

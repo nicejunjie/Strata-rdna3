@@ -7,6 +7,9 @@
 //      log under results/planner-20261112/next/ with 8 counted reads up to 11-14 01:57), for the bracket's checks)
 //    - M1 (argv[6]) defaults to src/program/planner_c_test_m1.txt: review 17c's 171 logged loads (tag, quant, the three M1 passes, the
 //      ON line's M1), for m1_from_passes (D11)
+//    - review 18a (build C4): option (e) "the reference is a floor" - bracket_combine is max(X_ref, min(X_med, X_lo)); C3's clamp is kept
+//      here as c3_combine so every C3 number below is still checked against C3, and (e)'s against its own expected values; A1 (the
+//      reference carried to the load's M1) and R2 (the host line) vectors are in the "review 18a" section
 #include "strata/program/planner_c.hpp"
 #include <cstdio>
 #include <sstream>
@@ -15,6 +18,11 @@
 #include <tuple>
 #include <unistd.h>
 using namespace strata::program::planner_c;
+// build C3's combination (review 16 D8), kept to check that the C4 numbers differ from C3 only where review 18a says they do
+static int64_t c3_combine(int64_t X_med, int64_t X_lo, int64_t X_ref) {
+    if (X_ref < 0 || X_lo < 0) return X_med;
+    return std::min(std::max(X_ref, std::min(X_med, X_lo)), std::max(X_med, X_lo));
+}
 int main(int argc, char** argv) {
     if (argc < 4) { std::fprintf(stderr, "usage: %s PACKDIR COUNTSDIR PROFILE [VECTORS]\n", argv[0]); return 2; }
     const std::string pd = argv[1], cd = argv[2], prof = argv[3];
@@ -306,6 +314,7 @@ int main(int argc, char** argv) {
         for (const Vec& v : allvec) if (v.tag == "builder-" + v.q) base[v.q] = v.f;
         struct Load { std::string tag, q, build; int64_t slots = 0; double bytes = 0, m1 = 0; int64_t X = -1; int spec = 4; std::vector<double> r; bool vec = false; };
         std::vector<Load> L;
+        std::map<std::string, Load> aside;   // review 18a item 5: the first apply build's loads (apply1-*), kept out of L as fix.cpp does
         {
             std::ifstream in(argc > 5 ? std::string(argv[5]) : std::string("src/program/planner_c_test_reads.txt")); std::string ln;
             int nlines = 0;
@@ -317,7 +326,7 @@ int main(int argc, char** argv) {
                 l.spec = spec == "?" ? 4 : std::stoi(spec);
                 double v; while (a >> v) l.r.push_back(v);
                 if (l.r.size() != 8 || l.X <= 0) continue;
-                if (l.build == "build-hip-apply" && l.tag.rfind("apply1-", 0) == 0) continue;   // fix.cpp: the first apply build's single loads
+                if (l.build == "build-hip-apply" && l.tag.rfind("apply1-", 0) == 0) { aside[l.tag] = l; continue; }   // fix.cpp: the first apply build's single loads
                 L.push_back(l);
             }
             bchk("the read series file", nlines == 131 && L.size() == 127, std::to_string(nlines) + " lines, " + std::to_string(L.size()) + " engine loads (want 131, 127)");
@@ -372,15 +381,48 @@ int main(int argc, char** argv) {
             }
             if (l.tag == "pilot/item5/dec/min-cand-4")
                 bchk("min-cand-4 (--spec 2): 5889 / 6145 / 6145 -> 6145, open", b.X_med == 5889 && b.X_lo == 6145 && b.X_ref == 6145 && b.X == 6145 && !cache_new, "X " + std::to_string(b.X));
-            if (l.tag == "pilot/item5/dec/min-cand-1")
-                bchk("min-cand-1 (--spec 2): 5889 / 5889 / 6145 -> 5889, open", b.X_med == 5889 && b.X_lo == 5889 && b.X_ref == 6145 && b.X == 5889 && !cache_new, "X " + std::to_string(b.X));
+            if (l.tag == "pilot/item5/dec/min-cand-1")   // review 18a: C3 5889, C4 6145 (the reference is a floor)
+                bchk("min-cand-1 (--spec 2): 5889 / 5889 / 6145 -> 6145 (C3 5889), open", b.X_med == 5889 && b.X_lo == 5889 && b.X_ref == 6145 && b.X == 6145 && !b.closed() && !cache_new &&
+                     c3_combine(b.X_med, b.X_lo, b.X_ref) == 5889, "X " + std::to_string(b.X) + " (C3 " + std::to_string(c3_combine(b.X_med, b.X_lo, b.X_ref)) + ") " + b.open_why());
         }
         bchk("the logged X = X_med (derive) on every engine load", parity == 127 && nengine == 127, std::to_string(parity) + " of " + std::to_string(nengine) + " (want 127 of 127)");
         std::printf("bracket  X_ref differs from C's builder-median reference on %d of %zu loads:%s\n", ref_moved, L.size(), ref_moved_tags.c_str());
         bchk("clean loads: the limit and the cache decision unchanged", clean == 184 && clean_same == 184, std::to_string(clean_same) + " of " + std::to_string(clean) + " (want 184 of 184)");
-        // fix.out's totals table (S0 / S2 / bracket open / cache B / cache new)
+        {   // ---- review 18a item 5: (e) on a lasting shift of the staged path and on a burst (key absent, level 2) ----
+            auto run = [&](const Load& l, const std::vector<double>& rd, int64_t want, int64_t want_c3, const std::string& what) {
+                const Pack& p = packs.at(l.q); const Facts f = facts_of(l);
+                const Result r = derive(p, f, rd, -1); const Bracket b = bracket(p, f, rd, r);
+                std::string why; const bool st = stable_X(p, f, r, -1, why);
+                const bool cached = st && b.closed();   // the engine's write condition (and M1 settled)
+                int lvl = 0; std::string note; const int64_t lim = apply_limit(&p, f, &r, -1, 3072, lvl, note, &b);
+                const int64_t c3 = c3_combine(b.X_med, b.X_lo, b.X_ref);
+                char d[240]; std::snprintf(d, sizeof d, "X_med %lld X_lo %lld X_ref %lld -> X %lld, applied %lld level %d, %s, %s | C3 %lld",
+                                           (long long) b.X_med, (long long) b.X_lo, (long long) b.X_ref, (long long) b.X, (long long) lim, lvl,
+                                           b.closed() ? "closed" : "OPEN", cached ? "cached" : "not cached", (long long) c3);
+                bchk(what, b.on && b.X == want && lim == want && lvl == 2 && !b.closed() && !cached && c3 == want_c3, d);
+            };
+            if (aside.count("apply1-iq4")) run(aside.at("apply1-iq4"), aside.at("apply1-iq4").r, 6145, 5889, "18a-5 apply1-iq4's reads -> 6145, open, not cached (C3 5889)");
+            else bchk("18a-5 apply1-iq4 in the reads file", false, "missing");
+            const Load* cq = nullptr;   // a clean Q4 load: production slots, MTP, X 8705, closed and stable (the first in the file)
+            for (const Load& l : L) {
+                if (l.vec || l.q != "q4" || l.spec == 2 || l.slots != base.at("q4").slots) continue;
+                const Pack& p = packs.at("q4"); const Facts f = facts_of(l); const Result r = derive(p, f, l.r, -1); const Bracket b = bracket(p, f, l.r, r);
+                std::string why; if (b.closed() && b.X == 8705 && stable_X(p, f, r, -1, why)) { cq = &l; break; }
+            }
+            if (cq) {
+                std::printf("bracket  18a-5 the clean Q4 load: %s\n", cq->tag.c_str());
+                for (int skip = 0; skip < 5; ++skip) {   // 4 of its 5 settled reads +80 ms (every choice of the 4)
+                    std::vector<double> r = cq->r; for (int i = 0; i < 5; ++i) if (i != skip) r[(size_t) 3 + i] += 80;
+                    run(*cq, r, 8705, 8449, "18a-5 Q4, settled reads but read " + std::to_string(4 + skip) + " +80 ms -> 8705, open (C3 8449)");
+                }
+                std::vector<double> r = cq->r; for (double& x : r) x += 80;
+                run(*cq, r, 8705, 8449, "18a-5 Q4, all 8 reads +80 ms -> 8705, open (C3 8449)");
+            } else bchk("18a-5 a clean Q4 load", false, "none");
+        }
+        // fix.out's totals table (S0 / S2 / bracket open / cache B / cache new).  Review 18a: S2 of the --spec 2 group is 2 under (e)
+        // (min-cand-1 6145; C3: 1), every other number is C3's
         const std::map<std::string, std::vector<int>> want = {
-            {"engine:iq3", {34, 34, 34, 34, 0, 30, 30}}, {"engine:iq4", {57, 57, 57, 57, 0, 57, 57}}, {"engine:iq4:spec2:otherslots", {2, 2, 0, 1, 1, 0, 0}},
+            {"engine:iq3", {34, 34, 34, 34, 0, 30, 30}}, {"engine:iq4", {57, 57, 57, 57, 0, 57, 57}}, {"engine:iq4:spec2:otherslots", {2, 2, 0, 2, 1, 0, 0}},
             {"engine:q4", {34, 34, 33, 34, 1, 33, 33}}, {"vector:iq3", {20, 20, 20, 20, 0, 20, 20}}, {"vector:iq4", {20, 20, 20, 20, 0, 20, 20}},
             {"vector:q4", {20, 20, 20, 20, 0, 18, 18}}};
         for (const auto& [g, w] : want) {
@@ -415,11 +457,35 @@ int main(int argc, char** argv) {
             "fast D    30 ms iq3 (34 clean loads):  k=1 0|0|0 of 170  k=2 0|0|0 of 340  k=3 0|0|0 of 340  k=4 0|0|0 of 170  k=5 0|0|0 of 34",
             "fast D    30 ms iq4 (57 clean loads):  k=1 0|0|0 of 285  k=2 0|0|0 of 570  k=3 0|0|0 of 570  k=4 0|0|0 of 285  k=5 0|0|0 of 57",
             "fast D    30 ms q4 (33 clean loads):  k=1 0|0|0 of 165  k=2 0|94|0 of 330  k=3 36|210|36 of 330  k=4 63|147|63 of 165  k=5 27|31|27 of 33"};
+        // review 18a: (e) on the same grid - X off the table X only where the reads are faster (the same counts as C3: raised), never
+        // below it ("low 0" everywhere; C3's third column above is what (e) removes)
+        const char* want_e[] = {
+            "D    20 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 49|0|0|low 0 of 340  k=4 83|5|0|low 0 of 170  k=5 34|5|0|low 0 of 34",
+            "D    20 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 9|0|0|low 0 of 570  k=4 18|0|0|low 0 of 285  k=5 9|0|0|low 0 of 57",
+            "D    20 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 0|0|0|low 0 of 330  k=3 0|0|0|low 0 of 330  k=4 0|0|0|low 0 of 165  k=5 0|0|0|low 0 of 33",
+            "D    40 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 340|0|0|low 0 of 340  k=4 170|170|0|low 0 of 170  k=5 34|34|0|low 0 of 34",
+            "D    40 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 396|0|0|low 0 of 570  k=4 285|169|0|low 0 of 285  k=5 57|57|0|low 0 of 57",
+            "D    40 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 11|0|0|low 0 of 330  k=3 109|5|0|low 0 of 330  k=4 101|36|0|low 0 of 165  k=5 27|15|0|low 0 of 33",
+            "D    80 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 340|0|0|low 0 of 340  k=4 170|170|0|low 0 of 170  k=5 34|34|0|low 0 of 34",
+            "D    80 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 570|0|0|low 0 of 570  k=4 285|285|0|low 0 of 285  k=5 57|57|0|low 0 of 57",
+            "D    80 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 24|0|0|low 0 of 330  k=3 330|16|0|low 0 of 330  k=4 165|165|0|low 0 of 165  k=5 33|33|0|low 0 of 33",
+            "D   150 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 340|0|0|low 0 of 340  k=4 170|170|0|low 0 of 170  k=5 34|34|0|low 0 of 34",
+            "D   150 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 570|0|0|low 0 of 570  k=4 285|285|0|low 0 of 285  k=5 57|57|0|low 0 of 57",
+            "D   150 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 24|0|0|low 0 of 330  k=3 330|16|0|low 0 of 330  k=4 165|165|0|low 0 of 165  k=5 33|33|0|low 0 of 33",
+            "fast D    10 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 0|0|0|low 0 of 340  k=4 0|0|0|low 0 of 170  k=5 0|0|0|low 0 of 34",
+            "fast D    10 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 0|0|0|low 0 of 570  k=4 0|0|0|low 0 of 285  k=5 0|0|0|low 0 of 57",
+            "fast D    10 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 0|0|0|low 0 of 330  k=3 0|0|0|low 0 of 330  k=4 0|0|0|low 0 of 165  k=5 0|0|0|low 0 of 33",
+            "fast D    20 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 0|0|0|low 0 of 340  k=4 0|0|0|low 0 of 170  k=5 0|0|0|low 0 of 34",
+            "fast D    20 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 0|0|0|low 0 of 570  k=4 0|0|0|low 0 of 285  k=5 0|0|0|low 0 of 57",
+            "fast D    20 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 0|10|0|low 0 of 330  k=3 2|26|2|low 0 of 330  k=4 4|22|4|low 0 of 165  k=5 2|6|2|low 0 of 33",
+            "fast D    30 ms iq3 (34 clean loads):  k=1 0|0|0|low 0 of 170  k=2 0|0|0|low 0 of 340  k=3 0|0|0|low 0 of 340  k=4 0|0|0|low 0 of 170  k=5 0|0|0|low 0 of 34",
+            "fast D    30 ms iq4 (57 clean loads):  k=1 0|0|0|low 0 of 285  k=2 0|0|0|low 0 of 570  k=3 0|0|0|low 0 of 570  k=4 0|0|0|low 0 of 285  k=5 0|0|0|low 0 of 57",
+            "fast D    30 ms q4 (33 clean loads):  k=1 0|0|0|low 0 of 165  k=2 0|94|0|low 0 of 330  k=3 36|210|36|low 0 of 330  k=4 63|147|63|low 0 of 165  k=5 27|31|27|low 0 of 33",};
         size_t wi = 0; int full_ok = 0, full_n = 0;
         for (int fast = 0; fast < 2; ++fast)
             for (double D : fast ? std::vector<double>{10, 20, 30} : std::vector<double>{20, 40, 80, 150})
                 for (const char* q : {"iq3", "iq4", "q4"}) {
-                    int n = 0, f0[6] = {}, f1[6] = {}, f2[6] = {}, tot[6] = {};
+                    int n = 0, f0[6] = {}, f1[6] = {}, f2[6] = {}, f3[6] = {}, low3[6] = {}, tot[6] = {};   // f2: C3's X off the table X; f3: (e)'s
                     const Pack& p = packs.at(q); const int64_t tx = table_X.at(q);
                     for (const Load& l : L) {
                         if (l.vec || l.q != q || l.spec == 2 || l.slots != base.at(q).slots) continue;
@@ -435,9 +501,10 @@ int main(int argc, char** argv) {
                             for (int i = 0; i < 5; ++i) if (m >> i & 1) { r[(size_t) 3 + i] += fast ? -D : D; ++k; }
                             double s_med = 0, s_lo = 0; start_read(r, s_med, u); start_read_lo(r, s_lo);
                             Bracket b; b.X_med = X_at(s_med); b.X_lo = X_at(s_lo); b.X_ref = Xr;
-                            if (b.X_med < 0) { ++tot[k]; ++f0[k]; ++f2[k]; f1[k] += b.X_lo != tx; continue; }   // (no X from the median: never here)
+                            if (b.X_med < 0) { ++tot[k]; ++f0[k]; ++f2[k]; ++f3[k]; f1[k] += b.X_lo != tx; continue; }   // (no X from the median: never here)
                             bracket_combine(b);
-                            ++tot[k]; f0[k] += b.X_med != tx; f1[k] += b.X_lo != tx; f2[k] += b.X != tx;
+                            ++tot[k]; f0[k] += b.X_med != tx; f1[k] += b.X_lo != tx; f2[k] += c3_combine(b.X_med, b.X_lo, b.X_ref) != tx; f3[k] += b.X != tx;
+                            low3[k] += b.X < tx;
                             if (m == 7) {   // bracket() itself, end to end, on this subset
                                 const Result rr = derive(p, f, r, -1); const Bracket bb = bracket(p, f, r, rr);
                                 ++full_n; full_ok += bb.on && bb.X == b.X && bb.X_med == b.X_med && bb.X_lo == b.X_lo && bb.X_ref == b.X_ref && bb.closed() == b.closed();
@@ -446,10 +513,17 @@ int main(int argc, char** argv) {
                     }
                     char ln[400]; int o = std::snprintf(ln, sizeof ln, "%sD %5.0f ms %s (%d clean loads):", fast ? "fast " : "", D, q, n);
                     for (int k = 1; k <= 5; ++k) o += std::snprintf(ln + o, sizeof ln - (size_t) o, "  k=%d %d|%d|%d of %d", k, f0[k], f1[k], f2[k], tot[k]);
-                    const bool ok = wi < sizeof want_lines / sizeof *want_lines && std::string(ln) == want_lines[wi]; ++wi;
+                    const bool ok = wi < sizeof want_lines / sizeof *want_lines && std::string(ln) == want_lines[wi];
                     ++nb; bbad += !ok;
-                    std::printf("contam   %s %s\n", ok ? "OK  " : "DIFF", ln);
-                    if (!ok && wi <= sizeof want_lines / sizeof *want_lines) std::printf("contam   want %s\n", want_lines[wi - 1]);
+                    std::printf("contam   %s C3  %s\n", ok ? "OK  " : "DIFF", ln);
+                    if (!ok && wi < sizeof want_lines / sizeof *want_lines) std::printf("contam   want %s\n", want_lines[wi]);
+                    // review 18a: the same grid under (e) - the third number is (e)'s X off the table X, then (e)'s X below it
+                    char le[400]; o = std::snprintf(le, sizeof le, "%sD %5.0f ms %s (%d clean loads):", fast ? "fast " : "", D, q, n);
+                    for (int k = 1; k <= 5; ++k) o += std::snprintf(le + o, sizeof le - (size_t) o, "  k=%d %d|%d|%d|low %d of %d", k, f0[k], f1[k], f3[k], low3[k], tot[k]);
+                    const bool oke = wi < sizeof want_e / sizeof *want_e && std::string(le) == want_e[wi]; ++wi;
+                    ++nb; bbad += !oke;
+                    std::printf("contam   %s (e) %s\n", oke ? "OK  " : "DIFF", le);
+                    if (!oke && wi <= sizeof want_e / sizeof *want_e) std::printf("contam   want %s\n", want_e[wi - 1]);
                 }
         bchk("bracket() = memo + bracket_combine on the k=3 subsets", full_n > 0 && full_ok == full_n, std::to_string(full_ok) + " of " + std::to_string(full_n));
     }
@@ -484,8 +558,13 @@ int main(int argc, char** argv) {
             r3[3] = 1500.0; r3[4] = 1500.0;
             const Result r = derive(p3, f3, r3, -1);
             const Bracket b = bracket(p3, f3, r3, r);
-            bchk("edge: no X_lo (2 reads below IQ3's guard) -> X = X_med, open", r.derived && b.on && b.X_lo == -1 && b.X == r.X && !b.closed(),
-                 "X_med " + std::to_string(b.X_med) + " X " + std::to_string(b.X) + " (" + b.note + ")");
+            bchk("edge: no X_lo (2 reads below IQ3's guard) -> max(X_ref, X_med), open", r.derived && b.on && b.X_lo == -1 && b.X == std::max(b.X_ref, r.X) && !b.closed(),
+                 "X_med " + std::to_string(b.X_med) + " X_ref " + std::to_string(b.X_ref) + " X " + std::to_string(b.X) + " (" + b.note + ")");
+            // review 18a item 2: the no-X_lo edge is max(X_ref, X_med), with X_ref above and below X_med
+            Bracket e1; e1.X_med = 4609; e1.X_lo = -1; e1.X_ref = 4865; bracket_combine(e1);
+            bchk("edge: no X_lo, X_ref above X_med -> X_ref", e1.X == 4865 && !e1.closed(), "X " + std::to_string(e1.X) + " (" + e1.note + ")");
+            Bracket e2; e2.X_med = 4865; e2.X_lo = -1; e2.X_ref = 4609; bracket_combine(e2);
+            bchk("edge: no X_lo, X_ref below X_med -> X_med", e2.X == 4865 && !e2.closed(), "X " + std::to_string(e2.X) + " (" + e2.note + ")");
         }
         {   // the combination: X_ref inside, below and above the range; an inverted pair (X_lo < X_med) takes min/max
             auto comb = [&](int64_t m, int64_t lo, int64_t ref, int64_t want, const char* what) {
@@ -494,13 +573,31 @@ int main(int argc, char** argv) {
             };
             comb(8449, 8705, 8705, 8705, "ref at the top of the range");
             comb(8449, 8961, 8705, 8705, "ref inside the range");
-            comb(8449, 8705, 9217, 8705, "ref above the range: X_lo");
+            comb(8449, 8705, 9217, 9217, "ref above the range: X_ref (C3: X_lo 8705)");
             comb(8449, 8705, 8193, 8449, "ref below the range: X_med");
             comb(6145, 6145, 5889, 6145, "closed pair, ref lower: X_med");
             comb(4865, 4609, 4097, 4609, "inverted pair (X_lo < X_med): min/max");
-            comb(4865, 4609, 5121, 4865, "inverted pair, ref above: max");
+            comb(4865, 4609, 5121, 5121, "inverted pair, ref above: X_ref (C3: max 4865)");
             Bracket c; c.X_med = c.X_lo = c.X_ref = 6145; bracket_combine(c);
             bchk("combine: all three equal -> closed", c.closed() && c.open_why().empty(), "");
+        }
+        {   // ---- review 18a items 4 and 7: every triple (X_med, X_lo, X_ref) over -1 and 4097..9473 in steps of 256 ----
+            std::vector<int64_t> V = {-1}; for (int64_t x = 4097; x <= 9473; x += 256) V.push_back(x);
+            long n = 0, b_floor = 0, b_key = 0, b_max = 0, b_closed = 0, raised = 0, held = 0, closed = 0;
+            for (int64_t xm : V) for (int64_t xl : V) for (int64_t xr : V) {
+                Bracket b; b.X_med = xm; b.X_lo = xl; b.X_ref = xr; bracket_combine(b); ++n;
+                if (xr >= 0 && b.X < xr) ++b_floor;                                        // X >= X_ref when X_ref exists
+                if (b.X != std::max(xr, c3_combine(xm, xl, xr))) ++b_key;                  // = max(K, C3's clamp), K = X_ref (design 3.5)
+                if (b.X > std::max({xr, xm, xl})) ++b_max;                                 // never above max(X_ref, X_med, X_lo)
+                const int64_t lo = xl < 0 ? xm : std::min(xm, xl);
+                const bool rs = xr >= 0 && b.X > xr, fh = xr >= 0 && xm > 0 && xr > lo;  // raised; floor-held
+                raised += rs; held += fh; closed += b.closed();
+                if (((rs || fh) && b.closed()) || (b.closed() && !(b.X == xr && b.X == xm && b.X == xl))) ++b_closed;   // item 7: never a record
+            }
+            char d[200]; std::snprintf(d, sizeof d, "%ld triples: below X_ref %ld, != max(X_ref, C3) %ld, above the max %ld", n, b_floor, b_key, b_max);
+            bchk("18a-4 exhaustive: X >= X_ref, = max(K, C3), <= max of the three", n == 23 * 23 * 23 && b_floor == 0 && b_key == 0 && b_max == 0, d);
+            std::snprintf(d, sizeof d, "%ld raised, %ld floor-held, %ld closed (all X = X_med = X_lo = X_ref); %ld violations", raised, held, closed, b_closed);
+            bchk("18a-7 a raised or floor-held X is never closed (never written)", b_closed == 0 && raised > 0 && held > 0 && closed == 22, d);
         }
         {   // a cache hit (no bracket: off) applies the stored X; bracket off falls back to r.X
             Result hit; hit.derived = true; hit.X = 6145;
@@ -521,11 +618,12 @@ int main(int argc, char** argv) {
         const std::map<std::string, double> m1mean = {{"iq3", 13.5870}, {"iq4", 13.6721}, {"q4", 13.7771}};   // the engine loads' mean M1 (fix.cpp)
         for (const char* q : {"iq3", "iq4", "q4"}) {
             const Pack& p = packs.at(q); const int64_t tx = table_X.at(q); const std::string Q = q;
-            double s = 0; const bool has = ref_start(p, s);
+            Facts fm = base.count(q) ? base.at(q) : Facts(); fm.bw = m1mean.at(q) * 1e9;
+            double s = 0; const bool has = ref_start(p, fm, s);
             const bool line = p.ref_start_ms > 0;
             if (!line) { bchk(Q + " the table has no ref_start line (an older table): skipped", true, ""); continue; }
-            bchk(Q + " ref_start() = the table's line", has && s == want_ref.at(q), std::to_string(s));
-            Pack nb = p; nb.ref_start_ms = 0; double sb = 0; ref_start(nb, sb);
+            bchk(Q + " ref_start() = the table's line", has && s == want_ref.at(q) && p.ref_m1_gbs == 0, std::to_string(s));
+            Pack nb = p; nb.ref_start_ms = 0; double sb = 0; ref_start(nb, fm, sb);
             bchk(Q + " no line: ref_start() = the builder median", sb == median(p.text[0].builder_ms.at((int64_t) (p.start - 7))), std::to_string(sb));
             for (double fct : {1.0, 1.0025, 0.9975}) {
                 if (!base.count(q)) { bchk(Q + " base facts", false, "missing"); break; }
@@ -547,6 +645,57 @@ int main(int argc, char** argv) {
                 bchk(Q + " margins of the reference (> 10 ms both ways)", dn > 10 && up > 10, d);
             }
         }
+        // ---- review 18a A1: the reference carried to the load's M1 (ref_start MS M1_ref) ----
+        for (const char* q : {"iq3", "iq4", "q4"}) {
+            if (!base.count(q) || !(packs.at(q).ref_start_ms > 0)) continue;
+            const Pack& p = packs.at(q); Pack p2 = p; p2.ref_m1_gbs = m1mean.at(q); const std::string Q = q;
+            Facts f = base.at(q); f.bw = m1mean.at(q) * 1e9;
+            double s1 = 0, s2 = 0; ref_start(p, f, s1); ref_start(p2, f, s2);
+            int64_t x1 = -1, x2 = -1; ref_X(p, f, x1); ref_X(p2, f, x2);
+            char d[160]; std::snprintf(d, sizeof d, "M1 %.4f = M1_ref: ref %.4f / %.4f ms, X_ref %lld / %lld", f.bw / 1e9, s1, s2, (long long) x1, (long long) x2);
+            bchk("18a-6 " + Q + " two fields at M1 = M1_ref: = the one-field X_ref", s1 == s2 && x1 == x2 && x1 == table_X.at(q), d);
+            {   // the copy part moves the reference: at M1 -1% the reference is copy_staged(2041) * (1 - 0.99) slower... i.e. +1% of the copy
+                Facts g = f; g.bw = f.bw * 0.99; double s3 = 0; ref_start(p2, g, s3);
+                const TextModel en(p2, g, 0); const double want = p.ref_start_ms + en.copy_staged((double) (p.start - 7)) * (1.0 - 0.99);
+                std::snprintf(d, sizeof d, "ref %.4f ms at M1 -1%% (want %.4f; copy_staged(2041) %.1f ms)", s3, want, en.copy_staged((double) (p.start - 7)));
+                bchk("18a-6 " + Q + " two fields at M1 -1%: MS + copy_staged(2041) * (1 - M1 / M1_ref)", std::fabs(s3 - want) < 1e-9 && s3 > p.ref_start_ms, d);
+            }
+            Facts nobw = f; nobw.bw = 0; double s4 = 0;
+            bchk("18a-6 " + Q + " two fields, no link rate: no reference", !ref_start(p2, nobw, s4), "");
+        }
+        if (base.count("q4") && packs.at("q4").ref_start_ms > 0) {   // Q4 at M1 -0.55% and +0.85%: one field 8961 / 8449, two fields 8705
+            const Pack& p = packs.at("q4"); Pack p2 = p; p2.ref_m1_gbs = m1mean.at("q4");
+            for (const auto& [fct, one] : std::vector<std::pair<double, int64_t>>{{1 - 0.0055, 8961}, {1 + 0.0085, 8449}}) {
+                Facts f = base.at("q4"); f.bw = m1mean.at("q4") * 1e9 * fct;
+                int64_t x1 = -1, x2 = -1; ref_X(p, f, x1); ref_X(p2, f, x2);
+                char w[96], d[96]; std::snprintf(w, sizeof w, "18a-6 q4 at M1 %+.2f%%: two fields 8705 (one field %lld)", (fct - 1) * 100, (long long) one);
+                std::snprintf(d, sizeof d, "one field %lld, two fields %lld", (long long) x1, (long long) x2);
+                bchk(w, x1 == one && x2 == 8705, d);
+                Result none; none.why = "no probes"; int lvl = 0; std::string note;
+                const int64_t lim = apply_limit(&p2, f, &none, -1, 3072, lvl, note);
+                bchk(std::string(w) + ": level 3", lim == 8705 && lvl == 3, std::to_string(lim) + " level " + std::to_string(lvl));
+            }
+        }
+        // ---- review 18a R2: host_facts on a fake /proc + /sys tree (a card behind its own switch, as the 7900 XTX), and on this host ----
+        {
+            const char* td0 = std::getenv("TMPDIR");
+            const std::string R = std::string(td0 && *td0 ? td0 : "/tmp") + "/planner_c_test." + std::to_string((long long) getpid()) + ".hostroot";
+            const std::string top = R + "/sys/devices/pci0000:00/0000:00:01.3", up = top + "/0000:05:00.0", card = up + "/0000:06:00.0/0000:07:00.0";
+            auto put = [](const std::string& path, const std::string& text) { std::ofstream(path) << text; };
+            std::string cmd = "mkdir -p '" + card + "' '" + R + "/proc' '" + R + "/sys/bus/pci/devices' && ln -sfn '" + card + "' '" + R + "/sys/bus/pci/devices/0000:07:00.0'";
+            const bool made = std::system(cmd.c_str()) == 0;
+            put(R + "/proc/cpuinfo", "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t:  Fake  CPU 9\t9950X  \nprocessor\t: 1\nmodel name\t: Other\n");
+            put(card + "/vendor", "0x1002\n"); put(card + "/device", "0x744c\n"); put(card + "/revision", "0xc8\n");
+            put(top + "/max_link_speed", "32.0 GT/s PCIe\n"); put(top + "/max_link_width", "8\n");
+            put(up + "/max_link_speed", "16.0 GT/s PCIe\n"); put(up + "/max_link_width", "16\n");
+            const std::string got = host_facts("0000:07:00.0", R);
+            bchk("18a R2 host_facts on a fake tree", made && got == "cpu=Fake_CPU_9_9950X gpu=1002:744c:c8 link=16.0GT/s_x8", got);
+            const std::string none = host_facts("0000:09:00.0", R);
+            bchk("18a R2 host_facts, no such card: gpu and link unknown", none == "cpu=Fake_CPU_9_9950X gpu=? link=?", none);
+            if (std::system(("rm -rf '" + R + "'").c_str()) != 0) std::printf("bracket  (could not remove %s)\n", R.c_str());
+            const std::string here = host_facts("0000:07:00.0");
+            std::printf("bracket  18a R2 this host (card 0000:07:00.0): %s\n", here.c_str());
+        }
         // load_pack: the line parses, a bad one is refused
         {
             const char* td0 = std::getenv("TMPDIR");
@@ -555,13 +704,28 @@ int main(int argc, char** argv) {
                 std::ifstream in(pd + "/qwen-iq4.txt"); std::ofstream out(tp); std::string ln; bool put = false;
                 while (std::getline(in, ln)) { if (ln.rfind("ref_start ", 0) == 0) continue; out << ln << "\n"; if (!put && ln.rfind("o_s ", 0) == 0) { if (!line.empty()) out << line << "\n"; put = true; } }
             };
-            for (const auto& [line, ok, val] : std::vector<std::tuple<std::string, bool, double>>{{"ref_start 1885.7", true, 1885.7}, {"", true, 0.0},
-                     {"ref_start -5", false, 0.0}, {"ref_start 0", false, 0.0}, {"ref_start nan", false, 0.0}, {"ref_start inf", false, 0.0}}) {
+            // review 18a A1: `ref_start MS [GB/s]` - one or two fields; a second field that is not a positive rate is refused
+            for (const auto& [line, ok, val, m1v] : std::vector<std::tuple<std::string, bool, double, double>>{{"ref_start 1885.7", true, 1885.7, 0.0}, {"", true, 0.0, 0.0},
+                     {"ref_start -5", false, 0.0, 0.0}, {"ref_start 0", false, 0.0, 0.0}, {"ref_start nan", false, 0.0, 0.0}, {"ref_start inf", false, 0.0, 0.0},
+                     {"ref_start 1885.7 13.6721", true, 1885.7, 13.6721}, {"ref_start 2426.3 13.7771", true, 2426.3, 13.7771},
+                     {"ref_start 1885.7 0", false, 0.0, 0.0}, {"ref_start 1885.7 -13.67", false, 0.0, 0.0}, {"ref_start 1885.7 abc", false, 0.0, 0.0},
+                     {"ref_start 1885.7 nan", false, 0.0, 0.0}, {"ref_start 1885.7 inf", false, 0.0, 0.0}, {"ref_start 1885.7 13.67x", false, 0.0, 0.0},
+                     {"ref_start 1885.7 13.6721 1", false, 0.0, 0.0}, {"ref_start", false, 0.0, 0.0}, {"ref_start 1885.7x", false, 0.0, 0.0}}) {
                 with_line(line);
                 Pack e; std::string le; bool got = false;
                 try { got = load_pack(tp, cd, e, le); } catch (const std::exception& ex) { got = false; le = ex.what(); }
-                const bool good = got == ok && (!got || e.ref_start_ms == val);
-                bchk("load_pack \"" + (line.empty() ? std::string("(no line)") : line) + "\"", good, got ? "loaded, ref_start_ms " + std::to_string(e.ref_start_ms) : "refused: " + le);
+                const bool good = got == ok && (!got || (e.ref_start_ms == val && e.ref_m1_gbs == m1v));
+                bchk("load_pack \"" + (line.empty() ? std::string("(no line)") : line) + "\"", good,
+                     got ? "loaded, ref_start_ms " + std::to_string(e.ref_start_ms) + " ref_m1_gbs " + std::to_string(e.ref_m1_gbs) : "refused: " + le);
+            }
+            // review 18a R2: the host line is kept as written (the rest of the line), and a table without one has none
+            for (const auto& [line, want] : std::vector<std::pair<std::string, std::string>>{
+                     {"host cpu=AMD_Ryzen_9_9950X3D2_16-Core_Processor gpu=1002:744c:c8 link=16.0GT/s_x8", "cpu=AMD_Ryzen_9_9950X3D2_16-Core_Processor gpu=1002:744c:c8 link=16.0GT/s_x8"},
+                     {"host   cpu=a gpu=b link=c  ", "cpu=a gpu=b link=c"}, {"", ""}}) {
+                with_line(line.empty() ? "ref_start 1885.7" : "ref_start 1885.7\n" + line);
+                Pack e; std::string le; bool got = false;
+                try { got = load_pack(tp, cd, e, le); } catch (const std::exception& ex) { got = false; le = ex.what(); }
+                bchk("load_pack host line \"" + (line.empty() ? std::string("(no line)") : line) + "\"", got && e.host == want, got ? "host \"" + e.host + "\"" : "refused: " + le);
             }
             std::remove(tp.c_str());
         }
