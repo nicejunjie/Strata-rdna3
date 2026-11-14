@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <stdexcept>
@@ -209,14 +210,14 @@ inline int64_t apply_limit(const Pack* p, const Facts& f, const Result* r, int64
     if (configured >= 0) { level = 1; note = r && r->derived ? "max(configured, X)" : "configured (no X: " + (r ? r->why : std::string("no rule")) + ")";
                            return r && r->derived ? std::max(configured, r->X) : configured; }
     if (r && r->derived) { level = 2; note = "X"; return r->X; }
-    if (p) {
+    if (p && f.bw > 0 && f.slots > 0) {   // review 14 F2: level 3 needs the start-up facts (an M1 that could not run -> level 4)
         std::vector<double> ms = p->text[0].builder_ms.count((int64_t) (p->start - 7)) ? p->text[0].builder_ms.at((int64_t) (p->start - 7)) : std::vector<double>();
         if (!ms.empty()) {
             const Result t = derive_from_start(*p, f, median(ms), -1);
             if (t.derived) { level = 3; note = "WARNING: no X this load (" + (r ? r->why : std::string("no rule")) + "): the pack's reference value"; return t.X; }
         }
     }
-    level = 4; note = "WARNING: no valid pack: the engine default"; return engine_default;
+    level = 4; note = p ? "WARNING: no start-up facts (link rate): the engine default" : "WARNING: no valid pack: the engine default"; return engine_default;
 }
 
 /// FNV-1a 64 over a file's bytes (the cache key's build and pack identity); 0 when unreadable
@@ -229,6 +230,70 @@ inline uint64_t file_hash(const std::string& path, uint64_t h = 1469598103934665
         for (size_t i = 0; i < n; ++i) { h ^= buf[i]; h *= 1099511628211ull; }
     std::fclose(fh);
     return h;
+}
+// ---- the derived-X cache (coordinator scope addition to review 14): one record per pack file, PACK.txt.x-cache ----
+// A load whose key matches the stored one (host, exe and pack content, card, copy mode, slots/bytes/context/chunk, free VRAM after
+// load in 32 MiB buckets) and whose M1 is within bw_tol of the stored M1 applies the stored X without the 8 start reads.  Anything
+// else - no file, a short or garbled file, a checksum that does not match, another key, M1 moved - is a MISS with its reason, and
+// the start reads run.  Written to PATH.tmp.<pid> and renamed over PATH (a reader sees the old record or the new one, never half).
+struct CacheEntry { int64_t X = -1; double start_ms = 0, bw = 0; int reads = 0; };
+inline uint64_t fnv_str(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+inline std::string cache_body(const std::string& key, const CacheEntry& e) {
+    char b[160];
+    std::snprintf(b, sizeof b, "x %lld start %.4f bw %.6f reads %d\n", (long long) e.X, e.start_ms, e.bw, e.reads);
+    return "strata-planner-x-cache 1\nkey " + key + "\n" + b;
+}
+inline bool cache_write(const std::string& path, const std::string& key, const CacheEntry& e, const std::string& tmp_suffix, std::string& err) {
+    const std::string body = cache_body(key, e);
+    char ck[64];
+    std::snprintf(ck, sizeof ck, "check %016llx\n", (unsigned long long) fnv_str(body));
+    const std::string tmp = path + ".tmp." + tmp_suffix;
+    std::FILE* fh = std::fopen(tmp.c_str(), "wb");
+    if (!fh) { err = "cannot write " + tmp; return false; }
+    const std::string all = body + ck;
+    const bool ok = std::fwrite(all.data(), 1, all.size(), fh) == all.size();
+    if (std::fclose(fh) != 0 || !ok) { std::remove(tmp.c_str()); err = "write of " + tmp + " failed"; return false; }
+#if defined(_WIN32)
+    std::remove(path.c_str());
+#endif
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { std::remove(tmp.c_str()); err = "rename to " + path + " failed"; return false; }
+    return true;
+}
+/// the first key field (name=value) that differs, for the miss reason
+inline std::string key_diff(const std::string& a, const std::string& b) {
+    auto split = [](const std::string& s) { std::map<std::string, std::string> m; size_t i = 0;
+        while (i < s.size()) { while (i < s.size() && s[i] == ' ') ++i; size_t j = s.find(' ', i); if (j == std::string::npos) j = s.size();
+            const std::string w = s.substr(i, j - i); const size_t q = w.find('='); if (!w.empty()) m[q == std::string::npos ? w : w.substr(0, q)] = q == std::string::npos ? "" : w.substr(q + 1); i = j; }
+        return m; };
+    const auto ma = split(a), mb = split(b);
+    for (const auto& kv : mb) { auto it = ma.find(kv.first); if (it == ma.end() || it->second != kv.second) return kv.first + " " + (it == ma.end() ? "absent" : it->second) + " -> " + kv.second; }
+    for (const auto& kv : ma) if (!mb.count(kv.first)) return kv.first + " no longer in the key";
+    return "the key differs";
+}
+inline bool cache_read(const std::string& path, const std::string& key, double bw_now, double bw_tol, const Pack& p, CacheEntry& e, std::string& why) {
+    std::FILE* fh = std::fopen(path.c_str(), "rb");
+    if (!fh) { why = "no cache file"; return false; }
+    std::string all; char buf[4096]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, fh)) > 0 && all.size() < (1u << 16)) all.append(buf, n);
+    std::fclose(fh);
+    std::vector<std::string> ln; size_t a = 0;
+    while (a < all.size()) { size_t b = all.find('\n', a); if (b == std::string::npos) { ln.push_back(all.substr(a)); break; } ln.push_back(all.substr(a, b - a)); a = b + 1; }
+    if (ln.size() != 4 || ln[0] != "strata-planner-x-cache 1" || ln[1].compare(0, 4, "key ") != 0 || ln[3].compare(0, 6, "check ") != 0) { why = "the cache file is not a cache record"; return false; }
+    const std::string body = ln[0] + "\n" + ln[1] + "\n" + ln[2] + "\n";
+    char ck[32]; std::snprintf(ck, sizeof ck, "%016llx", (unsigned long long) fnv_str(body));
+    if (ln[3].substr(6) != ck) { why = "the cache record's checksum does not match"; return false; }
+    if (ln[1].substr(4) != key) { why = "another key (" + key_diff(ln[1].substr(4), key) + ")"; return false; }
+    long long X = -1; double st = 0, bw = 0; int reads = 0; char tail = 0;
+    if (std::sscanf(ln[2].c_str(), "x %lld start %lf bw %lf reads %d%c", &X, &st, &bw, &reads, &tail) != 4) { why = "the cache record's values do not parse"; return false; }
+    if (X < 1024 || X > p.hi + 7 || X % p.grid != 1 || reads != 8 || !(bw > 0)) { why = "the cache record's values are out of range"; return false; }
+    if (!(bw_now > 0) || std::fabs(bw_now / bw - 1) > bw_tol) {
+        char b[96]; std::snprintf(b, sizeof b, "M1 %.4f GB/s now, %.4f GB/s stored", bw_now / 1e9, bw / 1e9); why = b; return false;
+    }
+    e.X = X; e.start_ms = st; e.bw = bw; e.reads = reads;
+    return true;
 }
 // ---- loading (the pack's line format, pack_export.py) ----
 inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, std::string& err) {
@@ -286,7 +351,34 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
     int32_t hdr[3];
     std::vector<std::vector<int32_t>> all; std::vector<int64_t> allT;   // model_c.read_counts: a new chunk at layer 0 or a new T
     std::vector<int32_t> row;
-    while (std::fread(hdr, sizeof hdr, 1, cf) == 1) {
+    // the shipped compact form (tools/make_planner_table.py): "SPC2", u32 version 1, layers, experts, maxt, chunks; per chunk int32 T and
+    // layers*experts 2-bit classes, 4 a byte, low bits first: 0 not routed, 1 routed by 1..maxt tokens, 2 by more.  The rule reads a
+    // count only as "> 0" and "<= maxt" (TextModel::counts_at), so the classes give the same X bit for bit; they load as 0 / 1 / maxt+1.
+    char magic[4] = {0, 0, 0, 0};
+    const bool compact = std::fread(magic, 1, 4, cf) == 4 && std::memcmp(magic, "SPC2", 4) == 0;
+    if (compact) {
+        uint32_t h[5];
+        if (std::fread(h, sizeof h, 1, cf) != 1 || h[0] != 1 || (int) h[1] != p.layers || (int) h[2] != p.experts || (int) h[3] != p.maxt || h[4] > 100000) {
+            std::fclose(cf); err = "compact counts header does not fit the pack (" + std::to_string(p.layers) + "x" + std::to_string(p.experts) + ", maxt " + std::to_string(p.maxt) + ")"; return false;
+        }
+        const size_t n = (size_t) p.layers * p.experts;
+        std::vector<uint8_t> buf((n + 3) / 4);
+        for (uint32_t c = 0; c < h[4]; ++c) {
+            int32_t T = 0;
+            if (std::fread(&T, sizeof T, 1, cf) != 1 || std::fread(buf.data(), 1, buf.size(), cf) != buf.size() || T <= 0) {
+                std::fclose(cf); err = "compact counts file is short or has a bad length at chunk " + std::to_string(c); return false;
+            }
+            std::vector<int32_t> v(n);
+            for (size_t i = 0; i < n; ++i) {
+                const int k = (buf[i >> 2] >> ((i & 3) * 2)) & 3;
+                if (k == 3) { std::fclose(cf); err = "compact counts file has an unknown class at chunk " + std::to_string(c); return false; }
+                v[i] = k == 0 ? 0 : k == 1 ? 1 : p.maxt + 1;
+            }
+            all.push_back(std::move(v)); allT.push_back(T);
+        }
+        if (std::fgetc(cf) != EOF) { std::fclose(cf); err = "compact counts file is longer than its header says"; return false; }
+    } else std::rewind(cf);
+    while (!compact && std::fread(hdr, sizeof hdr, 1, cf) == 1) {
         if (hdr[2] != p.experts || hdr[0] < 0 || hdr[0] >= p.layers || hdr[1] <= 0) {   // review 11 S3: never index past a chunk
             std::fclose(cf); err = "counts record (layer " + std::to_string(hdr[0]) + ", " + std::to_string(hdr[2]) + " experts) does not fit the pack's " +
                                    std::to_string(p.layers) + "x" + std::to_string(p.experts); return false;
@@ -324,7 +416,8 @@ inline bool load_rank(const std::string& path, int layers, int experts, std::vec
 }
 
 /// review 11 S3: a pack that does not fit this model, or whose indices point outside its counts, turns the shadow off
-inline bool validate(const Pack& p, int64_t layers, int64_t experts, std::string& err) {
+/// review 14 F10: the probe prompts (when present) - every variant 0..n-1 exactly `start` tokens, every id in [0, vocab) (vocab <= 0: ids >= 0)
+inline bool validate(const Pack& p, int64_t layers, int64_t experts, std::string& err, int64_t vocab = -1) {
     if (p.layers != layers || p.experts != experts) { err = "the pack is for " + std::to_string(p.layers) + "x" + std::to_string(p.experts) + " experts, the model has " + std::to_string(layers) + "x" + std::to_string(experts); return false; }
     if (p.step <= 0 || p.grid <= 0 || p.max_reads < 2 || p.lo >= p.hi || p.start <= 7) { err = "bad constants"; return false; }
     for (int t = 0; t < 3; ++t) {
@@ -335,6 +428,11 @@ inline bool validate(const Pack& p, int64_t layers, int64_t experts, std::string
             if (c == tt.chunks.end() || c->second.empty() || m == tt.builder_ms.end() || m->second.empty()) { err = "text " + std::to_string(t) + " length " + std::to_string(T) + " is empty"; return false; }
             for (int ci : c->second) if (ci < 0 || ci >= (int) p.counts.size() || p.chunk_T[(size_t) ci] != T) { err = "chunk index out of range or of another length"; return false; }
         }
+    }
+    for (size_t v = 0; v < p.probe_tokens.size(); ++v) {
+        const std::vector<int32_t>& ids = p.probe_tokens[v];
+        if ((int64_t) ids.size() != (int64_t) p.start) { err = "probe_tokens variant " + std::to_string(v) + " has " + std::to_string(ids.size()) + " tokens, not start " + std::to_string(p.start); return false; }
+        for (int32_t id : ids) if (id < 0 || (vocab > 0 && id >= vocab)) { err = "probe_tokens variant " + std::to_string(v) + " has token id " + std::to_string(id) + " outside the vocabulary (" + std::to_string(vocab) + ")"; return false; }
     }
     return true;
 }

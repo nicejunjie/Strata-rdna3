@@ -238,8 +238,55 @@ struct PlannerShadow {
     int probe_requests = 0, saved_stdout = -1;
     std::string ready_line;                   // READY waits until the start reads are done
     std::function<void()> finalize;           // derive (if not yet), apply, restore stdout, print READY
+    // review 14 F4: the probe phase is structural - the injected lines still queued (counted where next_line pops them), whether
+    // the line running now is one of them (the fence), and a deadline past which finalize runs with what was counted
+    int probes_queued = 0;
+    bool own_line = false, timed_out = false;
+    std::chrono::steady_clock::time_point deadline{};
+    // review 14 F2/F6: --planner's start-up state for the outcome line
+    bool eligible = false, pack_ok = false;   // a one-card load the planner applies to; a pack that loaded, validated and fits
+    std::string why_off;                      // why not (eligible false, or no pack)
+    // the derived-X cache (coordinator scope addition): PACK.txt.x-cache, keyed by the shadow key + free VRAM after load
+    int64_t free_mib = -1;                    // VRAM free with everything loaded (the serve print), -1 unknown
+    std::string xcache_path, xcache_key, cache_note;
 };
 PlannerShadow g_shadow;
+// [claude] planner rev 5 apply (review 14 F2/F6): the ONE outcome line of every --planner start, printed before READY.  Not eligible
+// (two cards, --batch, no expert source, no one-card prompt path): nothing is set, "NOT APPLIED (why), limit N in force".  Eligible:
+// apply_limit's four levels (p: the pack when it is valid, else nullptr; r: the rule's result, or why there is none), the limit is set
+// and READ BACK - the line says the limit in force, and NOT APPLIED with a warning when the engine did not take it.
+void planner_report(const strata::program::planner_c::Pack* p, const strata::program::planner_c::Result& r) {
+    namespace PC = strata::program::planner_c;
+    using strata::prefill::Prefill;
+    if (!g_shadow.eligible) {   // (nothing is set)
+        std::fprintf(stderr, "strata planner: NOT APPLIED (%s), limit %lld in force\n",
+                     g_shadow.why_off.empty() ? "this load has no one-card prompt path" : g_shadow.why_off.c_str(),
+                     (long long) Prefill::legacy_stream_min_tokens());
+        return;
+    }
+    const bool key = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
+    int level = 0; std::string note;
+    const int64_t lim = PC::apply_limit(p, g_shadow.facts, &r, key ? g_shadow.configured : -1, g_shadow.configured, level, note);
+    Prefill::set_derived_stream_min(lim);
+    const int64_t now = Prefill::legacy_stream_min_tokens();
+    char tail[512];
+    std::snprintf(tail, sizeof tail, "(level %d: %s) | X %lld configured %lld%s | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d/%d%s%s",
+                  level, note.c_str(), (long long) r.X, (long long) g_shadow.configured, key ? "" : " (key absent)",
+                  (long long) r.crossing[0], (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms,
+                  (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() ? "" : " | ", r.why.c_str());
+    std::string t = tail;
+    if (!g_shadow.cache_note.empty()) t += " | " + g_shadow.cache_note;
+    if (p == nullptr && now == lim) {   // no valid pack: the fallback limit, not the planner's
+        std::fprintf(stderr, "strata planner: NOT APPLIED (%s), limit %lld in force %s\n",
+                     g_shadow.why_off.empty() ? "no valid pack" : g_shadow.why_off.c_str(), (long long) now, t.c_str());
+    } else if (now == lim) {
+        std::fprintf(stderr, "strata planner: APPLIED staged limit %lld %s\n", (long long) lim, t.c_str());
+    } else {
+        const char* why = std::getenv("STRATA_PREFILL_STREAM_MIN") ? "STRATA_PREFILL_STREAM_MIN is set" : "the CPU share is off";
+        std::fprintf(stderr, "strata planner: NOT APPLIED (WARNING: the engine kept its limit: %s; wanted %lld), limit %lld in force %s\n",
+                     why, (long long) lim, (long long) now, t.c_str());
+    }
+}
 // [claude] planner step 2b (review 4 A2): the PLAN_* switches are honoured only by an engine the calibration tool started
 // with --calibration-plans (a CLI flag, never an environment variable), never under --batch slots (a slot read keeps the
 // last GEN's switches), and PLAN_STAGED_MAX never on a layer split (not audited there).  Forced values are clamped and
@@ -9211,8 +9258,15 @@ int main(int argc, char** argv) {
                 // like rev4/mb/mb.hip: wall clock around the enqueue and the sync); the result of an earlier load with the same key is
                 // only LOGGED next to this load's own derivation (review 11 M1: never skip it).  Nothing here changes any plan.
                 const std::string ppath = !o.planner.empty() ? o.planner : o.planner_shadow;
+                if (!o.planner.empty()) {   // review 14 F6: why --planner does not apply on this load (printed at READY)
+                    if (pf_parts.size() != 1) g_shadow.why_off = std::to_string(pf_parts.size()) + " prompt paths (two cards / a layer split): the planner is one-card only";
+                    else if (o.batch > 0) g_shadow.why_off = "--batch slots are configured";
+                    else if (srcp == nullptr) g_shadow.why_off = "no expert source";
+                }
                 if (!ppath.empty() && (!o.planner.empty() || o.calibration_plans) && pf_parts.size() == 1 && srcp != nullptr && o.batch <= 0) {   // (review 11b: no --batch slots)
                     g_shadow.apply = !o.planner.empty();
+                    g_shadow.eligible = g_shadow.apply;
+                    g_shadow.configured = strata::prefill::Prefill::legacy_stream_min_tokens();   // (review 14 F2: before any return below)
                     namespace PC = strata::program::planner_c;
                     std::string perr;
                     const size_t sl = ppath.find_last_of('/');
@@ -9220,7 +9274,7 @@ int main(int argc, char** argv) {
                     try {   // review 11: a malformed pack turns the shadow off, it never stops the engine
                         g_shadow.on = PC::load_pack(ppath, pdir, g_shadow.pack, perr) &&
                                       PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr) &&
-                                      PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr);
+                                      PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr, (int64_t) g.n_vocab);
                     } catch (const std::exception& ex) { g_shadow.on = false; perr = std::string("malformed pack: ") + ex.what(); }
                     // the pack must be this model's: the engine pack it was built from (its directory name) is in the pack
                     const size_t ps = o.pack.find_last_of('/');
@@ -9228,7 +9282,14 @@ int main(int argc, char** argv) {
                     if (g_shadow.on && !g_shadow.pack.engine_pack.empty() && g_shadow.pack.engine_pack != pack_name) {
                         g_shadow.on = false; perr = "the pack table was built for " + g_shadow.pack.engine_pack + ", this engine loads " + pack_name;
                     }
-                    if (!g_shadow.on) std::fprintf(stderr, "strata planner shadow: OFF (%s)\n", perr.c_str());
+                    g_shadow.pack_ok = g_shadow.on;
+                    if (!g_shadow.on) {
+                        if (std::FILE* pf = std::fopen(ppath.c_str(), "rb")) std::fclose(pf);
+                        else perr = "pack missing: " + ppath;   // a host without the pack: fallback level 1 with the key, never an error
+                        g_shadow.why_off = perr;
+                        if (g_shadow.apply) std::fprintf(stderr, "strata planner: the pack cannot be used (%s)\n", perr.c_str());   // review 14 F6
+                        else std::fprintf(stderr, "strata planner shadow: OFF (%s)\n", perr.c_str());
+                    }
                     if (g_shadow.on) {
                         PC::Facts& f = g_shadow.facts;
                         f.slots = pf_parts[0].cache->slots();
@@ -9278,7 +9339,8 @@ int main(int argc, char** argv) {
                         }
                         (void) cudaGetLastError();
                         if (scratch) cudaFree(scratch);
-                        if (f.bw <= 0) { g_shadow.on = false; std::fprintf(stderr, "strata planner shadow: OFF (the link probe could not run)\n"); }
+                        if (f.bw <= 0) { g_shadow.on = false; g_shadow.why_off = "the link probe could not run";
+                                         std::fprintf(stderr, g_shadow.apply ? "strata planner: no start-up facts (the link probe could not run)\n" : "strata planner shadow: OFF (the link probe could not run)\n"); }
                     }
                     if (g_shadow.on) {
                         // the key (review 11 M2/M3/S1/S2): host, this binary's content, the pack's content, the card and its copy mode,
@@ -12060,12 +12122,26 @@ int main(int argc, char** argv) {
             st->cv.notify_one();
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
-            if (g_shadow.self_probe && g_shadow.probe_requests >= 8 && g_shadow.finalize) g_shadow.finalize();   // [claude] rev 5 apply
+            // [claude] rev 5 apply (review 14 F4): the injected probe lines are counted HERE, where they are popped (they sit at the
+            // front, nothing else is pushed there), so finalize runs before the first line after them whatever each request did.
+            // Past the deadline the probes not yet run are dropped and finalize runs with the reads counted so far.
+            if (g_shadow.self_probe && g_shadow.finalize) {
+                bool fin = g_shadow.probes_queued == 0;
+                if (!fin && std::chrono::steady_clock::now() > g_shadow.deadline) {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    for (; g_shadow.probes_queued > 0 && !in_lines.empty(); --g_shadow.probes_queued) in_lines.pop_front();
+                    g_shadow.probes_queued = 0;
+                    g_shadow.timed_out = fin = true;
+                }
+                if (fin) g_shadow.finalize();
+            }
+            g_shadow.own_line = false;
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
             if (in_lines.empty()) return false;
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            if (g_shadow.self_probe && g_shadow.probes_queued > 0) { --g_shadow.probes_queued; ++g_shadow.probe_requests; g_shadow.own_line = true; }
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
@@ -12099,6 +12175,7 @@ int main(int argc, char** argv) {
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
+            g_shadow.free_mib = free_mib;   // [claude] planner: part of the derived-X cache key
             if (free_mib >= 256) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
 #ifdef _WIN32
@@ -12268,46 +12345,105 @@ int main(int argc, char** argv) {
         // their output to /dev/null - then derives, applies, and only then prints READY.  The server sees one READY, later.
         char ready_buf[64];
         std::snprintf(ready_buf, sizeof ready_buf, "READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
-        if (g_shadow.on && g_shadow.apply && !g_shadow.pack.probe_tokens.empty()) {
-            g_shadow.ready_line = ready_buf;
-            g_shadow.self_probe = true;
+        bool probing = false;
+        std::string no_probe;   // review 14 F2: why an eligible --planner load runs no probes
+        bool cache_hit = false;
+        strata::program::planner_c::CacheEntry xc;
+        if (g_shadow.on && g_shadow.apply) {
+            // the derived-X cache: a hit applies the stored X with no start reads.  Free VRAM after load in 32 MiB buckets (39 loads
+            // per quant on apply2 + apply20: the same MiB every load, so a bucket edge is crossed only by a real change of reserve)
+            // host-local and never in the source tree: the directory of the engine's own log (its stderr, when that is a file - the
+            // launcher's state/logs/<profile>-<port>.log in production), named after the pack.  No log file: no cache, every load reads.
+            g_shadow.xcache_path.clear();
+#if !defined(_WIN32)
+            {
+                struct stat sb{};
+                char lp[4096];
+                const ssize_t ln = fstat(2, &sb) == 0 && S_ISREG(sb.st_mode) ? readlink("/proc/self/fd/2", lp, sizeof lp - 1) : -1;
+                if (ln > 0 && lp[0] == '/') {
+                    const std::string logp(lp, (size_t) ln), pk = !o.planner.empty() ? o.planner : o.planner_shadow;
+                    const size_t a = logp.find_last_of('/'), b = pk.find_last_of('/');
+                    g_shadow.xcache_path = logp.substr(0, a) + "/" + (b == std::string::npos ? pk : pk.substr(b + 1)) + ".x-cache";
+                }
+            }
+#endif
+            g_shadow.xcache_key = g_shadow.key + " vram_free_mib32=" + (g_shadow.free_mib >= 0 ? std::to_string(g_shadow.free_mib / 32 * 32) : std::string("unknown"));
+            std::string why = "stderr is not a log file: no host-local cache directory";
+            cache_hit = !g_shadow.xcache_path.empty() &&
+                        strata::program::planner_c::cache_read(g_shadow.xcache_path, g_shadow.xcache_key, g_shadow.facts.bw, 0.005, g_shadow.pack, xc, why);
+            g_shadow.cache_note = (cache_hit ? "cache hit (" + g_shadow.xcache_path + ")" : "cache miss (" + why + ")") +
+                                  "; free VRAM " + std::to_string((long long) g_shadow.free_mib) + " MiB after load";
+            if (cache_hit) no_probe = "cache hit";
+        }
+        if (g_shadow.on && g_shadow.apply && !cache_hit && g_shadow.pack.probe_tokens.empty()) no_probe = "the pack has no probe_tokens";
+        if (g_shadow.on && g_shadow.apply && !cache_hit && !g_shadow.pack.probe_tokens.empty()) {
             std::fflush(stdout);
-            g_shadow.saved_stdout = dup(1);
-            const int dn = open("/dev/null", O_WRONLY);
-            if (dn >= 0) { dup2(dn, 1); close(dn); }
+            // review 14 F5: mute stdout only when it can be restored - a failed dup/open/dup2 skips the probes (logged)
+            const int sv = dup(1);
+            const int dn = sv >= 0 ? open("/dev/null", O_WRONLY) : -1;
+            const bool muted = dn >= 0 && dup2(dn, 1) >= 0;
+            const int mute_errno = errno;
+            if (dn >= 0) close(dn);
+            if (!muted) {
+                if (sv >= 0) close(sv);
+                no_probe = std::string("stdout could not be muted for the probes (") + (sv < 0 ? "dup" : dn < 0 ? "open /dev/null" : "dup2") +
+                           ": " + std::strerror(mute_errno) + ")";
+                std::fprintf(stderr, "strata planner: probes SKIPPED: %s\n", no_probe.c_str());
+            } else {
+                probing = true;
+                g_shadow.saved_stdout = sv;
+                g_shadow.ready_line = ready_buf;
+                g_shadow.self_probe = true;
+                g_shadow.probes_queued = 8;
+                g_shadow.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);   // review 14 F4
+            }
+        }
+        if (probing) {
             {
                 std::lock_guard<std::mutex> lk(in_mu);
                 for (int i = 0; i < 8; ++i) {
                     const std::vector<int32_t>& ids = g_shadow.pack.probe_tokens[(size_t) i % g_shadow.pack.probe_tokens.size()];
                     // 64 answer tokens, as the harness's start reads the rule was frozen on: their decode windows let the adaptive
-                    // expert tier settle between reads, and the prompt's last 7 tokens go to the windows (the part is 2041, not 2047)
+                    // expert tier settle between reads.  ckpt=0 sets no turn boundary (turn_at = -1), so the probe reads its 2047
+                    // conditioning tokens in ONE part; the harness's reads split at the last turn boundary (2041, then 6 through the
+                    // windows).  Review 14 F3: kept as it is - this sequence is the engine's own start statistic (apply20 + the pilot).
                     std::string ln = "GEN 64 ckpt=0 env=PLAN_STAGED_MAX:" + std::to_string(g_shadow.pack.start_limit) + ",PLAN_PROBE:1 ";
                     for (size_t j = 0; j < ids.size(); ++j) { if (j) ln += ','; ln += std::to_string(ids[j]); }
                     in_lines.push_front(ln);   // ahead of anything the server sent (it waits for READY first)
                 }
-                // push_front reversed them; the variants alternate either way
+                // push_front reverses them: with the pack's 3 variants they run in the order 1,0,2,1,0,2,1,0 (i % 3 reversed), not
+                // the harness's 0,1,2,0,1,2,0,1; reads 4-8 use the same variants the same number of times
             }
             in_cv.notify_one();
-            g_shadow.finalize = [&o]() {
+            g_shadow.finalize = []() {
                 namespace PC = strata::program::planner_c;
                 if (!g_shadow.self_probe) return;
                 g_shadow.self_probe = false;
                 PC::Result r = PC::derive(g_shadow.pack, g_shadow.facts, g_shadow.reads, g_shadow.configured);
-                const bool key = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
-                int level = 0; std::string note;
-                const int64_t lim = PC::apply_limit(&g_shadow.pack, g_shadow.facts, &r, key ? g_shadow.configured : -1, g_shadow.configured, level, note);
-                strata::prefill::Prefill::set_derived_stream_min(lim);
+                if (g_shadow.timed_out)
+                    r.why += std::string(r.why.empty() ? "" : "; ") + "the 120 s probe deadline passed after " + std::to_string(g_shadow.probe_requests) + " probes";
                 g_shadow.done = true;
                 std::fflush(stdout);
                 if (g_shadow.saved_stdout >= 0) { dup2(g_shadow.saved_stdout, 1); close(g_shadow.saved_stdout); g_shadow.saved_stdout = -1; }
-                std::fprintf(stderr, "strata planner: APPLIED staged limit %lld (level %d: %s) | X %lld configured %lld%s | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d/%d%s%s\n",
-                             (long long) lim, level, note.c_str(), (long long) r.X, (long long) g_shadow.configured, key ? "" : " (key absent)",
-                             (long long) r.crossing[0], (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms,
-                             (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() ? "" : " | ", r.why.c_str());
+                if (r.derived && g_shadow.reads.size() == 8 && !g_shadow.timed_out && !g_shadow.xcache_path.empty()) {   // the derived-X cache: only a full 8-read derivation
+                    PC::CacheEntry e; e.X = r.X; e.start_ms = r.start_ms; e.bw = g_shadow.facts.bw; e.reads = 8;
+                    std::string err;
+                    g_shadow.cache_note += PC::cache_write(g_shadow.xcache_path, g_shadow.xcache_key, e, std::to_string((long long) getpid()), err)
+                                               ? "; X written to the cache" : "; cache NOT written: " + err;
+                }
+                planner_report(&g_shadow.pack, r);
                 std::fputs(g_shadow.ready_line.c_str(), stdout);
                 std::fflush(stdout);
             };
         } else {
+            if (!o.planner.empty()) {   // review 14 F2/F6: no probes - still the four-level limit and the outcome line, before READY
+                strata::program::planner_c::Result r;
+                r.acted = g_shadow.configured;
+                r.why = !no_probe.empty() ? no_probe : !g_shadow.why_off.empty() ? g_shadow.why_off : "no probes";
+                if (cache_hit) { r.derived = true; r.X = xc.X; r.start_ms = xc.start_ms; r.why.clear(); }
+                if (g_shadow.eligible) g_shadow.done = true;
+                planner_report(g_shadow.pack_ok ? &g_shadow.pack : nullptr, r);   // (no link rate: apply_limit gives level 4)
+            }
             std::fputs(ready_buf, stdout);
         }
         std::fflush(stdout);
@@ -13517,9 +13653,9 @@ int main(int argc, char** argv) {
                 // (every GEN/GENI starts from the start-up values)
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
-                apply_plan_switches(o.calibration_plans || g_shadow.self_probe, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules); rev 5 apply: the engine's own start reads may force the pack's limit
-                g_shadow.probe = g_shadow.on && !g_shadow.done && strata::core::reqsw::get_i64(strata::core::reqsw::PLAN_PROBE) > 0;   // [claude] rev 5 shadow
-                if (g_shadow.probe && g_shadow.self_probe) ++g_shadow.probe_requests;
+                apply_plan_switches(o.calibration_plans || g_shadow.own_line, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules); rev 5 apply: the engine's own start reads (and only they: review 14 F4) may force the pack's limit
+                g_shadow.probe = g_shadow.on && !g_shadow.done && strata::core::reqsw::get_i64(strata::core::reqsw::PLAN_PROBE) > 0 &&
+                                 (!g_shadow.apply || g_shadow.own_line);   // [claude] rev 5 shadow; --planner: only its own lines count (review 14 F4)
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -14722,11 +14858,9 @@ int main(int argc, char** argv) {
                 bool any = false;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
-                    // [claude] planner step 1b: a layout laid out for another staged threshold (a forced plan now or then)
-                    // is laid out again: its buffers hold MMQ's rows for that threshold only (review 1 M1)
-                    const bool smin_mismatch = (p.sp->layout_stream_min_forced() ||
-                                                strata::prefill::Prefill::stream_all_min_tokens() != strata::prefill::Prefill::legacy_stream_min_tokens()) &&
-                                               p.sp->layout_stream_min() != strata::prefill::Prefill::stream_all_min_tokens();
+                    // [claude] planner step 1b: a layout laid out for another staged threshold (a forced plan now or then, or
+                    // --planner's derived limit: review 14 F1) is laid out again: its buffers hold MMQ's rows for that threshold only (review 1 M1)
+                    const bool smin_mismatch = p.sp->layout_stream_min() != strata::prefill::Prefill::stream_all_min_tokens();
                     if (!p.lent.empty()) {
                         if (want <= p.lent_chunk && !smin_mismatch) continue;   // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'

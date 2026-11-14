@@ -2571,7 +2571,8 @@ void Prefill::set_part_stream_min(int64_t tokens) { g_stream_min_part = std::max
 int64_t Prefill::legacy_stream_min_tokens() { return legacy_stream_min(); }
 void Prefill::set_count_dump(std::FILE* f) { g_count_dump = f; }
 // [claude] planner rev 5 apply (review 13): the derived staged limit replaces the CPU share's (STRATA_PREFILL_CPU_SHARE_MAX) for the
-// rest of the load; a layout laid out for the old one is laid out again by the step-1b relayout (smin_mismatch).
+// rest of the load; a layout laid out for the old one is laid out again by the step-1b relayout (smin_mismatch).  It takes effect
+// only with the CPU share on and STRATA_PREFILL_STREAM_MIN unset: the caller reads legacy_stream_min_tokens() back (review 14 F6).
 void Prefill::set_derived_stream_min(int64_t tokens) { if (tokens > 0 && cpu_share_on()) g_stream_min_share = tokens; }
 void Prefill::set_part_walk_max(int64_t tokens) { g_walk_max_part = std::max<int64_t>(0, tokens); }
 int64_t Prefill::walk_max_tokens() { return walk_max(); }
@@ -2995,8 +2996,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // [claude] planner step 1b (review 1 M1): a layout and the chunks read in it must see ONE staged threshold - a fused
     // layout keeps MMQ's buffers for stream_all_min() - 1 rows only, so a smaller threshold than the layout's would write
     // past them.  The serve lend lays a part out again when its plan's threshold differs; this is the backstop.
-    // (checked when a part's plan set the threshold now or for this layout: today's rule alone is never checked here)
-    if ((g_stream_min_part > 0 || m.layout_forced) && m.layout_smin >= 0 && m.layout_smin != stream_all_min()) {
+    // (review 14 F1: checked whatever set the threshold - a part's plan, or --planner's derived limit moving today's rule)
+    if (m.layout_smin >= 0 && m.layout_smin != stream_all_min()) {
         err = "prefill: this part's staged threshold (" + std::to_string(stream_all_min()) + ") is not the one its buffers were laid "
               "out for (" + std::to_string(m.layout_smin) + "): lay the part out again first";
         return false;

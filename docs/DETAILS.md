@@ -1860,6 +1860,47 @@ expert here: none was page-locked):
 A coding agent's recorded conversation on the two cards (a 100K-token start, then 8 turns of 1-5K tokens of code, 128
 tokens written a turn, the same tokens read by both): 137.4 s off, 130.6 s auto (reading 121.1 -> 114.3 s).
 
+## The one-card staged limit from a table: `--planner` (opt-in, one GPU)
+
+With the CPU share on, chunks below a limit are staged after their routing and longer ones stream every expert the GPU
+does not hold. Where the two cost the same depends on the card, the link, the cache size and the text, so the limit was
+a hand-measured number per model (`STRATA_PREFILL_CPU_SHARE_MAX`). `--planner TABLE` derives it at start instead
+(one GPU, no `--batch`; with two cards or `--batch` it prints `strata planner: NOT APPLIED (...)` and changes nothing):
+
+- **start-up facts**: the cache's slots and bytes, the loan each path borrows, the profile's ranking, and the link rate
+  (384 slot-sized copies from the pinned arena);
+- **8 start reads**: before it says READY, the engine reads the table's canned English 2048-token prompt 8 times
+  (64 answer tokens each, no checkpoint, staged); the median of reads 4-8 corrects the table's staged remainder;
+- **the rule**: per text (English, code, Chinese) the last length where staged is predicted faster, the lowest of the
+  three, less 128 tokens, rounded down to the 256 grid (+1). A copy/compute ratio below 1.6 there gives no limit.
+
+The limit applied: with `STRATA_PREFILL_CPU_SHARE_MAX` set, the larger of the two; without it, the derived one; no
+derived limit: the rule at the table's own reference start read (a warning); no usable table (a missing file is
+not an error): the engine default. Every start prints one line, `strata planner: APPLIED staged limit N (level ...)`
+or `NOT APPLIED (why), limit N in force`, with the limit read back from the prompt path.
+
+The 8 reads cost about 18-28 s of load. The result is cached in the directory of the engine's log (its stderr, when
+that is a file), as `TABLE.x-cache`: a later start with the same host, binary, table, card, copy mode, slots, bytes,
+context, chunk, free VRAM after load (32 MiB buckets) and a link rate within 0.5% applies the stored limit without the
+reads (`cache hit`). Anything else - no file, a damaged record, another key - reads again (`cache miss (why)`).
+
+The shipped tables (`data/planner/qwen-<quant>.txt` and `.counts`, Qwen3.8-Flash-Next IQ3_S / IQ4_XS / Q4_K_XL, one
+RX 7900 XTX) are built by `tools/make_planner_table.py` from one builder run per model: the model's one-card config with
+`--calibration-plans`, `STRATA_PREFILL_CPU_SHARE_MAX` unset and `--dump-prompt-counts COUNTS.bin`, reading the
+English, code and Chinese ladder prompts at 1, 2, 3, 4, 5, 6, 7, 8, 10, 12 and 16K tokens, 4 reads each, every read
+forced staged (`PLAN_STAGED_MAX:16641`), prefix 0. The table keeps the rungs the rule reads (2041 tokens, and 3065 to
+12281 for the crossing search) and each routed-token count as a 2-bit class (not routed / 1-8 tokens / more), which is
+all the rule reads of it: 0.7 MB a model instead of 13 MB, the same limit bit for bit. The stream compute shape and
+offset (`--stream-compute`, `--o-s`) come from separate short-read probes and are passed in. The shipped files:
+
+    python tools/make_planner_table.py --log b-iq4/flash-iq4-1gpu/engine.log --counts counts-iq4.bin --quant iq4 \
+        --engine-pack unsloth-ud-iq4_xs --stream-compute 293.1085792824071 0.2311197916666667 --o-s 115.30553535527179 \
+        --probe-tokens probe-iq4.txt --out data/planner/qwen-iq4.txt
+
+(IQ3_S: `--engine-pack qwen-iq3_s`, Q4_K_XL: `unsloth-ud-q4_k_xl`, their own `--stream-compute` / `--o-s` as in the
+tables' header lines.) A table is specific to the host it was measured on; on another machine build your own from a
+builder run of your own prompts, or leave `--planner` off.
+
 ## Missed experts in a verify window: the tail is skipped (on by default on CUDA, `STRATA_ROUTE_TAIL_SKIP`)
 
 When a card cannot hold every routed expert, most of a decode token's waiting time is spent on the experts that are not in VRAM:
