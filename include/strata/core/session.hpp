@@ -100,8 +100,11 @@ struct SessionState {
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1, const QsaState* share_rope = nullptr);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
+/// `host_owners` (KV streaming): another session's `qsa_states` array over the same layers; each QSA state shares that
+/// session's pinned host copy instead of allocating one (qsa_state_init's `host_owner`).
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaState* share_rope = nullptr);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaState* share_rope = nullptr,
+                      const QsaState* host_owners = nullptr);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

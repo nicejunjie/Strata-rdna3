@@ -5663,15 +5663,17 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's foreign session shares the TP session's %.0f MiB "
                                      "(STRATA_TP_SHARE_DP)\n", dev, (double) tp_arena_bytes[i] / 1048576.0);
             }
+            strata::core::SessionState& owner = i == 0 ? st0.ss : ss;
             if ((!shared && cudaMalloc(&buf, dbytes) != cudaSuccess) ||
-                strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope) == 0) {
+                strata::core::session_init(g, o.max_context, K, buf, dp_ss[i], lo, hi, rope, owner.qsa_states) == 0) {
                 std::fprintf(stderr, "strata generate: DP prompt path: CUDA%d's session for layers [%lld, %lld) failed; "
                                      "DP off\n", dev, (long long) lo, (long long) hi);
                 cudaGetLastError();
                 ok = false;
                 break;
             }
-            strata::core::SessionState& owner = i == 0 ? st0.ss : ss;
+            // (stage A) session_init shared the owner's host copies already; this keeps the old contract for a state
+            // whose layout differed (it allocated its own and is pointed at the owner's, as before)
             for (int64_t q = dp_ss[i].qsa_ord0; q < dp_ss[i].qsa_ord0 + dp_ss[i].qsa_alloc; ++q)
                 dp_ss[i].qsa_states[q].host = owner.qsa_states[q].host;
             strata::core::session_zero(dp_ss[i], g, nullptr, i == 0 ? main_cs : st0.stream);
