@@ -1,7 +1,8 @@
 // [claude] planner rev 5 shadow: planner_c.hpp against rule_c.py (localLLM 67850ea) on every stored load - X, acted, the three
 // per-text crossings and the guard ratio must match.  CPU only.
 //   g++ -O2 -std=c++20 -Iinclude src/program/planner_c_test.cpp -o planner_c_test && ./planner_c_test PACKDIR COUNTSDIR PROFILE [VECTORS]
-//   (the shipped table: ./planner_c_test data/planner data/planner data/expert-profile.bin VECTORS)
+//   (the shipped table, from the repository root: ./planner_c_test data/planner data/planner data/expert-profile.bin
+//    - VECTORS defaults to src/program/planner_c_test_vectors.txt, the rev 5 export's 279 stored loads; review 15 S6)
 #include "strata/program/planner_c.hpp"
 #include <cstdio>
 #include <sstream>
@@ -31,7 +32,7 @@ int main(int argc, char** argv) {
     const std::map<std::string, int64_t> table_X = {{"iq3", 4609}, {"iq4", 6145}, {"q4", 8705}};
     std::map<std::string, std::pair<Facts, std::vector<double>>> sample;
     std::map<std::string, std::string> sample_tag;   // per quant: one real 8-read load whose X is the table X
-    std::ifstream vf(argc > 4 ? std::string(argv[4]) : pd + "/vectors.txt"); std::string l1, l2, l3, l4, l5;
+    std::ifstream vf(argc > 4 ? std::string(argv[4]) : std::string("src/program/planner_c_test_vectors.txt")); std::string l1, l2, l3, l4, l5;
     int n = 0, bad = 0;
     while (std::getline(vf, l1) && std::getline(vf, l2) && std::getline(vf, l3) && std::getline(vf, l4) && std::getline(vf, l5)) {
         std::istringstream a(l1); std::string kw, tag, q; Facts f; a >> kw >> tag >> q >> f.slots >> f.cache_bytes >> f.bw;
@@ -108,16 +109,87 @@ int main(int argc, char** argv) {
         Pack d = p; d.probe_tokens[2][7] = -3;                          v("a negative id (no vocabulary given)", d, -1, false);
         Pack e2 = p; e2.probe_tokens.clear();                           v("no probe_tokens (a shadow pack)", e2, V, true);
     }
+    // review 15 D1: the table's `profile` line against the loaded --expert-profile
+    {
+        const uint64_t H = file_hash(prof);
+        auto v = [&](const std::string& what, const Pack& pp, uint64_t want_profile, bool want, const char* must = nullptr) {
+            std::string e; const bool got = validate(pp, 48, 512, e, -1, want_profile);
+            const bool ok = got == want && (must == nullptr || e.find(must) != std::string::npos); ++na; abad += !ok;
+            std::printf("profile  %-44s %s %s%s\n", what.c_str(), ok ? "OK  " : "DIFF", got ? "valid" : "invalid: ", e.c_str());
+        };
+        const Pack& p = packs.at("iq4");
+        if (p.profile_hash != 0) {   // the shipped table: built under this profile
+            ++na; abad += p.profile_hash != H;
+            std::printf("profile  %-44s %s table %016llx, PROFILE %016llx\n", "the shipped table's line = file_hash(PROFILE)", p.profile_hash == H ? "OK  " : "DIFF",
+                        (unsigned long long) p.profile_hash, (unsigned long long) H);
+            v("the shipped table under its profile", p, H, true);
+        } else std::printf("profile  (the rev 5 export has no profile line: the shipped-table vector is skipped)\n");
+        Pack a = p; a.profile_hash = H;          v("profile line = --expert-profile", a, H, true);
+        Pack b = p; b.profile_hash = H ^ 1;      v("another profile -> refused", b, H, false, "built for another expert profile");
+        Pack c = p; c.profile_hash = 0;          v("no profile line -> refused", c, H, false, "records no expert profile");
+        Pack d = p; d.profile_hash = H ^ 1;      v("no check asked (profile 0: the export path)", d, 0, true);
+        // the line as load_pack parses it: a copy of the iq4 table with another profile hash, loaded and refused
+        const char* td0 = std::getenv("TMPDIR");
+        const std::string tp = std::string(td0 && *td0 ? td0 : "/tmp") + "/planner_c_test." + std::to_string((long long) getpid()) + ".table.txt";
+        std::string src = pd + "/qwen-iq4.txt";
+        if (std::FILE* t = std::fopen((pd + "/pack-iq4.txt").c_str(), "r")) { std::fclose(t); src = pd + "/pack-iq4.txt"; }
+        {
+            std::ifstream in(src); std::ofstream out(tp); std::string ln; bool put = false;
+            while (std::getline(in, ln)) {
+                if (ln.rfind("profile ", 0) == 0) continue;
+                out << ln << "\n";
+                if (!put && ln.rfind("engine_pack ", 0) == 0) { out << "profile 0123456789abcdef\n"; put = true; }
+            }
+        }
+        Pack e; std::string le;
+        const bool loaded = load_pack(tp, cd, e, le);
+        ++na; abad += !(loaded && e.profile_hash == 0x0123456789abcdefull);
+        std::printf("profile  %-44s %s %s profile %016llx\n", "load_pack parses the line", loaded && e.profile_hash == 0x0123456789abcdefull ? "OK  " : "DIFF",
+                    loaded ? "loaded" : le.c_str(), (unsigned long long) e.profile_hash);
+        if (loaded) v("that table under PROFILE -> the pack cannot be used", e, H, false, "built for another expert profile");
+        std::remove(tp.c_str());
+    }
+    // review 15 D2: args_env_hash - the command line less argv[0] in order, the STRATA_/HSA_/GPU_ environment sorted, kArgsEnvSkip out
+    {
+        const std::vector<std::string> cmd = {"/x/strata", "--serve", "--pack", "/p", "--spec", "4"};
+        const std::vector<std::string> env = {"PATH=/bin", "STRATA_PREFILL_RING=192", "GPU_MAX_HW_QUEUES=6", "HSA_ENABLE_SDMA=0", "HOME=/h",
+                                              "STRATA_OWNER_ATTEST_KEY=aa", "STRATA_DS4_SLOT_DIR=/l/ds4-slots", "AIBOX_STRATA_LOG=/l/x.log"};
+        const uint64_t h0 = args_env_hash(cmd, env);
+        auto h = [&](const std::string& what, std::vector<std::string> c, std::vector<std::string> e, bool same) {
+            const bool got = args_env_hash(c, e) == h0; const bool ok = got == same; ++na; abad += !ok;
+            std::printf("args_env %-44s %s %s\n", what.c_str(), ok ? "OK  " : "DIFF", got ? "same hash" : "another hash");
+        };
+        auto with = [&](std::vector<std::string> e, size_t i, const std::string& kv) { e[i] = kv; return e; };
+        std::vector<std::string> perm(env.rbegin(), env.rend());
+        h("the environment in another order", cmd, perm, true);
+        h("a STRATA_ value changed", cmd, with(env, 1, "STRATA_PREFILL_RING=128"), false);
+        h("a GPU_ value changed", cmd, with(env, 2, "GPU_MAX_HW_QUEUES=4"), false);
+        h("an HSA_ value changed", cmd, with(env, 3, "HSA_ENABLE_SDMA=1"), false);
+        { auto e = env; e.push_back("STRATA_PREFILL_CPU_SHARE_MAX=6145"); h("a STRATA_ variable added (the key)", cmd, e, false); }
+        h("PATH changed (not hashed)", cmd, with(env, 0, "PATH=/usr/bin"), true);
+        h("AIBOX_STRATA_LOG changed (not a hashed prefix)", cmd, with(env, 7, "AIBOX_STRATA_LOG=/m/y.log"), true);
+        h("STRATA_OWNER_ATTEST_KEY changed (skipped)", cmd, with(env, 5, "STRATA_OWNER_ATTEST_KEY=bb"), true);
+        h("STRATA_DS4_SLOT_DIR changed (skipped)", cmd, with(env, 6, "STRATA_DS4_SLOT_DIR=/m/ds4-slots"), true);
+        { auto c = cmd; c[0] = "/y/strata"; h("argv[0] changed (the exe= field)", c, env, true); }
+        { auto c = cmd; c[5] = "3"; h("an argument changed", c, env, false); }
+        { auto c = cmd; c.push_back("--planner"); c.push_back("/t.txt"); h("an argument added", c, env, false); }
+        { std::vector<std::string> c = {"/x/strata", "--serve", "--spec", "4", "--pack", "/p"}; h("the arguments in another order", c, env, false); }
+        { std::vector<std::string> c = {"/x/strata", "--serve", "--pack/p", "--spec", "4"}; h("two arguments joined", c, env, false); }
+        const std::vector<std::string> self = nul_list("/proc/self/cmdline");
+        ++na; abad += self.empty() || self.size() != (size_t) argc;
+        std::printf("args_env %-44s %s %zu strings (argc %d)\n", "nul_list(/proc/self/cmdline)", !self.empty() && self.size() == (size_t) argc ? "OK  " : "DIFF", self.size(), argc);
+    }
     // the derived-X cache: write, hit, and every miss (no file, garbage, truncated, checksum, another key, M1 moved, out of range)
     {
         const char* td = std::getenv("TMPDIR");
         const std::string path = std::string(td && *td ? td : "/tmp") + "/planner_c_test." + std::to_string((long long) getpid()) + ".x-cache";
         const Pack& p = packs.at("iq4");
-        const std::string key = "host=h exe=0123 pack=4567 gpu=0000:03:00.0 sdma=default slots=7492 bytes=1 context=262144 chunk=16384 vram_free_mib32=320";
+        const std::string key = "host=h exe=0123 pack=4567 profile=caa0c5d52cc0b041 gpu=0000:03:00.0 sdma=default slots=7492 bytes=1 context=262144 chunk=16384 "
+                                "args_env=89abcdef01234567 boot=0e5f6c1a-1111-2222-3333-444455556666 kernel=7.0.0-42-generic vram_free_mib32=320";
         CacheEntry e; e.X = 6145; e.start_ms = 1885.4; e.bw = 13.675e9; e.reads = 8;
-        auto c = [&](const std::string& what, const std::string& k, double bw, bool want) {
-            CacheEntry g; std::string why; const bool hit = cache_read(path, k, bw, 0.005, p, g, why);
-            const bool ok = hit == want && (!hit || g.X == 6145); ++na; abad += !ok;
+        auto c = [&](const std::string& what, const std::string& k, double bw, bool want, const std::string& must = "") {
+            CacheEntry g; std::string why; const bool hit = cache_read(path, k, bw, kCacheBwTol, p, g, why);
+            const bool ok = hit == want && (!hit || g.X == 6145) && (must.empty() || why.find(must) != std::string::npos); ++na; abad += !ok;
             std::printf("cache %-44s %s %s%s\n", what.c_str(), ok ? "OK  " : "DIFF", (hit ? "hit X " + std::to_string(g.X) : std::string("miss: ")).c_str(), why.c_str());
         };
         auto put = [&](const std::string& text) { std::FILE* f = std::fopen(path.c_str(), "wb"); std::fwrite(text.data(), 1, text.size(), f); std::fclose(f); };
@@ -126,9 +198,24 @@ int main(int argc, char** argv) {
         c("no file", key, e.bw, false);
         std::string err;
         const bool w = cache_write(path, key, e, "t", err); ++na; abad += !w; std::printf("cache %-44s %s %s\n", "write", w ? "OK  " : "DIFF", err.c_str());
+        { const std::string g0 = get(); const bool v2 = g0.rfind("strata-planner-x-cache 2\n", 0) == 0; ++na; abad += !v2;
+          std::printf("cache %-44s %s\n", "the record is format 2", v2 ? "OK  " : "DIFF"); }
         c("hit", key, e.bw, true);
-        c("hit, M1 +0.4%", key, e.bw * 1.004, true);
+        // review 15 D5: the hit tolerance is 0.25% (was 0.5%)
+        c("hit, M1 +0.24%", key, e.bw * 1.0024, true);
+        c("hit, M1 -0.24%", key, e.bw * 0.9976, true);
+        c("M1 +0.26%", key, e.bw * 1.0026, false, "GB/s stored");
+        c("M1 -0.26%", key, e.bw * 0.9974, false, "GB/s stored");
+        c("M1 +0.4% (a hit under the old 0.5%)", key, e.bw * 1.004, false, "GB/s stored");
         c("M1 +0.6%", key, e.bw * 1.006, false);
+        // review 15 D1/D2/D3: each new key field, changed alone, is a miss that names it
+        for (const char* f : {"profile", "args_env", "boot", "kernel"}) {
+            std::string k3 = key; const size_t i = k3.find(std::string(" ") + f + "=") + 1, j = k3.find(' ', i);
+            k3.replace(i, j - i, std::string(f) + "=" + (std::string(f) == "kernel" ? "7.0.0-43-generic" : std::string(f) == "boot" ? "ffffffff-0000-0000-0000-000000000000" : "0000000000000001"));
+            c(std::string("another ") + f, k3, e.bw, false, std::string("another key (") + f + " ");
+        }
+        { std::string k4 = key; const size_t i = k4.find(" boot=") + 6, j = k4.find(' ', i); k4.replace(i, j - i, "");
+          c("boot id absent (empty field) vs stored", k4, e.bw, false, "another key (boot "); }
         c("another free-VRAM bucket", key.substr(0, key.size() - 3) + "352", e.bw, false);
         std::string k2 = key; k2.replace(k2.find("exe=0123"), 8, "exe=0124");
         c("another exe hash", k2, e.bw, false);
@@ -139,7 +226,63 @@ int main(int argc, char** argv) {
         { std::string b = good; b[b.find("x 6145") + 2] = '7'; put(b); c("value edited (checksum)", key, e.bw, false); }
         { std::string b = good; const size_t i = b.find("exe=0123"); b.replace(i, 8, "exe=0124"); put(b); c("stored key edited (checksum)", k2, e.bw, false); }
         { CacheEntry bad = e; bad.X = 6144; cache_write(path, key, bad, "t", err); c("X off the grid", key, e.bw, false); }
+        {   // review 15: a version-1 record (the 242bf4326 format, its own valid checksum) is a miss, not an error
+            const std::string body = "strata-planner-x-cache 1\nkey host=h exe=0123 pack=4567 gpu=0000:03:00.0 sdma=default slots=7492 bytes=1 context=262144 "
+                                     "chunk=16384 vram_free_mib32=320\nx 6145 start 1885.4000 bw 13675000000.000000 reads 8\n";
+            char ck[64]; std::snprintf(ck, sizeof ck, "check %016llx\n", (unsigned long long) fnv_str(body));
+            put(body + ck); c("a version-1 record", key, e.bw, false, "format 1");
+        }
+        // a record whose key has no boot / kernel (written on a host without them) against one that has them
+        { cache_write(path, "host=h boot= kernel=", e, "t", err); c("a record with empty boot/kernel, now set", "host=h boot=b kernel=k", e.bw, false, "another key (boot "); }
+        { cache_write(path, "host=h boot= kernel=", e, "t", err); c("empty boot/kernel both times: hit", "host=h boot= kernel=", e.bw, true); }
         std::remove(path.c_str());
+    }
+    // review 15 D5: stable_X - the record is written only when start +-10 ms and M1 +-0.25% give the same X
+    for (const char* q : {"iq3", "iq4", "q4"}) {
+        if (!sample.count(q)) continue;
+        const Pack& p = packs.at(q); const Facts& f = sample[q].first;
+        const Result r = derive(p, f, sample[q].second, configured.at(q));
+        std::string why; const bool st = stable_X(p, f, r, configured.at(q), why);
+        // the margin to the nearest step of X in start (1 ms resolution): stable needs more than 10 ms both ways
+        double up = 0, dn = 0;
+        while (up < 200 && derive_from_start(p, f, r.start_ms + up + 1, configured.at(q)).X == r.X) up += 1;
+        while (dn < 200 && derive_from_start(p, f, r.start_ms - dn - 1, configured.at(q)).X == r.X) dn += 1;
+        std::printf("stable   %-4s %s start %.1f ms X %lld: %s%s (X holds for +%.0f / -%.0f ms)\n", q, sample_tag[q].c_str(), r.start_ms, (long long) r.X,
+                    st ? "stable" : "unstable: ", why.c_str(), up, dn);
+        if (std::string(q) == "iq4") { ++na; abad += !st; std::printf("stable   %-44s %s\n", "iq4's sample is stable (written)", st ? "OK  " : "DIFF"); }
+        // a start 5 ms below X's next step up: +10 ms moves X, so the record is NOT written
+        if (up < 200) {
+            Result u = derive_from_start(p, f, r.start_ms + up + 1 - 5, configured.at(q));
+            std::string w; const bool su = stable_X(p, f, u, configured.at(q), w);
+            const bool ok = !su && w.find("start +10 ms") != std::string::npos; ++na; abad += !ok;
+            std::printf("stable   %-44s %s %s%s\n", (std::string(q) + " 5 ms below a step: not cached").c_str(), ok ? "OK  " : "DIFF", su ? "stable" : "unstable: ", w.c_str());
+        }
+        if (dn < 200) {
+            Result u = derive_from_start(p, f, r.start_ms - dn - 1 + 5, configured.at(q));
+            std::string w; const bool su = stable_X(p, f, u, configured.at(q), w);
+            const bool ok = !su && w.find("start -10 ms") != std::string::npos; ++na; abad += !ok;
+            std::printf("stable   %-44s %s %s%s\n", (std::string(q) + " 5 ms above a step: not cached").c_str(), ok ? "OK  " : "DIFF", su ? "stable" : "unstable: ", w.c_str());
+        }
+        // M1: the factor that moves X (scan in 0.05% steps up to 2%); within 0.25% of it the record is not written
+        for (int sgn : {+1, -1}) {
+            int k = 1; Facts g = f;
+            for (; k <= 40; ++k) { g.bw = f.bw * (1 + sgn * 0.0005 * k); if (derive_from_start(p, g, r.start_ms, configured.at(q)).X != r.X) break; }
+            if (k > 40) continue;
+            Facts h = f; h.bw = f.bw * (1 + sgn * (0.0005 * k - 0.0015));   // 0.15% short of the step: M1 +-0.25% crosses it
+            Result u = derive_from_start(p, h, r.start_ms, configured.at(q));
+            if (u.X != r.X) continue;
+            // M1 * (1 +- 0.25%) alone moves X here; start +-10 ms is checked first and is usually the wider move, so the reason may name it
+            Facts m = h; m.bw = h.bw * (1 + sgn * kCacheBwTol);
+            const bool m1_moves = derive_from_start(p, m, u.start_ms, configured.at(q)).X != u.X;
+            std::string w; const bool su = stable_X(p, h, u, configured.at(q), w);
+            const bool ok = !su && m1_moves; ++na; abad += !ok;
+            std::printf("stable   %-44s %s %s%s\n", (std::string(q) + (sgn > 0 ? " M1 0.15% below a step" : " M1 0.15% above a step")).c_str(), ok ? "OK  " : "DIFF",
+                        su ? "stable" : "unstable: ", w.c_str());
+        }
+    }
+    {   // no X: never written
+        Result none; none.why = "no probes"; std::string w; const bool su = stable_X(packs.at("iq4"), sample.count("iq4") ? sample["iq4"].first : Facts(), none, 6145, w);
+        ++na; abad += su; std::printf("stable   %-44s %s %s\n", "no X: not cached", !su ? "OK  " : "DIFF", w.c_str());
     }
     std::printf("%d apply/validate/cache vectors, %d differ\n", na, abad);
     return bad || abad ? 1 : 0;

@@ -108,7 +108,6 @@ public:
     static int64_t walk_max_tokens();            ///< the routed walk's limit in force (the part's plan, else today's)
     static int64_t legacy_walk_max_tokens();
     int64_t layout_stream_min() const;
-    bool layout_stream_min_forced() const;
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

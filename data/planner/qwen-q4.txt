@@ -1,5 +1,6 @@
 quant q4
 engine_pack unsloth-ud-q4_k_xl
+profile caa0c5d52cc0b041
 counts_file qwen-q4.counts
 n_chunks 108
 win 31.95

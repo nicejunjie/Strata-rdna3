@@ -116,6 +116,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
 #endif
@@ -249,6 +250,7 @@ struct PlannerShadow {
     // the derived-X cache (coordinator scope addition): PACK.txt.x-cache, keyed by the shadow key + free VRAM after load
     int64_t free_mib = -1;                    // VRAM free with everything loaded (the serve print), -1 unknown
     std::string xcache_path, xcache_key, cache_note;
+    std::string pci;                          // review 15 S1: the card's PCI id (the cache file is per table and card)
 };
 PlannerShadow g_shadow;
 // [claude] planner rev 5 apply (review 14 F2/F6): the ONE outcome line of every --planner start, printed before READY.  Not eligible
@@ -273,14 +275,16 @@ void planner_report(const strata::program::planner_c::Pack* p, const strata::pro
     std::snprintf(tail, sizeof tail, "(level %d: %s) | X %lld configured %lld%s | crossings %lld %lld %lld ratio %.4f add %.1f ms start %.1f ms reads %d/%d%s%s",
                   level, note.c_str(), (long long) r.X, (long long) g_shadow.configured, key ? "" : " (key absent)",
                   (long long) r.crossing[0], (long long) r.crossing[1], (long long) r.crossing[2], r.ratio, r.add_ms, r.start_ms,
-                  (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() ? "" : " | ", r.why.c_str());
+                  (int) g_shadow.reads.size(), g_shadow.probe_requests, r.why.empty() || note.find(r.why) != std::string::npos ? "" : " | ",
+                  r.why.empty() || note.find(r.why) != std::string::npos ? "" : r.why.c_str());
     std::string t = tail;
     if (!g_shadow.cache_note.empty()) t += " | " + g_shadow.cache_note;
-    if (p == nullptr && now == lim) {   // no valid pack: the fallback limit, not the planner's
+    if (p == nullptr && now == lim) {   // no valid pack: the fallback limit, not the planner's (review 15 S2: the reason once)
+        std::snprintf(tail, sizeof tail, "(level %d) | configured %lld%s", level, (long long) g_shadow.configured, key ? "" : " (key absent)");
         std::fprintf(stderr, "strata planner: NOT APPLIED (%s), limit %lld in force %s\n",
-                     g_shadow.why_off.empty() ? "no valid pack" : g_shadow.why_off.c_str(), (long long) now, t.c_str());
-    } else if (now == lim) {
-        std::fprintf(stderr, "strata planner: APPLIED staged limit %lld %s\n", (long long) lim, t.c_str());
+                     g_shadow.why_off.empty() ? "no valid pack" : g_shadow.why_off.c_str(), (long long) now, tail);
+    } else if (now == lim) {   // review 15 S2: KEPT when nothing was derived and the configured limit stays
+        std::fprintf(stderr, "strata planner: %s staged limit %lld %s\n", level == 1 && !r.derived ? "KEPT" : "APPLIED", (long long) lim, t.c_str());
     } else {
         const char* why = std::getenv("STRATA_PREFILL_STREAM_MIN") ? "STRATA_PREFILL_STREAM_MIN is set" : "the CPU share is off";
         std::fprintf(stderr, "strata planner: NOT APPLIED (WARNING: the engine kept its limit: %s; wanted %lld), limit %lld in force %s\n",
@@ -9271,10 +9275,12 @@ int main(int argc, char** argv) {
                     std::string perr;
                     const size_t sl = ppath.find_last_of('/');
                     const std::string pdir = sl == std::string::npos ? "." : ppath.substr(0, sl);
+                    // review 15 D1: the table must be built under this --expert-profile (its `profile` line = this file's hash)
+                    const uint64_t prof_hash = PC::file_hash(o.expert_profile);
                     try {   // review 11: a malformed pack turns the shadow off, it never stops the engine
                         g_shadow.on = PC::load_pack(ppath, pdir, g_shadow.pack, perr) &&
                                       PC::load_rank(o.expert_profile, g_shadow.pack.layers, g_shadow.pack.experts, g_shadow.facts.rank, perr) &&
-                                      PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr, (int64_t) g.n_vocab);
+                                      PC::validate(g_shadow.pack, g.n_layers, g.n_expert, perr, (int64_t) g.n_vocab, prof_hash != 0 ? prof_hash : 1);
                     } catch (const std::exception& ex) { g_shadow.on = false; perr = std::string("malformed pack: ") + ex.what(); }
                     // the pack must be this model's: the engine pack it was built from (its directory name) is in the pack
                     const size_t ps = o.pack.find_last_of('/');
@@ -9354,15 +9360,34 @@ int main(int argc, char** argv) {
                         if (cudaDeviceGetPCIBusId(pci, sizeof pci, dev) != cudaSuccess) { (void) cudaGetLastError(); std::snprintf(pci, sizeof pci, "dev%d", dev); }
 #endif
                         const char* sdma = std::getenv("HSA_ENABLE_SDMA");
+                        // review 15: profile= (D1, the table's profile line was checked above), args_env= (D2: PC::args_env_hash - the
+                        // command line less argv[0], and the STRATA_/HSA_/GPU_ environment as launched, sorted), boot= and kernel= (D3: the
+                        // first load of every boot derives; Linux only, empty elsewhere)
+                        std::string boot, kernel;
+#if !defined(_WIN32)
+                        if (std::FILE* bf = std::fopen("/proc/sys/kernel/random/boot_id", "r")) {
+                            char bl[128] = ""; if (std::fgets(bl, sizeof bl, bf)) boot = bl; std::fclose(bf);
+                            while (!boot.empty() && (boot.back() == '\n' || boot.back() == ' ')) boot.pop_back();
+                        }
+                        struct utsname un{};
+                        if (uname(&un) == 0) kernel = un.release;
+#endif
+                        for (char& ch : kernel) if (ch == ' ') ch = '_';
+                        const uint64_t args_env = PC::args_env_hash(PC::nul_list("/proc/self/cmdline"), PC::nul_list("/proc/self/environ"));
                         char kb[1024];
-                        std::snprintf(kb, sizeof kb, "host=%s exe=%016llx pack=%016llx gpu=%s sdma=%s slots=%lld bytes=%.0f context=%lld chunk=%lld", hn,
-                                      (unsigned long long) PC::file_hash("/proc/self/exe"), (unsigned long long) g_shadow.pack.content_hash, pci,
+                        std::snprintf(kb, sizeof kb, "host=%s exe=%016llx pack=%016llx profile=%016llx gpu=%s sdma=%s slots=%lld bytes=%.0f context=%lld chunk=%lld "
+                                      "args_env=%016llx boot=%s kernel=%s", hn,
+                                      (unsigned long long) PC::file_hash("/proc/self/exe"), (unsigned long long) g_shadow.pack.content_hash,
+                                      (unsigned long long) g_shadow.pack.profile_hash, pci,
                                       sdma ? sdma : "default", (long long) g_shadow.facts.slots, g_shadow.facts.cache_bytes, (long long) o.max_context,
-                                      (long long) chunk);
+                                      (long long) chunk, (unsigned long long) args_env, boot.c_str(), kernel.c_str());
                         g_shadow.key = kb;
+                        g_shadow.pci = pci;
                         g_shadow.cache_path = ppath + ".shadow-cache";
-                        std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.4f GB/s; configured staged limit %lld; waiting for the canned start reads (PLAN_PROBE)\n",
-                                     kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured);
+                        std::fprintf(stderr, "strata planner shadow: ON - %s; M1 %.4f GB/s; configured staged limit %lld; %s\n",
+                                     kb, g_shadow.facts.bw / 1e9, (long long) g_shadow.configured,
+                                     g_shadow.apply ? "the X cache is read at READY: a miss runs the 8 start reads"
+                                                    : "waiting for the canned start reads (PLAN_PROBE)");
                         if (std::FILE* cf = std::fopen(g_shadow.cache_path.c_str(), "r")) {   // earlier loads with this key: LOGGED only
                             char line[2048];
                             while (std::fgets(line, sizeof line, cf)) {
@@ -12171,11 +12196,12 @@ int main(int argc, char** argv) {
             // what is left once everything is allocated: under WDDM a GPU filled to the brim does not fail, it pages -
             // and a page-in while the verify graph spins on a host flag stalls the request for good
             size_t free_b = 0, total_b = 0;
-            cudaMemGetInfo(&free_b, &total_b);
+            const bool mem_ok = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;   // [claude] review 15 S3: the planner's cache needs a real reading
+            if (!mem_ok) (void) cudaGetLastError();
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
-            g_shadow.free_mib = free_mib;   // [claude] planner: part of the derived-X cache key
+            g_shadow.free_mib = mem_ok ? free_mib : -1;   // [claude] planner: part of the derived-X cache key (-1: the query failed)
             if (free_mib >= 256) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
 #ifdef _WIN32
@@ -12363,14 +12389,17 @@ int main(int argc, char** argv) {
                 if (ln > 0 && lp[0] == '/') {
                     const std::string logp(lp, (size_t) ln), pk = !o.planner.empty() ? o.planner : o.planner_shadow;
                     const size_t a = logp.find_last_of('/'), b = pk.find_last_of('/');
-                    g_shadow.xcache_path = logp.substr(0, a) + "/" + (b == std::string::npos ? pk : pk.substr(b + 1)) + ".x-cache";
+                    // review 15 S1: one file per table AND card, so a one-card profile that alternates cards keeps both records
+                    g_shadow.xcache_path = logp.substr(0, a) + "/" + (b == std::string::npos ? pk : pk.substr(b + 1)) + "." + g_shadow.pci + ".x-cache";
                 }
             }
 #endif
             g_shadow.xcache_key = g_shadow.key + " vram_free_mib32=" + (g_shadow.free_mib >= 0 ? std::to_string(g_shadow.free_mib / 32 * 32) : std::string("unknown"));
             std::string why = "stderr is not a log file: no host-local cache directory";
+            if (g_shadow.free_mib < 0 && !g_shadow.xcache_path.empty()) { g_shadow.xcache_path.clear(); why = "free VRAM after load unknown (the query failed): no cache"; }   // review 15 S3
             cache_hit = !g_shadow.xcache_path.empty() &&
-                        strata::program::planner_c::cache_read(g_shadow.xcache_path, g_shadow.xcache_key, g_shadow.facts.bw, 0.005, g_shadow.pack, xc, why);
+                        strata::program::planner_c::cache_read(g_shadow.xcache_path, g_shadow.xcache_key, g_shadow.facts.bw, strata::program::planner_c::kCacheBwTol,
+                                                               g_shadow.pack, xc, why);
             g_shadow.cache_note = (cache_hit ? "cache hit (" + g_shadow.xcache_path + ")" : "cache miss (" + why + ")") +
                                   "; free VRAM " + std::to_string((long long) g_shadow.free_mib) + " MiB after load";
             if (cache_hit) no_probe = "cache hit";
@@ -12426,10 +12455,15 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 if (g_shadow.saved_stdout >= 0) { dup2(g_shadow.saved_stdout, 1); close(g_shadow.saved_stdout); g_shadow.saved_stdout = -1; }
                 if (r.derived && g_shadow.reads.size() == 8 && !g_shadow.timed_out && !g_shadow.xcache_path.empty()) {   // the derived-X cache: only a full 8-read derivation
-                    PC::CacheEntry e; e.X = r.X; e.start_ms = r.start_ms; e.bw = g_shadow.facts.bw; e.reads = 8;
-                    std::string err;
-                    g_shadow.cache_note += PC::cache_write(g_shadow.xcache_path, g_shadow.xcache_key, e, std::to_string((long long) getpid()), err)
-                                               ? "; X written to the cache" : "; cache NOT written: " + err;
+                    std::string unstable;   // review 15 D5: ... and only an X the rule keeps at start +-10 ms and M1 +-0.25%
+                    if (!PC::stable_X(g_shadow.pack, g_shadow.facts, r, g_shadow.configured, unstable)) {
+                        g_shadow.cache_note += "; X not cached (unstable: " + unstable + ")";
+                    } else {
+                        PC::CacheEntry e; e.X = r.X; e.start_ms = r.start_ms; e.bw = g_shadow.facts.bw; e.reads = 8;
+                        std::string err;
+                        g_shadow.cache_note += PC::cache_write(g_shadow.xcache_path, g_shadow.xcache_key, e, std::to_string((long long) getpid()), err)
+                                                   ? "; X written to the cache" : "; cache NOT written: " + err;
+                    }
                 }
                 planner_report(&g_shadow.pack, r);
                 std::fputs(g_shadow.ready_line.c_str(), stdout);

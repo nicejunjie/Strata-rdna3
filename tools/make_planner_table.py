@@ -14,6 +14,9 @@ predicted faster than streaming every expert.  What the rule needs that is not a
   probe_tokens                   the canned start prompts, token ids exactly as the server sends them (chat template
                                  included), one line per variant
   const                          the rule's constants (grid, margin, guard, the crossing search lo/hi/step, ...)
+  profile                        the FNV-1a 64 hash of the expert profile (--expert-profile) the builder run loaded: the
+                                 rule's residency and the staged times come from its ranking, so the engine refuses the
+                                 table under any other profile (a new profile means a new builder run and table)
 
 Only the lengths the rule reads are kept: the start read's part (start - 7) and the rungs that bracket the crossing
 search [lo, hi) - the rule interpolates between neighbouring rungs, so the others never enter X.
@@ -24,7 +27,8 @@ with `--dump-prompt-counts COUNTS.bin`; its engine log has the plan lines (`stra
 reads must come in text order, `--reads-per-text` staged reads each (the shipped tables: 11 lengths x 4 = 44).
 
     python tools/make_planner_table.py --log ENGINE.LOG --counts COUNTS.bin --quant iq4 --engine-pack unsloth-ud-iq4_xs \\
-        --stream-compute A B --o-s X --probe-tokens PROBES.txt --out data/planner/qwen-iq4.txt
+        --stream-compute A B --o-s X --probe-tokens PROBES.txt --profile data/expert-profile.bin \\
+        --out data/planner/qwen-iq4.txt
 
 writes OUT and OUT with `.txt` replaced by `.counts`.  PROBES.txt: one line per variant, comma-separated ids.
 """
@@ -87,6 +91,14 @@ def kept_lengths(Ts, c):
     return keep
 
 
+def fnv1a64(path):
+    """the engine's planner_c::file_hash: FNV-1a 64 over the file's bytes"""
+    h = 1469598103934665603
+    for b in Path(path).read_bytes():
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
 def classes(counts, maxt):
     """2-bit classes, 4 a byte, low bits first: 0 not routed, 1 routed by 1..maxt tokens, 2 by more"""
     flat = [0 if v <= 0 else 1 if v <= maxt else 2 for row in counts for v in row]
@@ -103,6 +115,7 @@ def main():
     ap.add_argument("--stream-compute", nargs=2, type=float, required=True, metavar=("A", "B"))
     ap.add_argument("--o-s", type=float, required=True)
     ap.add_argument("--probe-tokens", required=True, help="one line per start-prompt variant: comma-separated token ids")
+    ap.add_argument("--profile", required=True, help="the --expert-profile file the builder run loaded (its hash goes in the table)")
     ap.add_argument("--texts", type=int, default=3, help="texts in the builder run, in order (english, code, chinese)")
     ap.add_argument("--reads-per-text", type=int, default=44)
     ap.add_argument("--out", required=True, help="the table (.txt); the counts go next to it as .counts")
@@ -113,6 +126,9 @@ def main():
     n = a.reads_per_text
     if len(chunks) != a.texts * n or len(rows) != a.texts * n:
         raise SystemExit(f"{len(chunks)} counted chunks and {len(rows)} staged plan lines; {a.texts} texts x {n} expected")
+    for i, ((T, _), (part, _)) in enumerate(zip(chunks, rows)):   # review 15 S5: pair by position, and check every pair
+        if abs(part - T) >= 16:
+            raise SystemExit(f"read {i}: the counted chunk has {T} tokens, its staged plan line a {part}-token part")
     lines_text, out_chunks = [], []
     for t in range(a.texts):
         idx = range(n * t, n * (t + 1))
@@ -124,14 +140,17 @@ def main():
                     ids.append(len(out_chunks))
                     out_chunks.append(chunks[i])
             ms = [m for part, m in rows[n * t: n * (t + 1)] if abs(part - T) < 16]
+            if len(ms) != len(ids):
+                raise SystemExit(f"text {t} length {T}: {len(ids)} counted chunks but {len(ms)} part times")
             lines_text.append(f"text {t} T {T} chunks {' '.join(map(str, ids))} ms {' '.join(repr(float(x)) for x in ms)}")
     probes = [ln.strip() for ln in Path(a.probe_tokens).read_text().splitlines() if ln.strip()]
     for p in probes:
         if len(p.split(",")) != c["start"]:
             raise SystemExit(f"a probe variant has {len(p.split(','))} tokens, not {c['start']}")
     out = Path(a.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
     cpath = out.with_suffix(".counts")
-    L = [f"quant {a.quant}", f"engine_pack {a.engine_pack}", f"counts_file {cpath.name}", f"n_chunks {len(out_chunks)}",
+    L = [f"quant {a.quant}", f"engine_pack {a.engine_pack}", f"profile {fnv1a64(a.profile):016x}", f"counts_file {cpath.name}", f"n_chunks {len(out_chunks)}",
          f"win {repr(float(window_ms(a.log)))}", f"stream_compute {repr(a.stream_compute[0])} {repr(a.stream_compute[1])}",
          f"o_s {repr(a.o_s)}", "const " + " ".join(f"{k} {v}" for k, v in c.items())]
     L += [f"probe_tokens {v} {p}" for v, p in enumerate(probes)]

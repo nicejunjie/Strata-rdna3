@@ -1880,9 +1880,15 @@ not an error): the engine default. Every start prints one line, `strata planner:
 or `NOT APPLIED (why), limit N in force`, with the limit read back from the prompt path.
 
 The 8 reads cost about 18-28 s of load. The result is cached in the directory of the engine's log (its stderr, when
-that is a file), as `TABLE.x-cache`: a later start with the same host, binary, table, card, copy mode, slots, bytes,
-context, chunk, free VRAM after load (32 MiB buckets) and a link rate within 0.5% applies the stored limit without the
-reads (`cache hit`). Anything else - no file, a damaged record, another key - reads again (`cache miss (why)`).
+that is a file), as `TABLE.<PCI id>.x-cache` (one record per table and card): a later start with the same host, binary,
+table, expert profile, card, copy mode, slots, bytes, context, chunk, engine arguments and `STRATA_*` / `HSA_*` / `GPU_*`
+environment (one hash; the binary's own path and `STRATA_OWNER_ATTEST_KEY` / `STRATA_DS4_SLOT_DIR` are left out), boot
+(`/proc/sys/kernel/random/boot_id`) and kernel release, free VRAM after load (32 MiB buckets) and a link rate within
+0.25% applies the stored limit without the reads (`cache hit`). Anything else - no file, a damaged record, a record of
+the older format 1, another key (the line names the field) - reads again (`cache miss (why)`). So the first start after
+every reboot reads. A limit is written only when the rule gives the same one at the start read +-10 ms and at the link
+rate +-0.25%; otherwise the line says `X not cached (unstable: ...)` and every start reads. A start that derives nothing
+and keeps `STRATA_PREFILL_CPU_SHARE_MAX` says `KEPT staged limit N`.
 
 The shipped tables (`data/planner/qwen-<quant>.txt` and `.counts`, Qwen3.8-Flash-Next IQ3_S / IQ4_XS / Q4_K_XL, one
 RX 7900 XTX) are built by `tools/make_planner_table.py` from one builder run per model: the model's one-card config with
@@ -1891,11 +1897,15 @@ English, code and Chinese ladder prompts at 1, 2, 3, 4, 5, 6, 7, 8, 10, 12 and 1
 forced staged (`PLAN_STAGED_MAX:16641`), prefix 0. The table keeps the rungs the rule reads (2041 tokens, and 3065 to
 12281 for the crossing search) and each routed-token count as a 2-bit class (not routed / 1-8 tokens / more), which is
 all the rule reads of it: 0.7 MB a model instead of 13 MB, the same limit bit for bit. The stream compute shape and
-offset (`--stream-compute`, `--o-s`) come from separate short-read probes and are passed in. The shipped files:
+offset (`--stream-compute`, `--o-s`) come from separate short-read probes and are passed in. The table's `profile`
+line is the hash of the expert profile the builder run loaded (`--profile`, the builder's `--expert-profile`): the rule's
+residency and the staged times both follow its ranking, so an engine with another `--expert-profile` refuses the table
+(`the pack cannot be used (built for another expert profile ...)`, the configured limit stays). **A new expert profile
+means a new builder run and table.** The shipped files (built under `data/expert-profile.bin`):
 
     python tools/make_planner_table.py --log b-iq4/flash-iq4-1gpu/engine.log --counts counts-iq4.bin --quant iq4 \
         --engine-pack unsloth-ud-iq4_xs --stream-compute 293.1085792824071 0.2311197916666667 --o-s 115.30553535527179 \
-        --probe-tokens probe-iq4.txt --out data/planner/qwen-iq4.txt
+        --probe-tokens probe-iq4.txt --profile data/expert-profile.bin --out data/planner/qwen-iq4.txt
 
 (IQ3_S: `--engine-pack qwen-iq3_s`, Q4_K_XL: `unsloth-ud-q4_k_xl`, their own `--stream-compute` / `--o-s` as in the
 tables' header lines.) A table is specific to the host it was measured on; on another machine build your own from a

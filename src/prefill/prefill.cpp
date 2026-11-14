@@ -1083,7 +1083,6 @@ struct Prefill::Impl {
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     int64_t layout_smin = -1;                // [claude] planner step 1b: the staged threshold this layout was laid out with
-    bool layout_forced = false;              // ...and whether a part's plan set it (not today's rule)
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
@@ -1825,7 +1824,6 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ring = ring_slots(T);
     m.layout_smin = stream_all_min();   // [claude] planner step 1b: run() reads with this threshold only
-    m.layout_forced = g_stream_min_part > 0;
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
     if (o.base == nullptr && m.ring > 0) {
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
@@ -2578,7 +2576,6 @@ void Prefill::set_part_walk_max(int64_t tokens) { g_walk_max_part = std::max<int
 int64_t Prefill::walk_max_tokens() { return walk_max(); }
 int64_t Prefill::legacy_walk_max_tokens() { return legacy_walk_max(); }
 int64_t Prefill::layout_stream_min() const { return impl_ ? impl_->layout_smin : -1; }
-bool Prefill::layout_stream_min_forced() const { return impl_ && impl_->layout_forced; }
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the

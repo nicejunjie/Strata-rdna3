@@ -1,5 +1,6 @@
 quant iq3
 engine_pack qwen-iq3_s
+profile caa0c5d52cc0b041
 counts_file qwen-iq3.counts
 n_chunks 108
 win 25.4

@@ -41,6 +41,7 @@ struct Pack {
     double win = 0, sc_a = 0, sc_b = 0, o_s = 0;            ///< decode windows ms; stream compute a + b c; o_s
     int layers = 48, experts = 512, maxt = 8, grid = 256, margin = 128, max_reads = 8, start = 2048, lo = 3328, hi = 12288, step = 16, start_limit = 16641;
     uint64_t content_hash = 0;                             ///< FNV-1a of the pack file and the counts file (the cache key)
+    uint64_t profile_hash = 0;                             ///< review 15 D1: the `profile` line - file_hash of the expert profile it was built under (0: none)
     double share = 0.6, guard = 1.6, conv = 0.003;
     TextTable text[3];
     std::vector<std::vector<int32_t>> probe_tokens;      ///< the canned English start-read prompts (token ids), by variant
@@ -231,11 +232,15 @@ inline uint64_t file_hash(const std::string& path, uint64_t h = 1469598103934665
     std::fclose(fh);
     return h;
 }
-// ---- the derived-X cache (coordinator scope addition to review 14): one record per pack file, PACK.txt.x-cache ----
-// A load whose key matches the stored one (host, exe and pack content, card, copy mode, slots/bytes/context/chunk, free VRAM after
-// load in 32 MiB buckets) and whose M1 is within bw_tol of the stored M1 applies the stored X without the 8 start reads.  Anything
-// else - no file, a short or garbled file, a checksum that does not match, another key, M1 moved - is a MISS with its reason, and
-// the start reads run.  Written to PATH.tmp.<pid> and renamed over PATH (a reader sees the old record or the new one, never half).
+// ---- the derived-X cache (coordinator scope addition to review 14): one record per pack file and card, PACK.txt.<pci>.x-cache ----
+// A load whose key matches the stored one (host, exe, pack and expert-profile content, card, copy mode, slots/bytes/context/chunk, the
+// engine's arguments and STRATA_/HSA_/GPU_ environment, boot id and kernel release, free VRAM after load in 32 MiB buckets) and whose
+// M1 is within kCacheBwTol of the stored M1 applies the stored X without the 8 start reads.  Anything else - no file, a short or garbled
+// file, another format version, a checksum that does not match, another key, M1 moved - is a MISS with its reason, and the start reads
+// run.  Written to PATH.tmp.<pid> and renamed over PATH (a reader sees the old record or the new one, never half); written only when
+// stable_X holds (review 15 D5).
+constexpr int kCacheVersion = 2;          ///< review 15: 2 = the D1/D2/D3 key fields; a version-1 record reads as a miss
+constexpr double kCacheBwTol = 0.0025;    ///< review 15 D5: M1 within 0.25% of the stored M1 on a hit (was 0.5%)
 struct CacheEntry { int64_t X = -1; double start_ms = 0, bw = 0; int reads = 0; };
 inline uint64_t fnv_str(const std::string& s, uint64_t h = 1469598103934665603ull) {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
@@ -244,7 +249,7 @@ inline uint64_t fnv_str(const std::string& s, uint64_t h = 1469598103934665603ul
 inline std::string cache_body(const std::string& key, const CacheEntry& e) {
     char b[160];
     std::snprintf(b, sizeof b, "x %lld start %.4f bw %.6f reads %d\n", (long long) e.X, e.start_ms, e.bw, e.reads);
-    return "strata-planner-x-cache 1\nkey " + key + "\n" + b;
+    return "strata-planner-x-cache " + std::to_string(kCacheVersion) + "\nkey " + key + "\n" + b;
 }
 inline bool cache_write(const std::string& path, const std::string& key, const CacheEntry& e, const std::string& tmp_suffix, std::string& err) {
     const std::string body = cache_body(key, e);
@@ -281,7 +286,10 @@ inline bool cache_read(const std::string& path, const std::string& key, double b
     std::fclose(fh);
     std::vector<std::string> ln; size_t a = 0;
     while (a < all.size()) { size_t b = all.find('\n', a); if (b == std::string::npos) { ln.push_back(all.substr(a)); break; } ln.push_back(all.substr(a, b - a)); a = b + 1; }
-    if (ln.size() != 4 || ln[0] != "strata-planner-x-cache 1" || ln[1].compare(0, 4, "key ") != 0 || ln[3].compare(0, 6, "check ") != 0) { why = "the cache file is not a cache record"; return false; }
+    if (ln.size() >= 1 && ln[0].compare(0, 23, "strata-planner-x-cache ") == 0 && ln[0] != "strata-planner-x-cache " + std::to_string(kCacheVersion)) {
+        why = "a cache record of format " + ln[0].substr(23) + ", this engine reads " + std::to_string(kCacheVersion); return false;   // review 15: v1 -> miss
+    }
+    if (ln.size() != 4 || ln[0] != "strata-planner-x-cache " + std::to_string(kCacheVersion) || ln[1].compare(0, 4, "key ") != 0 || ln[3].compare(0, 6, "check ") != 0) { why = "the cache file is not a cache record"; return false; }
     const std::string body = ln[0] + "\n" + ln[1] + "\n" + ln[2] + "\n";
     char ck[32]; std::snprintf(ck, sizeof ck, "%016llx", (unsigned long long) fnv_str(body));
     if (ln[3].substr(6) != ck) { why = "the cache record's checksum does not match"; return false; }
@@ -294,6 +302,59 @@ inline bool cache_read(const std::string& path, const std::string& key, double b
     }
     e.X = X; e.start_ms = st; e.bw = bw; e.reads = reads;
     return true;
+}
+/// review 15 D5: write the record only when the rule gives the same X at start +-10 ms and at M1 +-0.25% (the hit tolerance) - four more
+/// derive_from_start calls on this load's facts.  False (why: the first perturbation that moves X) -> not cached, every load reads.
+inline bool stable_X(const Pack& p, const Facts& f, const Result& r, int64_t configured, std::string& why) {
+    if (!r.derived) { why = "no X"; return false; }
+    const struct { double dstart, bwf; const char* what; } v[4] = {
+        {+10.0, 1.0, "start +10 ms"}, {-10.0, 1.0, "start -10 ms"}, {0.0, 1.0 + kCacheBwTol, "M1 +0.25%"}, {0.0, 1.0 - kCacheBwTol, "M1 -0.25%"}};
+    for (const auto& x : v) {
+        Facts g = f; g.bw = f.bw * x.bwf;
+        const Result d = derive_from_start(p, g, r.start_ms + x.dstart, configured);
+        if (!d.derived || d.X != r.X) {
+            why = std::string(x.what) + " gives " + (d.derived ? "X " + std::to_string((long long) d.X) : "no X (" + d.why + ")") + ", not " + std::to_string((long long) r.X);
+            return false;
+        }
+    }
+    return true;
+}
+/// a NUL-separated /proc file (cmdline, environ) as its strings; empty when unreadable
+inline std::vector<std::string> nul_list(const std::string& path) {
+    std::vector<std::string> out;
+    std::FILE* fh = std::fopen(path.c_str(), "rb");
+    if (!fh) return out;
+    std::string all; char buf[4096]; size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, fh)) > 0) all.append(buf, n);
+    std::fclose(fh);
+    size_t a = 0;
+    while (a < all.size()) { size_t b = all.find('\0', a); if (b == std::string::npos) b = all.size(); out.push_back(all.substr(a, b - a)); a = b + 1; }
+    return out;
+}
+/// review 15 D2: the cache key's args_env field.  Hashed (FNV-1a 64, fnv_str):
+///   - the engine's command line WITHOUT argv[0], in order (an argument's position carries its meaning: `--spec 4 --kv int8`);
+///     argv[0] is the binary's path, and its content is already the key's exe= field (the same binary at another path is the same load)
+///   - every environment variable whose name starts with STRATA_, HSA_ or GPU_, as NAME=VALUE, sorted (the environment's order does not
+///     matter), except kArgsEnvSkip below.  Other variables (PATH, HOME, HIP_VISIBLE_DEVICES - the card is the gpu= field) are not hashed.
+/// kArgsEnvSkip: values that legitimately differ between identical loads -
+///   STRATA_OWNER_ATTEST_KEY  a fresh secret per launch (serve/launch_identity: the owner's attestation key)
+///   STRATA_DS4_SLOT_DIR      a folder the server derives from the log path (DeepSeek only; the cache lives in the log directory anyway)
+inline constexpr const char* kArgsEnvSkip[] = {"STRATA_OWNER_ATTEST_KEY", "STRATA_DS4_SLOT_DIR"};
+inline uint64_t args_env_hash(const std::vector<std::string>& cmdline, const std::vector<std::string>& environ_kv) {
+    std::vector<std::string> env;
+    for (const std::string& kv : environ_kv) {
+        if (kv.compare(0, 7, "STRATA_") != 0 && kv.compare(0, 4, "HSA_") != 0 && kv.compare(0, 4, "GPU_") != 0) continue;
+        const std::string name = kv.substr(0, kv.find('='));
+        bool skip = false;
+        for (const char* s : kArgsEnvSkip) skip = skip || name == s;
+        if (!skip) env.push_back(kv);
+    }
+    std::sort(env.begin(), env.end());
+    uint64_t h = fnv_str("args");
+    for (size_t i = 1; i < cmdline.size(); ++i) { h = fnv_str(cmdline[i], h); h = fnv_str(std::string(1, '\0'), h); }
+    h = fnv_str(std::string(1, '\x01') + "env", h);
+    for (const std::string& kv : env) { h = fnv_str(kv, h); h = fnv_str(std::string(1, '\0'), h); }
+    return h;
 }
 // ---- loading (the pack's line format, pack_export.py) ----
 inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, std::string& err) {
@@ -311,6 +372,7 @@ inline bool load_pack(const std::string& path, const std::string& dir, Pack& p, 
         if (k == "quant") p.quant = words.at(1);
         else if (k == "counts_file") p.counts_file = words.at(1);
         else if (k == "engine_pack") p.engine_pack = words.at(1);
+        else if (k == "profile") p.profile_hash = std::stoull(words.at(1), nullptr, 16);   // review 15 D1
         else if (k == "probe_tokens") {   // probe_tokens <variant> id,id,...
             const size_t v = (size_t) std::stoi(words.at(1));
             if (p.probe_tokens.size() <= v) p.probe_tokens.resize(v + 1);
@@ -417,7 +479,15 @@ inline bool load_rank(const std::string& path, int layers, int experts, std::vec
 
 /// review 11 S3: a pack that does not fit this model, or whose indices point outside its counts, turns the shadow off
 /// review 14 F10: the probe prompts (when present) - every variant 0..n-1 exactly `start` tokens, every id in [0, vocab) (vocab <= 0: ids >= 0)
-inline bool validate(const Pack& p, int64_t layers, int64_t experts, std::string& err, int64_t vocab = -1) {
+/// review 15 D1: profile_hash != 0 (the engine: file_hash of its --expert-profile) - the table must record that same profile; the rule's
+/// residency and the table's staged times both come from the profile's ranking, so a table built under another profile is refused
+inline bool validate(const Pack& p, int64_t layers, int64_t experts, std::string& err, int64_t vocab = -1, uint64_t profile_hash = 0) {
+    if (profile_hash != 0 && p.profile_hash != profile_hash) {
+        char b[160];
+        if (p.profile_hash == 0) std::snprintf(b, sizeof b, "the table records no expert profile; --expert-profile is %016llx", (unsigned long long) profile_hash);
+        else std::snprintf(b, sizeof b, "built for another expert profile: the table's %016llx, --expert-profile %016llx", (unsigned long long) p.profile_hash, (unsigned long long) profile_hash);
+        err = b; return false;
+    }
     if (p.layers != layers || p.experts != experts) { err = "the pack is for " + std::to_string(p.layers) + "x" + std::to_string(p.experts) + " experts, the model has " + std::to_string(layers) + "x" + std::to_string(experts); return false; }
     if (p.step <= 0 || p.grid <= 0 || p.max_reads < 2 || p.lo >= p.hi || p.start <= 7) { err = "bad constants"; return false; }
     for (int t = 0; t < 3; ++t) {
