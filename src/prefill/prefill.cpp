@@ -227,6 +227,14 @@ inline int64_t handoff_floor_rows(int64_t chunk, const char** why) {
     *why = "max(8192, the TP minimum rounded up to 256)";
     return std::min(chunk, std::max<int64_t>(8192, (tp_min_tokens() + 255) / 256 * 256));
 }
+// todo 7 test hook: STRATA_TEST_HANDOFF_GROW_FAIL=N (tests only, like STRATA_TEST_PAGEABLE; not a user setting): the
+// process's N-th hand-off grow (1-based) fails as a refused pin and a failed pageable allocation would, so a prompt read
+// fails on the host side (no CUDA fault) - the request fails, the engine goes on and the slot keeps its old size
+inline bool handoff_grow_test_fail() {
+    static const long n = [] { const char* e = std::getenv("STRATA_TEST_HANDOFF_GROW_FAIL"); return e ? std::atol(e) : 0L; }();
+    static std::atomic<long> seen{0};
+    return n > 0 && seen.fetch_add(1) + 1 == n;
+}
 inline int64_t handoff_grow_rows(int64_t want, int64_t max_rows) {   // a grown slot: 4096-row steps (256 below 4096)
     const int64_t step = want < 4096 ? 256 : 4096;
     return std::min(max_rows, std::max<int64_t>(want, (want + step - 1) / step * step));
@@ -6687,7 +6695,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
                 float* fresh = nullptr;
-                const bool pinned = m.hand_pageable[hand_buf_].empty() &&
+                const bool test_fail = handoff_grow_test_fail();
+                const bool pinned = !test_fail && m.hand_pageable[hand_buf_].empty() &&
                                     core::host_alloc_guarded((void**) &fresh, (size_t) rows * D * 4, cudaHostAllocPortable) == cudaSuccess;
                 if (pinned) {
                     core::host_free_guarded(m.hand[hand_buf_]);
@@ -6696,15 +6705,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // the pin was refused (RAM or the pin budget): the slot goes pageable instead of failing the request -
                     // the D2H / H2D copies of a pageable buffer stage through HIP (slower, the same bytes)
                     (void) cudaGetLastError();
+                    // todo 7 (Fable stall5): the new vector first, then free and swap - a failed allocation leaves the slot
+                    // as it was (hand and hand_cap still agree), so a later request can use it
+                    std::vector<float> grown;
                     try {
-                        if (m.hand_pageable[hand_buf_].empty()) core::host_free_guarded(m.hand[hand_buf_]);
-                        m.hand[hand_buf_] = nullptr;
-                        m.hand_pageable[hand_buf_].resize((size_t) rows * D);
-                        m.hand[hand_buf_] = m.hand_pageable[hand_buf_].data();
+                        if (test_fail) throw std::bad_alloc();
+                        grown.resize((size_t) rows * D);
                     } catch (const std::bad_alloc&) {
                         err = "prefill: the hand-off buffer could not grow to " + std::to_string(rows) + " rows (no RAM)";
                         return false;
                     }
+                    if (m.hand_pageable[hand_buf_].empty()) core::host_free_guarded(m.hand[hand_buf_]);
+                    m.hand_pageable[hand_buf_].swap(grown);
+                    m.hand[hand_buf_] = m.hand_pageable[hand_buf_].data();
                 }
                 m.hand_cap[hand_buf_] = rows;
                 std::fprintf(stderr, "strata prefill: hand-off buffer %d grown to %lld rows%s for a %lld-row chunk on CUDA%d, grown in %.0f ms\n",

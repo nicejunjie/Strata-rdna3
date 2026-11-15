@@ -15292,6 +15292,12 @@ int main(int argc, char** argv) {
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (tp_on) tpv[0].set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
+            // todo 7 (Fable stall5 section 3): the prompt read failed on the host side - no CUDA fault (a refused
+            // allocation, a hand-off that could not grow): the request ends as a cancelled one does (the lent slots
+            // refilled, the session not kept live, the checkpoints taken before the failed part kept), with
+            // `ERR prompt read failed: <why>` as its one terminal line in place of DONE (and BADM), and the engine goes on
+            bool read_failed = false;
+            std::string read_err;
             tr("prompt start", n - 1);
             req_prompt_n = n;
             tpp_read_req = false;   // [claude] (set by this request's TP read)
@@ -15452,15 +15458,41 @@ int main(int argc, char** argv) {
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                        std::printf("ERR %s\n", err.c_str());
-                        // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
-                        // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
-                        if (cudaPeekAtLastError() != cudaSuccess) {
-                            std::fflush(stdout);
-                            std::fflush(stderr);
-                            std::_Exit(1);
+                        // todo 7: only this request fails when the engine can go on - not after a failed batch window
+                        // (the decoding slots' state), not after a verifier that released its GPU waits (#267: the
+                        // server ends the engine on those words), and not after a CUDA fault (below)
+                        static const char* const kVerifyLost[] = {"verify: timed out at layer ", "verify batch: timed out at layer ",
+                                                                  "verify: an earlier window never finished",
+                                                                  "verify batch: an earlier window never finished"};
+                        bool goes_on = !batch_fatal;
+                        for (const char* pre : kVerifyLost) goes_on = goes_on && err.rfind(pre, 0) != 0;
+                        bool fault = cudaPeekAtLastError() != cudaSuccess;
+                        if (!fault && goes_on) {
+                            // a fault another thread's call returned (and cleared) shows in the devices' own state: every
+                            // device of the engine must finish its queued work cleanly before it takes another request
+                            for (int st = -1; st < (int) stages.size() && !fault; ++st) {
+                                const strata::core::OnDevice on(st < 0 ? 0 : stages[(size_t) st]->dev);
+                                fault = cudaDeviceSynchronize() != cudaSuccess;
+                            }
                         }
-                        return 1;
+                        if (fault || !goes_on) {
+                            std::printf("ERR %s\n", err.c_str());
+                            // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
+                            // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
+                            if (fault) {
+                                std::fflush(stdout);
+                                std::fflush(stderr);
+                                std::_Exit(1);
+                            }
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata serve: the prompt read failed with no CUDA fault: this request fails, "
+                                             "the engine goes on (todo 7)\n");
+                        read_failed = true;
+                        read_err = err;
+                        pp_exact = false;   // a part was in flight: the session is not exactly at pp_reached
+                        cancelled = true;   // the cancel's way out below: the lent slots refilled, no decode, nothing live
+                        break;
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
@@ -15514,7 +15546,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-            std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+            if (!read_failed) std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone (STRATA_ADMIT_MERGE_FIRST: the prompt
             // tokens from merge_at on, the last one's output its first token)
@@ -16885,7 +16917,9 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
+            if (read_failed)   // todo 7: the request's one terminal line (the server: no DONE follows an ERR)
+                std::printf("ERR prompt read failed: %s\n", read_err.c_str());
+            else std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
@@ -16985,7 +17019,7 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                if (!read_failed) std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);   // (todo 7: its ERR ended it)
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
                     rows_wait_t = Clock::now();
@@ -17006,7 +17040,7 @@ int main(int argc, char** argv) {
                          (long long) n, (long long) resume, read_txt, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
-                         (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+                         (long long) draft_offered, checks.size(), read_failed ? " (failed)" : cancelled ? " (cancelled)" : "");
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);
