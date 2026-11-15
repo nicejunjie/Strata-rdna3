@@ -30,7 +30,16 @@
 Measured on one or two **RX 7900 XTX** (24 GB each, PCIe 4.0 x8) with a Ryzen 9 9950X3D2 and 128 GB of RAM, release
 `claude-20261102-p16k` on two GPUs (16K prompts measured on it; the other lengths take the same path as on
 `claude-20261102-rg24`, where they were measured) and `claude-20261101-rg23` on one (production from 2026-11-02), with
-every expert computed (no expert skipping). Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs except 16K; the faint band
+every expert computed (no expert skipping).
+
+> **About the release names in this section** (`claude-20261101-rg23`, `claude-20261102-rg24`, `claude-20261102-p16k`, ...):
+> they are engine builds on the maintainer's own machine, named by date, and are not published as GitHub releases or tags.
+> To run this fork, build it from this branch. The charts below were measured on the builds named above. Production as of
+> 2026-11-15 runs `claude-20261115-stallb` on two GPUs (from this branch) and `claude-20261111-rg23-defaults` on one GPU
+> (`claude-20261115-planner5` for the IQ4 prompt planner); the one-GPU builds come from the rg23 line, published as branch
+> `planner-rg23-20261112`.
+
+Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs except 16K; the faint band
 is the trial range); every request was checked for exact input length, 256 output tokens and correct retrieval, with no
 prompt cache.
 
@@ -220,21 +229,21 @@ Pick one option. They all start the same engine and use the same models.
 ### Option A: the Strata app
 
 The easiest way. The app has the engine inside: install it, pick a model, chat. Download the file for your system and
-graphics card from the [releases page](https://github.com/Niko1221/Strata/releases/latest). Not sure which one? See the
+graphics card from the [v0.2.3 release page](https://github.com/Niko1221/Strata/releases/tag/v0.2.3) (newer upstream versions: [latest](https://github.com/Niko1221/Strata/releases/latest)). Not sure which one? See the
 line under the table.
 
 | System | Your graphics card | File to download |
 | --- | --- | --- |
-| **Windows 10 / 11** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda13.exe) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-cuda12.exe) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip.exe) |
-| | AMD Radeon RX 7000 series or Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-windows-hip-rdna3.exe) |
-| **Linux** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda13.AppImage) |
-| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-nvidia-cuda12.AppImage) |
-| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx9070.AppImage) |
-| | AMD Radeon RX 7000 series | [`Strata-0.2.3-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-rx7900.AppImage) |
-| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-linux-amd-strixhalo.AppImage) |
-| **Mac** (Apple Silicon, macOS 15 or newer) | built in | [`Strata-0.2.3-mac.dmg`](https://github.com/Niko1221/Strata/releases/latest/download/Strata-0.2.3-mac.dmg) |
+| **Windows 10 / 11** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-windows-cuda13.exe`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-windows-cuda13.exe) |
+| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-windows-cuda12.exe`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-windows-cuda12.exe) |
+| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-windows-hip.exe`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-windows-hip.exe) |
+| | AMD Radeon RX 7000 series or Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-windows-hip-rdna3.exe`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-windows-hip-rdna3.exe) |
+| **Linux** | NVIDIA RTX, driver 580 or newer | [`Strata-0.2.3-linux-nvidia-cuda13.AppImage`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-linux-nvidia-cuda13.AppImage) |
+| | NVIDIA, older card or driver older than 580 | [`Strata-0.2.3-linux-nvidia-cuda12.AppImage`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-linux-nvidia-cuda12.AppImage) |
+| | AMD Radeon RX 9000 series or Radeon AI PRO R9700 | [`Strata-0.2.3-linux-amd-rx9070.AppImage`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-linux-amd-rx9070.AppImage) |
+| | AMD Radeon RX 7000 series | [`Strata-0.2.3-linux-amd-rx7900.AppImage`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-linux-amd-rx7900.AppImage) |
+| | AMD Ryzen AI Max (Strix Halo) | [`Strata-0.2.3-linux-amd-strixhalo.AppImage`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-linux-amd-strixhalo.AppImage) |
+| **Mac** (Apple Silicon, macOS 15 or newer) | built in | [`Strata-0.2.3-mac.dmg`](https://github.com/Niko1221/Strata/releases/download/v0.2.3/Strata-0.2.3-mac.dmg) |
 
 **If you are unsure:** for NVIDIA, take `cuda13` if your driver is version 580 or newer, otherwise `cuda12`. `cuda12` is
 for older cards and older drivers. The `hip` and `amd` files are for AMD cards. RX 6000 cards have no installer of
