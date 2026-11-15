@@ -12147,6 +12147,9 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+#if defined(STRATA_USE_HIP)
+        ::strata::hip_compat::host_lock_report("at READY");   // the one host memory lock line (hip_compat/host_lock.hpp)
+#endif
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;

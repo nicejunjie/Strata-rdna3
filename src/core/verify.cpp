@@ -462,7 +462,7 @@ bool one_token_self_commit() {
 bool mapped(size_t bytes, void** h, void** d) {
 #if defined(STRATA_USE_HIP)
     if (g_coherent) {
-        if (hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
+        if (::strata::hip_compat::host_alloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
                                         (peer_portable() ? hipHostMallocPortable : 0)) != hipSuccess)
             return false;
         std::memset(*h, 0, bytes);

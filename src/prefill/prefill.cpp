@@ -3038,7 +3038,7 @@ static bool r_async_on() {
 }
 static bool r_coherent_alloc(void** p, size_t bytes) {
 #if defined(STRATA_USE_HIP)
-    return hipHostMalloc(p, bytes, hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable) == hipSuccess;
+    return ::strata::hip_compat::host_alloc(p, bytes, hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable) == hipSuccess;
 #else
     return cudaHostAlloc(p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
 #endif

@@ -86,7 +86,7 @@ bool pinned_coherent(void** h, size_t bytes) {
 #if defined(STRATA_USE_HIP)
     // coherent (fine-grained) host memory: a store from one card is seen by a kernel running on the other without
     // either stream syncing - the design's M0 finding (peer stores into VRAM are not)
-    return hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable) == hipSuccess;
+    return ::strata::hip_compat::host_alloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent | hipHostMallocPortable) == hipSuccess;
 #else
     return cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
 #endif
