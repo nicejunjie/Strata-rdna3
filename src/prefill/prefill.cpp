@@ -227,13 +227,17 @@ inline int64_t handoff_floor_rows(int64_t chunk, const char** why) {
     *why = "max(8192, the TP minimum rounded up to 256)";
     return std::min(chunk, std::max<int64_t>(8192, (tp_min_tokens() + 255) / 256 * 256));
 }
-// todo 7 test hook: STRATA_TEST_HANDOFF_GROW_FAIL=N (tests only, like STRATA_TEST_PAGEABLE; not a user setting): the
-// process's N-th hand-off grow (1-based) fails as a refused pin and a failed pageable allocation would, so a prompt read
-// fails on the host side (no CUDA fault) - the request fails, the engine goes on and the slot keeps its old size
+// todo 7 test hook, COMPILED OUT of release builds (owner: no new env vars): a test-only build made with
+// -DSTRATA_TEST_HOOKS -DSTRATA_TEST_HANDOFF_GROW_FAIL_N=N makes the process's N-th hand-off grow (1-based) fail as a
+// refused pin and a failed pageable allocation would, so a prompt read fails on the host side (no CUDA fault) - the
+// request fails, the engine goes on and the slot keeps its old size.  Without STRATA_TEST_HOOKS this is always false.
 inline bool handoff_grow_test_fail() {
-    static const long n = [] { const char* e = std::getenv("STRATA_TEST_HANDOFF_GROW_FAIL"); return e ? std::atol(e) : 0L; }();
+#if defined(STRATA_TEST_HOOKS) && defined(STRATA_TEST_HANDOFF_GROW_FAIL_N)
     static std::atomic<long> seen{0};
-    return n > 0 && seen.fetch_add(1) + 1 == n;
+    return seen.fetch_add(1) + 1 == (long) (STRATA_TEST_HANDOFF_GROW_FAIL_N);
+#else
+    return false;
+#endif
 }
 inline int64_t handoff_grow_rows(int64_t want, int64_t max_rows) {   // a grown slot: 4096-row steps (256 below 4096)
     const int64_t step = want < 4096 ? 256 : 4096;
