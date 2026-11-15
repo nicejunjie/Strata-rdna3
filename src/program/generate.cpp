@@ -15458,14 +15458,17 @@ int main(int argc, char** argv) {
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                        // todo 7: only this request fails when the engine can go on - not after a failed batch window
-                        // (the decoding slots' state), not after a verifier that released its GPU waits (#267: the
-                        // server ends the engine on those words), and not after a CUDA fault (below)
-                        static const char* const kVerifyLost[] = {"verify: timed out at layer ", "verify batch: timed out at layer ",
-                                                                  "verify: an earlier window never finished",
-                                                                  "verify batch: an earlier window never finished"};
-                        bool goes_on = !batch_fatal;
-                        for (const char* pre : kVerifyLost) goes_on = goes_on && err.rfind(pre, 0) != 0;
+                        // todo 7 (Fable item 7 review, E1): only this request fails, and the engine goes on, for an
+                        // ALLOW-LIST of host-side resource refusals, each proven by an injection test - everything else
+                        // (a broken invariant, a verifier that released its GPU waits, a failed batch window, a CUDA
+                        // fault) stays fail-stop as before: the engine exits and the server restarts it.  Add a prefix
+                        // here only with its own injection test (results/stall-20261115).
+                        static const char* const kGoesOn[] = {
+                            "prefill: the hand-off buffer could not grow",   // a refused pin + a failed pageable allocation
+                        };
+                        bool goes_on = false;
+                        for (const char* pre : kGoesOn) goes_on = goes_on || err.rfind(pre, 0) == 0;
+                        goes_on = goes_on && !batch_fatal;
                         bool fault = cudaPeekAtLastError() != cudaSuccess;
                         if (!fault && goes_on) {
                             // a fault another thread's call returned (and cleared) shows in the devices' own state: every
