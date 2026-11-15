@@ -36,6 +36,7 @@ namespace strata::hip_compat {
 struct HostLock {
     std::mutex mu;
     std::unordered_map<void*, size_t> blocks;   // locked block -> bytes (forgotten on free; the unmap drops the lock)
+    std::unordered_map<void*, size_t> failed;   // blocks whose mlock failed (counted once; the sweep leaves them)
     uint64_t bytes = 0;
     uint64_t fail_bytes = 0;
     int fails = 0;
@@ -76,6 +77,7 @@ inline void host_lock(void* p, size_t bytes) {
             std::fprintf(stderr, "strata: host memory lock: a %zu KiB block stays unlocked (mlock: %s)\n", bytes >> 10,
                          std::strerror(e));
         s.fail_bytes += bytes;
+        s.failed[p] = bytes;
         return;
     }
     s.blocks[p] = bytes;
@@ -89,6 +91,7 @@ inline void host_lock_forget(void* p) {
     if (p == nullptr) return;
     HostLock& s = host_lock_state();
     std::lock_guard<std::mutex> g(s.mu);
+    s.failed.erase(p);
     auto it = s.blocks.find(p);
     if (it == s.blocks.end()) return;
     s.bytes -= it->second;
@@ -118,6 +121,10 @@ inline void host_lock_sweep_locked(HostLock& s, std::unordered_map<uintptr_t, st
         const std::pair<size_t, unsigned long long> id(bytes, inode);
         auto it = seen.find((uintptr_t) a);
         if (it != seen.end() && it->second == id) continue;
+        bool failed_ours = false;   // a host_alloc block whose own mlock failed: already counted, not tried again
+        for (auto& kv : s.failed)
+            if ((uintptr_t) kv.first >= (uintptr_t) a && (uintptr_t) kv.first < (uintptr_t) b) { failed_ours = true; break; }
+        if (failed_ours) { seen[(uintptr_t) a] = id; continue; }
         if (mlock((void*) (uintptr_t) a, bytes) != 0) {
             const int e = errno;
             if (s.fails++ < 8)
