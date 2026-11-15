@@ -416,6 +416,22 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class EngineError(ValueError):
+    """The engine's ERR line for a request (a ValueError: a 400, as before).  Either the engine refused the request and
+    waits for the next one, or it said why it is about to end; Service.run tells the two apart (todo 7, Fable stall5
+    section 3: a server fault answered as a 400 is not retried, and the next request met the dying engine)."""
+
+
+class EngineFault(ValueError):
+    """The engine failed this request for a reason of its own, not the request's, and goes on serving (its
+    `ERR prompt read failed: ...`): a 503 the client may retry.  A ValueError, so a stream that has started reports
+    it as an error event."""
+
+
+# todo 7: the engine's words for a request it failed for a reason of its own (it keeps serving)
+ENGINE_FAULT_PREFIX = "prompt read failed:"
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -1266,6 +1282,26 @@ class StrataEngine:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
+    # todo 7: after a request's ERR line, how long Service.run waits to see whether the engine ends (an engine that
+    # cannot go on prints its ERR, unwinds and exits: ~2 s on a 2-GPU Q4 engine).  ERR_GOES_ON: lines after which the
+    # engine certainly waits for its next command (it refused the request before reading it, or failed only this
+    # request) - no wait for them
+    ERR_EXIT_WAIT_S = 10.0
+    ERR_GOES_ON = ("BGEN:", "expected: GEN", "logit_bias:", "bad request:", "this engine was started without --vision",
+                   "prompt (", "a token id is outside the vocabulary", ENGINE_FAULT_PREFIX)
+
+    def ended_after_err(self, message: str) -> bool:
+        """todo 7: True when the engine process ended (its output closed, or it exited) within ERR_EXIT_WAIT_S of the
+        ERR line `message`; False at once for an ERR_GOES_ON line, and when it is still running after the wait."""
+        if message.startswith(self.ERR_GOES_ON):
+            return False
+        end = time.monotonic() + self.ERR_EXIT_WAIT_S
+        while self.alive():
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+        return True
+
     def exit_code(self):
         if self.proc is None:
             return None
@@ -1543,7 +1579,7 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise EngineError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -2287,7 +2323,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise EngineError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -4401,6 +4437,17 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
+    def _restart_soon(self) -> None:
+        """todo 7: the engine ended after a request's ERR: start it again now (once this request has given the fifo
+        back), so the next request does not meet a dead engine or wait for the whole load itself."""
+        def go():
+            try:
+                self.load()
+            except Exception as e:  # noqa: BLE001 - the next request tries again (and says why)
+                print(f"[strata] starting the engine again after its error failed: {e}; the next request tries "
+                      "again", flush=True)
+        threading.Thread(target=go, daemon=True, name="strata-restart").start()
+
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
@@ -5368,7 +5415,22 @@ class Service:
                             finish = "error"
                             timed_out = True
                             raise
-                        except ValueError as e:             # the engine's ERR line (it may have ended after it)
+                        except EngineError as e:            # the engine's ERR line (it may have ended after it)
+                            finish = "error"
+                            print(f"[strata] the engine reported an error: {e}", flush=True)
+                            if str(e).startswith(ENGINE_FAULT_PREFIX):   # todo 7: it failed this request only: a 503
+                                raise EngineFault(str(e)) from e
+                            ended = getattr(self.engine, "ended_after_err", None)
+                            if ended is not None and ended(str(e)):
+                                # todo 7: it ended after its ERR: a server fault (503, not 400), and the start begins
+                                # now instead of with the next request (which met the dying engine and got a 503)
+                                died = EngineDied(f"the engine stopped after it reported: {e} "
+                                                  f"(exit code {self.engine.exit_code()})")
+                                self._say_died(died)
+                                self._restart_soon()
+                                raise died from e
+                            raise
+                        except ValueError as e:             # a request the engine was never sent (logit_bias ...)
                             finish = "error"
                             print(f"[strata] the engine reported an error: {e}", flush=True)
                             raise
@@ -6853,7 +6915,7 @@ def make_handler(svc: Service):
                     self._images(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
-            except EngineNonFinite as e:                    # #879, twice: not the request's fault
+            except (EngineNonFinite, EngineFault) as e:     # #879 twice, todo 7: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
@@ -7278,7 +7340,7 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
-                except EngineNonFinite as e:                 # #879, twice: not the request's fault
+                except (EngineNonFinite, EngineFault) as e:  # #879 twice, todo 7: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))

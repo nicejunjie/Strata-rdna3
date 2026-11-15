@@ -7,8 +7,9 @@ import threading
 import time
 import unittest
 import json
+import urllib.error
 import urllib.request
-from serve.server import StrataEngine, Service, ChatTemplate, EngineDied, serve
+from serve.server import StrataEngine, Service, ChatTemplate, EngineDied, EngineFault, serve
 from serve.test_server import ByteTokenizer
 
 FAKE=r'''
@@ -23,6 +24,10 @@ for line in sys.stdin:
   if not state.exists():
    state.write_text('first request was attempted')
    if mode=='invalid':print('ERR prompt exceeds context',flush=True)
+   elif mode=='dies':   # todo 7: a prefill error the engine cannot go on from: ERR, then it unwinds and exits
+    print('ERR prefill: growing the hand-off buffer to 16384 rows: no error',flush=True)
+    import time;time.sleep(0.2);sys.exit(1)
+   elif mode=='fault':print('ERR prompt read failed: prefill: the hand-off buffer could not grow to 16384 rows (no RAM)',flush=True)
    else:
     kind='verify batch' if mode=='batch' else 'verify'
     print(f'ERR {kind}: timed out at layer 18; its GPU waits were released and the GPU finished (#267)',flush=True)
@@ -110,6 +115,43 @@ class FatalRecovery(unittest.TestCase):
         with self.assertRaises(ValueError):list(e.generate([1],8,{},threading.Event()))
         self.assertTrue(e.alive())
         self.assertEqual(list(e.generate([1],8,{},threading.Event())),[90])
+    def test_err_then_exit_is_a_server_error_and_restarts_at_once(self):
+        # todo 7 (Fable stall5 section 3): a 503 (EngineDied), not a 400, and the engine starts again without waiting
+        # for the next request
+        e=self.engine('dies');svc=self.service(e);gen0=e.gen
+        with self.assertRaises(EngineDied):self.run_request(svc)
+        self.assertEqual(svc.history[-1]['finish'],'error')
+        end=time.monotonic()+10
+        while not (e.gen>gen0 and e.alive()) and time.monotonic()<end:time.sleep(.05)
+        self.assertTrue(e.gen>gen0 and e.alive(),'the engine must be started again at once, not by the next request')
+        self.assertEqual(self.run_request(svc)[-1][1]['completion_tokens'],1)
+    def test_engine_fault_that_goes_on_is_a_server_error_on_the_same_process(self):
+        e=self.engine('fault');svc=self.service(e);pid=e.proc.pid
+        with self.assertRaises(EngineFault):self.run_request(svc)
+        self.assertTrue(e.alive());self.assertEqual(e.proc.pid,pid)
+        self.assertEqual(self.run_request(svc)[-1][1]['completion_tokens'],1)
+        self.assertEqual(e.proc.pid,pid,'the next request is served by the same engine process')
+    def test_http_status_of_an_engine_error(self):
+        for mode,code in (('dies',503),('fault',503),('invalid',400)):
+            (self.root/'state').unlink(missing_ok=True)
+            e=self.engine(mode);e.ERR_EXIT_WAIT_S=0.3;svc=self.service(e);http=serve(svc,port=0)
+            body={'messages':[{'role':'user','content':'hi'}],'max_tokens':8,'chat_template_kwargs':{'enable_thinking':False}}
+            req=urllib.request.Request(f'http://127.0.0.1:{http.server_address[1]}/v1/chat/completions',
+                                       data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as cm:urllib.request.urlopen(req,timeout=10)
+                self.assertEqual(cm.exception.code,code,mode)
+                kind=json.loads(cm.exception.read())['error']['type']
+                self.assertEqual(kind,'server_error' if code>=500 else 'invalid_request_error',mode)
+                end=time.monotonic()+10   # (the restart 'dies' starts: done before the engine is closed)
+                while mode=='dies' and not (svc.engine.gen>1 and svc.engine.alive()) and time.monotonic()<end:time.sleep(.05)
+            finally:
+                http.shutdown();http.server_close();svc.engine.close()
+    def test_plain_err_keeps_its_400_when_the_engine_goes_on(self):
+        e=self.engine('invalid');e.ERR_EXIT_WAIT_S=0.3;svc=self.service(e);pid=e.proc.pid
+        with self.assertRaises(ValueError) as cm:self.run_request(svc)
+        self.assertNotIsInstance(cm.exception,(EngineDied,EngineFault))
+        self.assertTrue(e.alive());self.assertEqual(e.proc.pid,pid)
     def test_closed_serial_engine_rejects_without_accessing_closed_pipe(self):
         e=self.engine();e.close()
         with self.assertRaises(EngineDied):list(e.generate([1],8,{},threading.Event()))
