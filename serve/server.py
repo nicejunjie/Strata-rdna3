@@ -1288,12 +1288,19 @@ class StrataEngine:
     # request) - no wait for them
     ERR_EXIT_WAIT_S = 10.0
     ERR_GOES_ON = ("BGEN:", "expected: GEN", "logit_bias:", "bad request:", "this engine was started without --vision",
-                   "prompt (", "a token id is outside the vocabulary", ENGINE_FAULT_PREFIX)
+                   "prompt (", "a token id is outside the vocabulary", ENGINE_FAULT_PREFIX,
+                   # the vision request's own refusals (GENI, generate.cpp's `ve` messages): the engine answers ERR and
+                   # waits for its next command (Fable review item 7, S1).  Coupled to the engine's wording.
+                   "cannot open ", "bad embeddings file", "short embeddings file",
+                   "the prompt has more images than the embeddings file",
+                   "the embeddings file has more images than the prompt", "the prompt cannot end in an image",
+                   "the image position upload failed")
+    ERR_GOES_ON_RE = re.compile(r"image \d+ has ")   # "image <k> has <n> rows ..." (GENI)
 
     def ended_after_err(self, message: str) -> bool:
         """todo 7: True when the engine process ended (its output closed, or it exited) within ERR_EXIT_WAIT_S of the
         ERR line `message`; False at once for an ERR_GOES_ON line, and when it is still running after the wait."""
-        if message.startswith(self.ERR_GOES_ON):
+        if message.startswith(self.ERR_GOES_ON) or self.ERR_GOES_ON_RE.match(message):
             return False
         end = time.monotonic() + self.ERR_EXIT_WAIT_S
         while self.alive():

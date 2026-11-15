@@ -152,6 +152,15 @@ class FatalRecovery(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:self.run_request(svc)
         self.assertNotIsInstance(cm.exception,(EngineDied,EngineFault))
         self.assertTrue(e.alive());self.assertEqual(e.proc.pid,pid)
+    def test_image_request_errs_do_not_wait_for_an_exit(self):
+        # Fable item 7 S1: the GENI refusals leave the engine waiting for its next command, so no 10 s exit wait
+        e=self.engine('invalid');e.ERR_EXIT_WAIT_S=5.0
+        for m in ('cannot open /tmp/x.emb','bad embeddings file (expected strata-vision records of width 4096)',
+                  'short embeddings file','the prompt has more images than the embeddings file',
+                  'image 2 has 196 rows but the prompt holds 256 image tokens','the embeddings file has more images than the prompt',
+                  'the prompt cannot end in an image','the image position upload failed'):
+            t0=time.monotonic();self.assertFalse(e.ended_after_err(m),m);self.assertLess(time.monotonic()-t0,0.5,m)
+        self.assertFalse(StrataEngine.ERR_GOES_ON_RE.match('imagery is not supported'))
     def test_closed_serial_engine_rejects_without_accessing_closed_pipe(self):
         e=self.engine();e.close()
         with self.assertRaises(EngineDied):list(e.generate([1],8,{},threading.Event()))
