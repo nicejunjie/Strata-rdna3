@@ -1801,7 +1801,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             cudaGetLastError();
             m.ple_pageable[b].resize(T * N);          // pageable: the upload is staged before it returns
             m.ple_emb_host[b] = m.ple_pageable[b].data();
-        }
+        } else core::no_core_block(m.ple_emb_host[b], (size_t) T * N * 4);
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);

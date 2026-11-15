@@ -2,6 +2,9 @@
 
 #include "strata/core/progress.hpp"
 
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -78,6 +81,13 @@ public:
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
                 Segment segment;
                 segment.reserve(segment_capacity(count, previous, growing, held));
+#if defined(MADV_DONTDUMP)
+                {   // core dumps: the parked conversations (up to the cache's budget) stay out of a core (docs/HOSTS.md)
+                    const uintptr_t pg = 4096, a = ((uintptr_t) segment.data() + pg - 1) & ~(pg - 1),
+                                    e = ((uintptr_t) segment.data() + segment.capacity()) & ~(pg - 1);
+                    if (e > a + (1u << 20)) (void) madvise((void*) a, e - a, MADV_DONTDUMP);
+                }
+#endif
                 segment.resize(count, value);
                 segments_.push_back(std::move(segment));
                 size_ += count;

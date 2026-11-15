@@ -1,3 +1,4 @@
+#include "strata/core/pin_budget.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -157,6 +158,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (host_err == cudaSuccess) strata::core::no_core_block(host_, bytes_);
         if (host_err != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM

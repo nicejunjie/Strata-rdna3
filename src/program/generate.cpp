@@ -1,3 +1,6 @@
+#if !defined(_WIN32)
+#include <sys/resource.h>
+#endif
 #include "ggml.h"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
@@ -2411,6 +2414,18 @@ static void prime_hw_queues() {
 #endif
 
 int main(int argc, char** argv) {
+#if !defined(_WIN32)
+    {   // core dumps (moon, owner-approved 2026-11-15; docs/HOSTS.md): the host's systemd-coredump stores a core only for a
+        // process whose soft RLIMIT_CORE is above 0 - the engine raises its own to 8 GiB (within the hard limit); the
+        // arena, the pinned blocks and the parked conversations are MADV_DONTDUMP, so a core holds the stacks and the rest
+        struct rlimit rl {};
+        if (getrlimit(RLIMIT_CORE, &rl) == 0) {
+            const rlim_t want = (rlim_t) 8 << 30;
+            rl.rlim_cur = rl.rlim_max == RLIM_INFINITY ? want : std::min<rlim_t>(want, rl.rlim_max);
+            (void) setrlimit(RLIMIT_CORE, &rl);
+        }
+    }
+#endif
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.

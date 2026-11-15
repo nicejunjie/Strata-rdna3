@@ -22,6 +22,7 @@
 // outstanding, which is what the WDDM ceiling does on Windows.  It lets Linux reproduce the exhaustion.
 #pragma once
 
+#include <sys/mman.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -100,6 +101,7 @@ inline uint64_t soft_reserve_default_mib() {
 /// cudaHostRegister through the (test) budget.
 inline cudaError_t pin_register(void* p, size_t bytes, unsigned flags) {
     auto& s = pin_detail::st();
+    no_core_block(p, bytes);
     if (s.sim_budget == 0) return cudaHostRegister(p, bytes, flags);
     std::lock_guard<std::mutex> g(s.mu);
     if (s.sim_used + bytes > s.sim_budget) return cudaErrorMemoryAllocation;
@@ -188,6 +190,19 @@ inline void pin_sim_report(const char* when) {
                  (unsigned long long) (s.sim_peak >> 20), when);
 }
 
+/// Core dumps (moon, owner-approved 2026-11-15; docs/HOSTS.md): keep a block of 64 MiB or more (the expert arena, the KV
+/// host copies, the pinned staging) out of a core, so a crash's core holds the stacks and the small state and fits the
+/// host's per-dump limit.  Page-aligned interior only; a no-op where MADV_DONTDUMP does not exist.
+inline void no_core_block(void* p, size_t bytes) {
+#if defined(MADV_DONTDUMP)
+    if (p == nullptr || bytes < ((size_t) 64 << 20)) return;
+    const uintptr_t pg = 4096, a = ((uintptr_t) p + pg - 1) & ~(pg - 1), e = ((uintptr_t) p + bytes) & ~(pg - 1);
+    if (e > a) (void) madvise((void*) a, e - a, MADV_DONTDUMP);
+#else
+    (void) p; (void) bytes;
+#endif
+}
+
 /// cudaHostAlloc for a buffer the engine cannot run without.  On a refusal it hands the reserves back and tries once
 /// more; the caller still reports a second refusal.
 inline cudaError_t host_alloc_guarded(void** p, size_t bytes, unsigned flags) {
@@ -195,7 +210,7 @@ inline cudaError_t host_alloc_guarded(void** p, size_t bytes, unsigned flags) {
     {
         std::lock_guard<std::mutex> g(s.mu);
         const cudaError_t e = pin_detail::alloc_locked(s, p, bytes, flags);
-        if (e == cudaSuccess) return e;
+        if (e == cudaSuccess) { no_core_block(*p, bytes); return e; }
         (void) cudaGetLastError();
         if (s.hard == nullptr && s.soft == nullptr) return e;
         if (s.soft != nullptr) { pin_detail::free_locked(s, s.soft); s.soft = nullptr; s.soft_bytes = 0; }

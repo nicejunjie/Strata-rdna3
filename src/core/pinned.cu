@@ -316,6 +316,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             note.resize(note.size() - four_k.size());
         note += "; transparent huge pages requested (MADV_HUGEPAGE)";
     }
+    strata::core::no_core_block(p, bytes);   // core dumps: the arena stays out (docs/HOSTS.md)
     return p;
 #endif
 }
