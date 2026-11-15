@@ -13451,6 +13451,7 @@ int main(int argc, char** argv) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                     upload_mrope();
                     mrope_identity = true;
+                    // the server answers these at once (serve/server.py ERR_GOES_ON / ERR_GOES_ON_RE match this wording): keep them in step
                     std::printf("ERR %s\n", ve.c_str());
                     std::fflush(stdout);
                     continue;
