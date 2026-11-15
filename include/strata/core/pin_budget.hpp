@@ -99,6 +99,7 @@ inline uint64_t soft_reserve_default_mib() {
 }  // namespace pin_detail
 
 /// cudaHostRegister through the (test) budget.
+inline void no_core_block(void* p, size_t bytes);   // below (core dumps)
 inline cudaError_t pin_register(void* p, size_t bytes, unsigned flags) {
     auto& s = pin_detail::st();
     no_core_block(p, bytes);
