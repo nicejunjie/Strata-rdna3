@@ -18,7 +18,13 @@
 
 #include <cstdint>
 #include <string>
+#if defined(_WIN32)
+// The implementation is Linux only (elsewhere open() says so and nothing reads
+// keeper_); Windows only needs pid_t to exist for this header to compile.
+typedef int pid_t;
+#else
 #include <sys/types.h>
+#endif
 
 namespace strata::core {
 

@@ -22,7 +22,9 @@
 // outstanding, which is what the WDDM ceiling does on Windows.  It lets Linux reproduce the exhaustion.
 #pragma once
 
-#include <sys/mman.h>
+#if !defined(_WIN32)
+#include <sys/mman.h>   // MADV_DONTDUMP (no_core_block); the uses are #if defined(MADV_DONTDUMP), so Windows needs no header
+#endif
 #include <cuda_runtime.h>
 
 #include <cstdint>
