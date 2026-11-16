@@ -155,6 +155,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <stdexcept>
 #include <string>
 #include <set>
+#include "strata/program/planner_rows.hpp"
 #include <vector>
 
 
@@ -2509,6 +2510,39 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
+    // [claude] phase 3 Deploy A (results/planner-20261112/phase3, review-fable-phase3 sections 1 and 5): the --planner table's
+    // two-card threshold rows (`row2 STRATA_<KEY> <integer>`, planner_rows.hpp).  Applied here, before the option loop and
+    // before any parse site reads a key, with the arch defaults' rule: an explicit environment value wins, else the row,
+    // else the engine default.  A table holding today's values is behaviour-identical by construction.  A table that
+    // cannot be read or is refused applies nothing (one line); the environment alone decides, as before.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) != "--planner") continue;
+        namespace PR = strata::program::planner_rows;
+        std::string text, err;
+        std::FILE* pf = std::fopen(argv[i + 1], "rb");
+        if (pf == nullptr) { std::fprintf(stderr, "strata planner rows: cannot read %s: no rows applied\n", argv[i + 1]); break; }
+        char pbuf[65536]; size_t pn;
+        while ((pn = std::fread(pbuf, 1, sizeof pbuf, pf)) > 0) text.append(pbuf, pn);
+        std::fclose(pf);
+        std::vector<PR::Row> rows;
+        if (!PR::parse(text, rows, err)) {
+            std::fprintf(stderr, "strata planner rows: %s refused (%s): no rows applied, the environment alone decides\n", argv[i + 1], err.c_str());
+            break;
+        }
+        if (rows.empty()) break;   // a one-card table without two-card rows: nothing to say
+        const auto ap = PR::apply(rows, [](const char* k) { return (const char*) std::getenv(k); }, [](const char* k, const char* v) {
+#if defined(_WIN32)
+            _putenv_s(k, v);
+#else
+            setenv(k, v, 0);
+#endif
+        });
+        std::string said; int from_table = 0;
+        for (const auto& a : ap) { said += " " + a.key.substr(7) + "=" + a.value + (a.source == "env" ? "(env)" : ""); from_table += a.source == "table"; }
+        std::fprintf(stderr, "strata planner rows: %s: %zu two-card rows, %d from the table, %zu kept from the environment:%s\n", argv[i + 1],
+                     ap.size(), from_table, ap.size() - (size_t) from_table, said.c_str());
+        break;
+    }
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
@@ -2541,6 +2575,7 @@ int main(int argc, char** argv) {
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
+        else if (a == "--planner") { (void) next("--planner"); }   // [claude] phase 3: its two-card rows are applied at startup (planner_rows.hpp)
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
