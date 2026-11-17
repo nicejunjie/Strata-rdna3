@@ -9915,6 +9915,9 @@ int main(int argc, char** argv) {
         // site; cleared by every other move and every call that keeps the state on the stages (a batched part writes
         // them), and at each request's start
         int64_t tp_clean_cells = -1;
+        // [claude] head split (phase3 followup, review-fable-round4 section 3): set by the head split right before the
+        // batched sub-part's tp_to(false, ...) - a no-op there, which would clear the credit; that one call keeps it
+        bool tp_keep_clean_once = false;
         std::string tp_pre_err;
         auto tp_pre_join = [&]() -> int64_t {   // the precopy's pages (0: none, or it failed)
             if (tp_pre_th.joinable()) tp_pre_th.join();
@@ -9926,7 +9929,12 @@ int main(int argc, char** argv) {
             return p;
         };
         auto tp_to = [&](bool want_tp, int64_t cells, std::string& e) -> bool {
-            if (!tp_on || tp_state_tp == want_tp) { if (tp_on && !want_tp) { tp_pre_join(); tp_clean_cells = -1; } return true; }
+            if (!tp_on || tp_state_tp == want_tp) {
+                if (tp_on && !want_tp) { tp_pre_join(); if (!tp_keep_clean_once) tp_clean_cells = -1; }
+                tp_keep_clean_once = false;
+                return true;
+            }
+            tp_keep_clean_once = false;
             strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
             const int sdev[2] = {0, stages[0]->dev};
             const int64_t slb[2] = {0, split_at[0]};
@@ -15530,6 +15538,51 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
+                // [claude] head split (results/planner-20261112/phase3/followup, review-fable-round4.md section 3): a batched
+                // part that runs TP or DP from a0 = at first reads the head up to the next K/V block boundary (1-3 tokens;
+                // run_tp / run_dp start on a boundary).  read_part read it with sp.run - the layer pipeline over both cards,
+                // about 85 ms a stage whatever the head, 150-180 ms in all (IQ3 / Q4 cache-on maps).  Here the head goes
+                // through the windows on the TP pair instead (the short-read path, about 20 ms), the state goes back to the
+                // stages, and the pages below at + h stay marked clean (tp_clean_cells, the H1 credit) across the batched
+                // sub-part, which writes only from at + h on: the hand-over to the pair after it copies only the new pages.
+                // The batched sub-part then starts on the boundary (its head is 0) and takes the same path and chunk (its
+                // TP / DP length is the same).  Not for: windows parts, batch slots, pictures, a planned or resumed
+                // segment, or loans still out (they go back before any windows read).
+                if (tp_on && o.batch == 0 && req_imgs.empty() && !windows_ok(at, to) &&
+                    !(resume_plan.chunk > 0 && at == resume_plan_at) &&
+                    std::none_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return !p.lent.empty(); })) {
+                    namespace spn = strata::program::segment_plan;
+                    spn::PartFacts hf;
+                    hf.a0 = at; hf.b0 = to; hf.cap = o.prefill_chunk; hf.dp_on = dp_on; hf.layer_split = !stages.empty();
+                    hf.idx_block = strata::kernels::qsa_real_shapes().idx_block;
+                    hf.planned = !stages.empty() && sp.plan_chunk(to - at) > 0;
+                    spn::SegmentPlan hs;
+                    spn::read_side(hs, hf, legacy_thresholds());
+                    const int64_t h = hs.head;
+                    if ((hs.path == spn::Path::TP || hs.path == spn::Path::DP) && h > 0 && at + h < to && windows_ok(at, at + h)) {
+                        if (!tp_to(true, at, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        const auto t_head = Clock::now();
+                        if (!read_windows(at, at + h, err)) {
+                            tp_clean_cells = -1;
+                            if (stop_req.load()) { cancelled = true; break; }   // as a cancelled part: refills below, DONE cancel
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata plan: part %lld-%lld windows (head before %s) %.1f ms\n", (long long) at,
+                                     (long long) (at + h), spn::path_name(hs.path),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t_head).count());
+                        if (!tp_to(false, at + h, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        tp_clean_cells = at + h;     // both sides' host pages below at + h are equal now
+                        tp_keep_clean_once = true;   // the batched sub-part's tp_to(false, at) below is a no-op that keeps it
+                        at += h;
+                    }
+                }
                 const bool win = windows_ok(at, to);
                 const bool late_now = win && late_w > 0 && o.batch == 0;
                 tr("part next", at, to);
