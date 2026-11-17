@@ -14879,6 +14879,8 @@ int main(int argc, char** argv) {
                     }
                     if (te.rfind("prefill TP: ", 0) != 0) { e = te; return false; }   // it ran: the state is not usable
                     std::fprintf(stderr, "strata serve: %s - the usual prompt path reads it\n", te.c_str());
+                    tp_clean_cells = -1;   // [claude] head split (review-fable-gate8 condition 2, option B): a declined TP read takes
+                                           // another path from here; the in-request page credit is not carried across it
                     if (!own_rows_back(e)) return false;   // [claude] review M1
                     if (dp_takes(tn, o.prefill_chunk)) {
                         std::string de;
