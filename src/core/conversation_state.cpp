@@ -30,10 +30,12 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool queued = false) {
+using conversation_detail::HostSide;
+// `side`: which end is the checkpoint's own (pageable) host vector - see conversation_copy.hpp, crashfix-20261117
+bool copy(void* dst, const void* src, size_t bytes, std::string& error, HostSide side, bool queued = false) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
+    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued, side);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -173,13 +175,14 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    const auto D = HostSide::dst;
+    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error, D) ||
+        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error, D)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error, D) ||
+            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error, D) ||
+            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, D)) return false;
     }
     return true;
 }
@@ -197,16 +200,17 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    const auto S = HostSide::src;
+    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error, S) ||
+        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error, S)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error, S) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error, S) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error, S)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error, S)) return false;
         }
     }
     const size_t tokens = c.ids.size();
@@ -227,7 +231,7 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
     if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
         owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
         return fail(error, "direct copy between differently carved sessions");
-    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, queued); };
+    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, HostSide::none, queued); };
     if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
         !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
     for (size_t j = 0; j < owned_qsa(from); ++j) {

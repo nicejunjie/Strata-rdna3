@@ -110,11 +110,13 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+using conversation_detail::HostSide;
+// `side`: the end that is the snapshot's own pageable host memory (a segment, a file block) - crashfix-20261117
+bool transfer(void* dst, const void* src, size_t n, std::string& error, HostSide side) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n, false, side);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
@@ -173,7 +175,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, HostSide::dst);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -258,7 +260,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, HostSide::src);
             })) return false;
     return refresh_residency(st, g, upto, error);
 }
@@ -279,7 +281,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, HostSide::src);
             })) return false;
     return refresh_residency(st, g, upto, error);
 }
@@ -305,7 +307,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     auto why = std::make_shared<std::string>();
     s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why, HostSide::dst);
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -320,7 +322,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
         for (size_t offset = 0; offset < bytes;) {
             const size_t n = std::min(buffer.size(), bytes - offset);
-            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
+            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error, HostSide::dst)) return false;
             if (std::memcmp(buffer.data(), expected + offset, n) != 0) {
                 error = "conversation snapshot: restored K/V bytes differ";
                 return false;
