@@ -270,7 +270,17 @@ bool env_on(const char* name) {
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
 #if defined(STRATA_USE_HIP)
-const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
+// [claude] issue #12: on Windows (WDDM) the default mapped words are not coherent - the host and the GPU read the ring word
+// differently and about 1 run in 4 stalled in the last verify window of a 32K prompt; the coherent words removed it (0 of 10)
+// and decoded 8-18% faster.  So Windows takes them by default (STRATA_VERIFY_COHERENT=0 turns it off); Linux is unchanged.
+const bool g_coherent = [] {
+#if defined(_WIN32)
+    const char* e = std::getenv("STRATA_VERIFY_COHERENT");
+    return e == nullptr || e[0] != '0';
+#else
+    return env_on("STRATA_VERIFY_COHERENT");
+#endif
+}();
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
 #endif
 const bool g_trace = env_on("STRATA_VERIFY_TRACE");
