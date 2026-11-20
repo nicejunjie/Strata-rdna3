@@ -34,10 +34,15 @@ every expert computed (no expert skipping).
 
 > **About the release names in this section** (`claude-20261101-rg23`, `claude-20261102-rg24`, `claude-20261102-p16k`, ...):
 > they are engine builds on the maintainer's own machine, named by date, and are not published as GitHub releases or tags.
-> To run this fork, build it from this branch. The charts below were measured on the builds named above. Production as of
-> 2026-11-15 runs `claude-20261115-stallb` on two GPUs (from this branch) and `claude-20261111-rg23-defaults` on one GPU
-> (`claude-20261115-planner5` for the IQ4 prompt planner); the one-GPU builds come from the rg23 line, published as branch
-> `planner-rg23-20261112`.
+> To run this fork, build it from `main`; there are no release tags. The charts below were measured on the builds named
+> above. Production as of 2026-11-20 runs `claude-20261116-rows2` on two GPUs (branch `rows2-20261116`, one commit on
+> `main`) and the prompt-planner builds of the rg23 line on one GPU (`claude-20261115-planner5` / `-planner6`,
+> `claude-20261119-planner9b`; the line is published as branch `planner-rg23-20261112`).
+
+**Your numbers will differ with the CPU and RAM.** On one GPU the CPU computes the experts the card does not hold, so a
+CPU with fewer cores or slower RAM than the 16-core 9950X3D2 with DDR5-6000 reads prompts and decodes slower (an 8-core
+9800X3D measured about 5% lower prefill at 32K, issue #13). Decode also depends on the kind of text (code drafts are
+accepted more often) and warms up over the first requests while the expert cache adapts.
 
 Lines are the median of 3 trials (9 for UD-Q4_K_XL on 2 GPUs except 16K; the faint band
 is the trial range); every request was checked for exact input length, 256 output tokens and correct retrieval, with no
