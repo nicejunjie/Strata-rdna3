@@ -4851,6 +4851,11 @@ class Service:
         the conversation; a picture the user sends keeps the 400.  A picture that encodes stays in the cache, so the
         prompt's own encode below finds it."""
         fetched = {}                     # a URL's bytes, so prepare() does not download the same picture again
+        # #21: this request's own pictures stay in the cache while the next one is encoded, as encode_all keeps them.
+        # Without it, 64 cached pictures plus one new one evicted the oldest here, encode_all below then missed it,
+        # evicted the next, ... - every picture of the conversation was encoded again on every request.
+        held: list = []
+        keeps = hasattr(self.vision, "encode_all")   # the resident Vision; its encode takes keep
         for m in messages:
             content = m.get("content")
             if m.get("role") != "tool" or not isinstance(content, list):
@@ -4870,7 +4875,10 @@ class Service:
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                            if keeps:
+                                held.append(self.vision.encode(src, keep=held)[0])
+                            else:
+                                self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
