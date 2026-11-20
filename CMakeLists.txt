@@ -805,6 +805,9 @@ endif()
     # C++ runtime sit beside the exe (tools/hip/package_windows.py) and stay normal imports.
     target_link_libraries(strata PRIVATE delayimp)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
+    # Windows ROCm ships no HSA runtime or headers: the SDMA refill (STRATA_REFILL_SDMA) stays on
+    # hipMemcpyAsync, the same fallback a Linux build takes when libhsa-runtime64 is not found.
+    target_compile_definitions(strata PRIVATE STRATA_NO_HSA=1)
   endif()
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
