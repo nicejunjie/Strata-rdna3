@@ -10326,6 +10326,21 @@ int main(int argc, char** argv) {
             if (std::strcmp(what, "prompt") == 0) nf_prompt_windows = true;
             return true;
         };
+        // [claude] issue #18: a window's persistent kernel (STRATA_MEGAKERNEL) had a phase that never completed (another
+        // process held CUs): the window is wrong.  As for non-finite logits, none of its tokens goes out, the request ends
+        // (DONE nonfinite, which the server retries) and the next request reads its prompt from token 0; the persistent
+        // kernel is off for the rest of the process (the windows are captured again with the plain kernels), where the
+        // engine used to stop with an error.
+        auto mk_stall_hit = [&](strata::core::Verifier& v, const char* what) -> bool {
+            if (!v.megakernel_stall_take()) return false;
+            v.megakernel_off();
+            std::fprintf(stderr, "strata serve: a %s window's persistent kernel stalled (#18): its tokens are not emitted, the "
+                                 "request ends (DONE nonfinite) and the next request reads its prompt from token 0\n", what);
+            std::fflush(stderr);
+            nf_hit = true;
+            nan_flush = true;
+            return true;
+        };
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
@@ -14226,6 +14241,10 @@ int main(int argc, char** argv) {
                         e = "non-finite logits (#879)";
                         return false;
                     }
+                    if (mk_stall_hit(dv, "prompt")) {   // [claude] #18 (the same: the next request reads from 0)
+                        e = "the persistent kernel stalled (#18)";
+                        return false;
+                    }
                     // STRATA_LOGPOS=<path>: the teacher-forced log-probability of every token read here (every
                     // token is committed and nxt[t] is the prompt's own next token), appended to <path>; the last
                     // column is the log-probability of STRATA_LOGPOS_EXTRA (default 248046, <|im_end|>), so the
@@ -16644,7 +16663,10 @@ int main(int argc, char** argv) {
                 std::string commit_err;
                 const Clock::time_point tc0 = Clock::now();
                 dt_c_adapt += msx(tw1, tc0);
-                const bool nf_now = nonfinite_hit(dv, first_window ? "first decode" : "decode");   // (reads the window's flags only)
+                // [claude] #18: a stalled persistent kernel ends the request as non-finite logits do (its stall word is
+                // cleared, so the commit below runs: the next request reads from token 0 anyway)
+                const bool nf_now = mk_stall_hit(dv, first_window ? "first decode" : "decode") ||
+                                    nonfinite_hit(dv, first_window ? "first decode" : "decode");   // (reads the window's flags only)
                 const Clock::time_point tc1 = Clock::now();
                 dt_c_nf += msx(tc0, tc1);
                 bool commit_split = false;   // TP: card 0's commit in or beside the draft, card 1's after it

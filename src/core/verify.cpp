@@ -226,7 +226,9 @@ inline bool g_qfuse_hc() {
 }
 // STRATA_MEGAKERNEL=1 (opt-in): a GDN layer's dense chain (q8_1 quantize, qkv/z GEMVs, conv + a/b, recurrence + norm,
 // out GEMV) as one persistent kernel instead of six nodes (megakernel_gdn.cu; bitwise the six - mk_gdn_parity)
-inline bool g_megakernel() { static const bool on = [] { const char* v = std::getenv("STRATA_MEGAKERNEL"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+// [claude] issue #18: g_mk_off - a window's persistent kernel stalled once (Verifier::megakernel_off): off for the process
+std::atomic<bool> g_mk_off{false};
+inline bool g_megakernel() { static const bool on = [] { const char* v = std::getenv("STRATA_MEGAKERNEL"); return v != nullptr && std::atoi(v) != 0; }(); return on && !g_mk_off.load(std::memory_order_relaxed); }
 // fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2: the mixer's work that reads only the layer's input on
 // branches of the window's graph (bitwise the same outputs); 0 = in line, and no branch stream is created.  Unset: 2 on a
 // compute capability 12.0 card (sm120_series.hpp; STRATA_SM120_PERF=0 turns it off), 0 elsewhere.
@@ -1568,6 +1570,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 }
                 if (use_mk) {
+                    mk_in_graph_ = true;
                     strata::kernels::MkGdnArgs a;
                     a.x = xm; a.xq = xq_; a.w_qkv = wqkv->native_data; a.w_z = wg->native_data; a.w_out = wout->native_data;
                     a.m_qkv = mkmat_of(wqkv); a.m_z = mkmat_of(wg); a.m_out = mkmat_of(wout);
@@ -4137,6 +4140,42 @@ bool Verifier::commit(int n_keep, std::string& err) {
     if (!commit_one(n_keep, err)) return false;
     Verifier* nx = tp_ ? (tpl_.rank == 0 ? tp_peer_ : nullptr) : next_;   // TP: rank 0 commits both cards
     return nx == nullptr || nx->commit(n_keep, err);
+}
+
+bool Verifier::megakernel_stall_take() {
+    bool hit = false;
+    for (Verifier* v : {this, tp_ ? tp_peer_ : nullptr}) {
+        if (v == nullptr || v->h_mk_stall_ == nullptr) continue;
+        const unsigned w = *(volatile unsigned*) v->h_mk_stall_;
+        if (w != 0) {
+            std::fprintf(stderr, "strata verify: STRATA_MEGAKERNEL: phase %u of the persistent kernel never completed on CUDA%d "
+                                 "(not every block was resident: another kernel held CUs)\n", w - 1, v->device_);
+            *(volatile unsigned*) v->h_mk_stall_ = 0;
+            hit = true;
+        }
+    }
+    static const long test_n = [] { const char* e = std::getenv("STRATA_TEST_MK_STALL"); return e != nullptr ? std::atol(e) : 0L; }();
+    static long test_seen = 0;
+    if (test_n > 0 && g_megakernel() && (mk_in_graph_ || (tp_ && tp_peer_ != nullptr && tp_peer_->mk_in_graph_)) && ++test_seen == test_n) {
+        std::fprintf(stderr, "strata verify: STRATA_TEST_MK_STALL=%ld: this window reports a persistent-kernel stall\n", test_n);
+        hit = true;
+    }
+    return hit;
+}
+
+void Verifier::megakernel_off() {
+    if (!g_mk_off.exchange(true))
+        std::fprintf(stderr, "strata verify: STRATA_MEGAKERNEL is off for the rest of this process: the windows are captured "
+                             "again with the plain kernels (issue #18)\n");
+    for (Verifier* v : {this, tp_ ? tp_peer_ : nullptr}) {
+        if (v == nullptr) continue;
+        const OnDevice on(v->device_);
+        if (v->cs_) (void) cudaStreamSynchronize(v->cs_);
+        v->mk_in_graph_ = false;
+        for (auto* arr : {v->exec_, v->exec_nr_, v->exec_l_, v->exec_nr_l_})
+            for (int t = 0; t < 9; ++t)
+                if (arr[t] != nullptr) { (void) cudaGraphExecDestroy(arr[t]); arr[t] = nullptr; }
+    }
 }
 
 bool Verifier::commit_one(int n_keep, std::string& err) {

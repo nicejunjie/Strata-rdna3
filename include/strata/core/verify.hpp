@@ -200,6 +200,14 @@ public:
     bool commit(int n_keep, std::string& err);
     /// commit() for this card alone (TP: the caller commits the peer itself, e.g. on another thread).
     bool commit_one(int n_keep, std::string& err);
+    /// [claude] issue #18: a phase of the last window's persistent kernel (STRATA_MEGAKERNEL) never completed (another
+    /// process held CUs): true once, and the stall word is cleared, this verifier's and its TP peer's.  The caller then
+    /// ends the request without that window's tokens, as for non-finite logits (#879).
+    /// STRATA_TEST_MK_STALL=<n> (tests only): the n-th window with the persistent kernel reports a stall.
+    bool megakernel_stall_take();
+    /// [claude] issue #18: the persistent kernel off for the rest of the process; this verifier's and its TP peer's window
+    /// graphs are dropped, so the next window is captured with the plain kernels
+    void megakernel_off();
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -605,6 +613,7 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
+    bool mk_in_graph_ = false;   // [claude] #18: a captured window graph holds the persistent kernel (tests: STRATA_TEST_MK_STALL)
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
