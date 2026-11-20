@@ -1,6 +1,7 @@
 // [claude] see include/strata/core/sdma_copy.hpp
 #include "strata/core/sdma_copy.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +37,22 @@ hsa_status_t collect(hsa_agent_t a, void* data) {
     return HSA_STATUS_SUCCESS;
 }
 inline hsa_signal_t sig_of(const SdmaCopier::Done& d) { hsa_signal_t s; s.handle = d.handle; return s; }
+// [claude] issue #14: STRATA_TEST_SDMA_FAIL=probe | wait (tests only, see sdma_copy.hpp)
+const char* test_fail() { static const char* v = std::getenv("STRATA_TEST_SDMA_FAIL"); return v != nullptr ? v : ""; }
+// 1: landed, 0: not within timeout_ms, -1: a copy failed (negative signal; `v` its value)
+int wait_signal(hsa_signal_t s, int timeout_ms, hsa_signal_value_t& v) {
+    static const uint64_t freq = [] {
+        uint64_t f = 0;
+        return hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &f) == HSA_STATUS_SUCCESS && f > 0 ? f : (uint64_t) 1000000000;
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        v = hsa_signal_wait_scacquire(s, HSA_SIGNAL_CONDITION_LT, 1, freq / 100, HSA_WAIT_STATE_BLOCKED);
+        if (v == 0) return 1;
+        if (v < 0) return -1;
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) return 0;
+    }
+}
 }  // namespace
 
 SdmaCopier* SdmaCopier::for_device(int dev, std::string& err) {
@@ -43,7 +60,10 @@ SdmaCopier* SdmaCopier::for_device(int dev, std::string& err) {
     static std::map<int, std::unique_ptr<SdmaCopier>> made;
     static std::map<int, std::string> failed;
     std::lock_guard<std::mutex> lk(mu);
-    if (auto it = made.find(dev); it != made.end()) return it->second.get();
+    if (auto it = made.find(dev); it != made.end()) {
+        if (it->second->lost()) { err = "an SDMA copy did not land in time earlier"; return nullptr; }   // [claude] issue #14
+        return it->second.get();
+    }
     if (auto it = failed.find(dev); it != failed.end()) { err = it->second; return nullptr; }
     auto fail = [&](const std::string& why) -> SdmaCopier* {
         failed[dev] = why;
@@ -70,9 +90,55 @@ SdmaCopier* SdmaCopier::for_device(int dev, std::string& err) {
     if (c->gpu_agent_ == 0 || c->cpu_agent_ == 0) return fail(std::string("no HSA agent for ") + bus);
     static const int eng = [] { const char* v = std::getenv("STRATA_REFILL_SDMA_ENGINE"); return v ? std::atoi(v) : -1; }();
     c->engine_ = eng;
+    // [claude] issue #14: on ROCm 10.1 with kernel 6.8 every copy was accepted and none ever signalled, so each refill
+    // part waited 30 s and the watchdog ended the engine. One small copy must land (and read back) before the copier is
+    // used; otherwise the caller stays on hipMemcpyAsync (its "stays on hipMemcpyAsync: <why>" line).
+    std::string pe;
+    if (!c->probe(pe)) return fail(pe);   // (a probe copy that may still be in flight keeps its own buffers)
     SdmaCopier* r = c.get();
     made[dev] = std::move(c);
     return r;
+}
+
+bool SdmaCopier::probe(std::string& err) {
+    constexpr size_t kBytes = 4096;
+    constexpr int kTimeoutMs = 2000;   // a 4 KiB copy lands in microseconds; seconds means it never will
+    int prev = -1;
+    (void) hipGetDevice(&prev);
+    struct Back { int d; ~Back() { if (d >= 0) (void) hipSetDevice(d); } } back{prev};
+    if (hipSetDevice(dev_) != hipSuccess) { (void) hipGetLastError(); err = "SDMA probe: hipSetDevice failed"; return false; }
+    void* h = nullptr;
+    void* dv = nullptr;
+    if (hipHostMalloc(&h, kBytes, hipHostMallocDefault) != hipSuccess) { (void) hipGetLastError(); err = "SDMA probe: no pinned buffer"; return false; }
+    if (hipMalloc(&dv, kBytes) != hipSuccess) { (void) hipGetLastError(); (void) hipHostFree(h); err = "SDMA probe: no device buffer"; return false; }
+    auto* hb = static_cast<uint8_t*>(h);
+    for (size_t i = 0; i < kBytes; ++i) hb[i] = (uint8_t) (i * 37u + 11u + (unsigned) dev_);
+    if (hipMemset(dv, 0, kBytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) {
+        (void) hipGetLastError(); (void) hipFree(dv); (void) hipHostFree(h);
+        err = "SDMA probe: hipMemset failed";
+        return false;
+    }
+    Done d;
+    std::string e;
+    if (!create(d, 1, e)) { (void) hipFree(dv); (void) hipHostFree(h); err = "SDMA probe: " + e; return false; }
+    if (!copy(dv, h, kBytes, d, e)) { destroy(d); (void) hipFree(dv); (void) hipHostFree(h); err = "SDMA probe: " + e; return false; }
+    hsa_signal_value_t v = 0;
+    int r = wait_signal(sig_of(d), kTimeoutMs, v);
+    if (r == 1 && std::strcmp(test_fail(), "probe") == 0) r = 0;
+    if (r == 0) {   // never free what a copy may still write: the buffers and the signal stay (8 KiB, once a card)
+        err = "the SDMA probe copy did not land within " + std::to_string(kTimeoutMs) + " ms";
+        return false;
+    }
+    destroy(d);
+    std::vector<uint8_t> back_bytes(kBytes);
+    const bool same = r == 1 && hipMemcpy(back_bytes.data(), dv, kBytes, hipMemcpyDeviceToHost) == hipSuccess &&
+                      std::memcmp(back_bytes.data(), h, kBytes) == 0;
+    (void) hipGetLastError();
+    (void) hipFree(dv);
+    (void) hipHostFree(h);
+    if (r < 0) { err = "the SDMA probe copy failed (signal " + std::to_string((long long) v) + ")"; return false; }
+    if (!same) { err = "the SDMA probe copy landed wrong bytes"; return false; }
+    return true;
 }
 
 bool SdmaCopier::create(Done& d, int64_t n, std::string& err) {
@@ -113,20 +179,20 @@ bool SdmaCopier::landed(const Done& d) const {
 bool SdmaCopier::wait(const Done& d, int timeout_ms) const {
     if (d.handle == 0) return true;
     // [claude] review M5: bounded (a lost completion hung the engine in the next request's join) and the error state seen
-    static const uint64_t freq = [] {
-        uint64_t f = 0;
-        return hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &f) == HSA_STATUS_SUCCESS && f > 0 ? f : (uint64_t) 1000000000;
-    }();
-    const auto t0 = std::chrono::steady_clock::now();
-    for (;;) {
-        const hsa_signal_value_t v = hsa_signal_wait_scacquire(sig_of(d), HSA_SIGNAL_CONDITION_LT, 1, freq / 100, HSA_WAIT_STATE_BLOCKED);
-        if (v == 0) return true;
-        if (v < 0) { std::fprintf(stderr, "strata sdma: a copy failed (signal %lld)\n", (long long) v); return false; }
-        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
-            std::fprintf(stderr, "strata sdma: copies not landed after %d ms (%lld left)\n", timeout_ms, (long long) v);
-            return false;
-        }
+    // [claude] issue #14: lost (an earlier wait timed out): only look - the caller copies the part again through HIP
+    if (lost_.load()) return hsa_signal_load_scacquire(sig_of(d)) == 0;
+    hsa_signal_value_t v = 0;
+    int r = wait_signal(sig_of(d), timeout_ms, v);
+    if (r == 1 && std::strcmp(test_fail(), "wait") == 0) {   // (tests) the first wait reports a timeout though its copies landed
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) r = 0;
     }
+    if (r == 1) return true;
+    if (r < 0) { std::fprintf(stderr, "strata sdma: a copy failed (signal %lld)\n", (long long) v); return false; }
+    if (!lost_.exchange(true))
+        std::fprintf(stderr, "strata sdma: copies not landed after %d ms (%lld left); CUDA%d's copies go through hipMemcpyAsync "
+                             "from now on (issue #14)\n", timeout_ms, (long long) v, dev_);
+    return false;
 }
 namespace {
 struct Landed { void (*fn)(void*); void* arg; };

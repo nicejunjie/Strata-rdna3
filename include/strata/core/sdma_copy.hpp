@@ -7,6 +7,7 @@
 // ran beside the first decode windows that way, and every one of those windows' kernels on that card ran 3-4x slower
 // (2x RX 7900 XTX, Qwen3.8-Flash IQ3_S, 128K prompt: the first eight windows 85 ms instead of 20).  hsa_amd_memory_async_copy
 // goes to the SDMA engine, which leaves the CUs alone.  HIP builds only; elsewhere for_device returns null.
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -16,6 +17,9 @@ namespace strata::core {
 class SdmaCopier {
 public:
     /// the copier of a HIP device (made on first use; null when the build has no HSA or the agent was not found - `err` says)
+    /// [claude] issue #14: also null when its start-up probe copy did not land (ROCm 10.1 / kernel 6.8 accepted SDMA copies
+    /// that never signalled), and from the first wait that timed out on (lost: the callers go to hipMemcpyAsync from then on)
+    /// STRATA_TEST_SDMA_FAIL=probe | wait (tests only): the probe reports not landed | the first wait reports a timeout
     static SdmaCopier* for_device(int dev, std::string& err);
 
     /// a completion counter `n` copies decrement; landed() once every one did
@@ -30,8 +34,10 @@ public:
     bool copy(void* dst_dev, const void* src_host, size_t bytes, Done& d, std::string& err);
     /// landed: no copy still in flight (a failed copy - the signal went negative - counts as landed; `wait` reports it)
     bool landed(const Done& d) const;
-    /// [claude] review M5: blocks until `d` lands; false when a copy failed (negative signal) or `timeout_ms` passed
+    /// [claude] review M5: blocks until `d` lands; false when a copy failed (negative signal) or `timeout_ms` passed.
+    /// [claude] issue #14: a timeout marks the copier lost; a wait on a lost copier only looks (never blocks again)
     bool wait(const Done& d, int timeout_ms = 30000) const;
+    bool lost() const { return lost_.load(); }
     /// `fn(arg)` once `d` lands (the runtime's async thread; at most once per call; the Done must stay alive until then).
     /// false: not registered (the caller polls `landed` instead).
     bool on_landed(Done& d, void (*fn)(void*), void* arg);
@@ -42,9 +48,11 @@ public:
 
 private:
     SdmaCopier() = default;
+    bool probe(std::string& err);   // one small copy that must land and read back (for_device)
     int dev_ = -1;
     int engine_ = -1;
     uint64_t gpu_agent_ = 0, cpu_agent_ = 0;
+    mutable std::atomic<bool> lost_{false};
 };
 
 }  // namespace strata::core

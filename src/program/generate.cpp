@@ -10928,10 +10928,13 @@ int main(int argc, char** argv) {
             std::string e2;
             strata::core::SdmaCopier* c = strata::core::SdmaCopier::for_device(dev < 0 ? 0 : dev, e2);
             static std::set<int> said;
-            if (said.insert(dev).second)
-                std::fprintf(stderr, c != nullptr ? "strata serve: the late refill on CUDA%d goes to the SDMA engine through HSA (engine %d)\n"
-                                                  : "strata serve: the late refill on CUDA%d stays on hipMemcpyAsync: %s\n",
-                             dev < 0 ? 0 : dev, c != nullptr ? c->engine() : 0, e2.c_str());
+            if (said.insert(dev).second) {   // [claude] #14: the reason was printed as "(null)" (the engine number took its place)
+                if (c != nullptr)
+                    std::fprintf(stderr, "strata serve: the late refill on CUDA%d goes to the SDMA engine through HSA (engine %d)\n",
+                                 dev < 0 ? 0 : dev, c->engine());
+                else
+                    std::fprintf(stderr, "strata serve: the late refill on CUDA%d stays on hipMemcpyAsync: %s\n", dev < 0 ? 0 : dev, e2.c_str());
+            }
             return c;
         };
         // a part's completion counter for n copies (none: its event alone)
@@ -11300,10 +11303,13 @@ int main(int argc, char** argv) {
                         std::string e2;
                         strata::core::SdmaCopier* sd = strata::core::SdmaCopier::for_device(dev, e2);
                         static std::set<int> said;
-                        if (said.insert(dev).second)
-                            std::fprintf(stderr, sd != nullptr ? "strata serve: the adaptive tier's copies on CUDA%d go to the SDMA engine through HSA (engine %d)\n"
-                                                               : "strata serve: the adaptive tier's copies on CUDA%d stay on hipMemcpyAsync: %s\n",
-                                         dev, sd != nullptr ? sd->engine() : 0, e2.c_str());
+                        if (said.insert(dev).second) {   // [claude] #14: (the same "(null)" reason as the late refill's line)
+                            if (sd != nullptr)
+                                std::fprintf(stderr, "strata serve: the adaptive tier's copies on CUDA%d go to the SDMA engine through HSA (engine %d)\n",
+                                             dev, sd->engine());
+                            else
+                                std::fprintf(stderr, "strata serve: the adaptive tier's copies on CUDA%d stay on hipMemcpyAsync: %s\n", dev, e2.c_str());
+                        }
                         asd.parts.push_back({sd, {}, dev, s.layer, 0, &asd});
                         part = &asd.parts.back();
                         if (asd.layers.empty() || asd.layers.back() != s.layer) asd.layers.push_back(s.layer);
