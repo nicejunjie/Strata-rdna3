@@ -43,6 +43,8 @@ inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { *e = new
 inline cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) { e->seq = fake::seq(); return cudaSuccess; }
 inline cudaError_t cudaEventSynchronize(cudaEvent_t e) { fake::run_until(e->seq); return cudaSuccess; }
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) { return cudaSuccess; }
+inline cudaError_t cudaFreeHost(void* p) { fake::pinned().erase(p); delete[] static_cast<uint8_t*>(p); return cudaSuccess; }
+inline cudaError_t cudaGetLastError() { return cudaSuccess; }
 template<class T> inline cudaError_t cudaHostAlloc(T** p, size_t n, unsigned) {
     *p = reinterpret_cast<T*>(new uint8_t[n]);
     fake::pinned().insert(*p);

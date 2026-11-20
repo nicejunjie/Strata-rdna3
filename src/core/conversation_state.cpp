@@ -3,6 +3,7 @@
 #include "conversation_copy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <limits>
 
@@ -173,18 +174,81 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
-    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    {   // O (crashfix-20261117): the state into a pinned staging area (direct DMA), the blocks filled by the device's helper
+        // thread (pending until then); layout gdn | ple | tails | dead | block_pos, the layers' parts contiguous as in the blocks
+        const size_t n_ple = ss.ple_hist ? z.ple : 0, n_t = layers * z.tail, n_d = layers * z.dead, n_b = layers * z.block_pos;
+        const size_t off_ple = z.gdn, off_t = off_ple + n_ple, off_d = off_t + n_t, off_b = off_d + n_d, total = off_b + n_b;
+        int dev = 0;
+        if (total && cudaGetDevice(&dev) == cudaSuccess) {
+            auto& h = conversation_detail::ckpt_helper(dev);
+            const int slot = conversation_detail::ckpt_acquire(h, total);
+            if (slot >= 0) {
+                auto* a = static_cast<uint8_t*>(h.area[slot]);
+                bool ok = copy(a, ss.gdn_state, z.gdn, error, HostSide::none, true) &&
+                          copy(a + off_ple, ss.ple_hist, n_ple, error, HostSide::none, true);
+                for (size_t j = 0; ok && j < layers; ++j) {
+                    const auto& st = owned(ss, j);
+                    ok = copy(a + off_t + j * z.tail, st.idx_tail, z.tail, error, HostSide::none, true) &&
+                         copy(a + off_d + j * z.dead, st.idx_dead, z.dead, error, HostSide::none, true) &&
+                         copy(a + off_b + j * z.block_pos, st.idx_block_pos, z.block_pos, error, HostSide::none, true);
+                }
+                cudaStream_t s = nullptr;
+                if (ok && conversation_detail::private_stream(s) == cudaSuccess) {
+                    const cudaError_t e = cudaStreamSynchronize(s);
+                    if (e != cudaSuccess) { ok = false; error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(e); }
+                } else if (ok) ok = fail(error, "no private copy stream");
+                if (!ok) {
+                    cudaStream_t s2 = nullptr;
+                    if (conversation_detail::private_stream(s2) == cudaSuccess) (void) cudaStreamSynchronize(s2);   // nothing in flight
+                    conversation_detail::ckpt_release(h, slot);
+                    c.gdn.clear(); c.ple.clear(); c.tails.clear(); c.dead.clear(); c.block_pos.clear();
+                    return false;
+                }
+                std::vector<conversation_detail::CkptPart> parts{
+                    {c.gdn.begin_pending(z.gdn), 0, z.gdn}, {c.ple.begin_pending(n_ple), off_ple, n_ple},
+                    {c.tails.begin_pending(n_t), off_t, n_t}, {c.dead.begin_pending(n_d), off_d, n_d},
+                    {c.block_pos.begin_pending(n_b), off_b, n_b}};
+                conversation_detail::ckpt_submit(h, slot, std::move(parts));
+                return true;
+            }
+        }
+    }
+#endif
+    // L (crashfix-20261117): every byte is overwritten from the GPU below, so the blocks are fresh and unfilled; a failed copy
+    // clears them (h: no half-written checkpoint stays readable), and every caller drops the checkpoint on false
+    c.gdn.assign_for_overwrite(z.gdn); c.ple.assign_for_overwrite(ss.ple_hist ? z.ple : 0);
+    c.tails.assign_for_overwrite(layers * z.tail); c.dead.assign_for_overwrite(layers * z.dead);
+    c.block_pos.assign_for_overwrite(layers * z.block_pos);
+    auto failed = [&] { c.gdn.clear(); c.ple.clear(); c.tails.clear(); c.dead.clear(); c.block_pos.clear(); return false; };
     const auto D = HostSide::dst;
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error, D) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error, D)) return false;
+    if (!copy(c.gdn.mutable_data(), ss.gdn_state, c.gdn.size(), error, D) ||
+        !copy(c.ple.mutable_data(), ss.ple_hist, c.ple.size(), error, D)) return failed();
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error, D) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error, D) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, D)) return false;
+        if (!copy(c.tails.mutable_data() + j * z.tail, st.idx_tail, z.tail, error, D) ||
+            !copy(c.dead.mutable_data() + j * z.dead, st.idx_dead, z.dead, error, D) ||
+            !copy(c.block_pos.mutable_data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, D)) return failed();
     }
     return true;
+}
+
+void conversation_checkpoint_release_held(CkptRelease point, bool no_late_left) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    // STRATA_TEST_CKPT_RELEASE (tests only): decode_start = at the decode start whatever is left to join; request_end = at the
+    // request's end only (the deadlock releases still apply).  Unset: the first of decode start with nothing left and the last join.
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_TEST_CKPT_RELEASE");
+        if (!e) return 0;
+        return std::string(e) == "decode_start" ? 1 : std::string(e) == "request_end" ? 2 : 0;
+    }();
+    bool go = point == CkptRelease::request_end;
+    if (mode == 0) go = go || point == CkptRelease::late_join_done || (point == CkptRelease::decode_start && no_late_left);
+    if (mode == 1) go = go || point == CkptRelease::decode_start;
+    if (go) conversation_detail::ckpt_release_held();
+#else
+    (void) point; (void) no_late_left;
+#endif
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,

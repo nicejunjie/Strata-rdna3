@@ -1861,6 +1861,8 @@ public:
     bool on() const { return on_; }
     void give(ConvCheckpoint&& c) {
         if (!on_ || c.gdn.empty()) return;
+        // S (crashfix-20261117): only storage no parked copy shares is reused (copy-on-write would keep others safe anyway)
+        if (!c.gdn.unique() || !c.ple.unique() || !c.tails.unique() || !c.dead.unique() || !c.block_pos.unique()) return;
         clear_marks(c);
         std::lock_guard<std::mutex> lk(mu_);
         if (free_.size() < cap_) free_.push_back(std::move(c));
@@ -11123,6 +11125,7 @@ int main(int argc, char** argv) {
                 ++joined;
             }
             late.swap(keep);   // (the parts not joined were moved into `keep`: back, whether any joined or not)
+            if (late.empty()) strata::core::conversation_checkpoint_release_held(strata::core::CkptRelease::late_join_done);   // P1: after the last late join
             if (joined == 0) return;
             if (late_tr) {
                 std::fprintf(stderr, "strata trace: late join %zu parts %zu rows at window %lld, %zu parts left\n", joined,
@@ -14065,6 +14068,8 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
+            // P1: whichever way this request ends (an error, a cancel, no token, a disconnect), its held checkpoint copies run
+            struct CkptReleaseGuard { ~CkptReleaseGuard() { strata::core::conversation_checkpoint_release_held(); } } ckpt_release_guard;
             req_times = ReqTimes{};
             tp_clean_cells = -1;
             if (use_mtp) mtp.set_prompt_len(n);
@@ -16347,6 +16352,7 @@ int main(int argc, char** argv) {
                 }
             }
             tr("decode start", n);
+            strata::core::conversation_checkpoint_release_held(strata::core::CkptRelease::decode_start, late.empty());   // P1
             // [claude] review M3: the stages hold [0, n - 1) here (the first window reads token n - 1): moving n recorded cell
             // n - 1 as moved, and STRATA_TP_BACK_SKIP then skipped its page on the way back when n % page_size == 0 (stale K/V
             // for the next live-continued turn)

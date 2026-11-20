@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/core/checkpoint_block.hpp"
 #include "strata/core/progress.hpp"
 
 #if !defined(_WIN32)
@@ -64,7 +65,15 @@ public:
             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
         return total;
     }
-    void resize(size_t n, uint8_t value = 0) {
+    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
+    // N (crashfix-20261117): the same, but new bytes are left uninitialised - only for a caller that overwrites every byte
+    // it grows by right after (conversation_kv_save: [keep, size) is written by the transfer, a failed one drops the image)
+    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
+    void pop_back() { resize(size_ - 1); }
+private:
+    void resize_impl(size_t n, const uint8_t* fill) {
+        const uint8_t value = fill ? *fill : 0;
+        auto grow = [&](Segment& s, size_t to) { if (fill) s.resize(to, value); else s.resize(to); };
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
@@ -73,7 +82,7 @@ public:
             const size_t extra = n - size_ - extend;
             segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
             if (extend) {
-                segments_.back().resize(segments_.back().size() + extend, value);
+                grow(segments_.back(), segments_.back().size() + extend);
                 size_ += extend;
             }
             while (size_ < n) {
@@ -88,7 +97,7 @@ public:
                     if (e > a + (1u << 20)) (void) madvise((void*) a, e - a, MADV_DONTDUMP);
                 }
 #endif
-                segment.resize(count, value);
+                grow(segment, count);
                 segments_.push_back(std::move(segment));
                 size_ += count;
                 progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
@@ -102,7 +111,7 @@ public:
             size_ = n;
         }
     }
-    void pop_back() { resize(size_ - 1); }
+public:
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
@@ -133,7 +142,7 @@ public:
     }
 
 private:
-    using Segment = std::vector<uint8_t>;
+    using Segment = std::vector<uint8_t, DefaultInitAllocator<uint8_t>>;   // N: fill only where a value is passed
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.

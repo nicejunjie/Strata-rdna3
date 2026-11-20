@@ -2,6 +2,7 @@
 // Token equality, image identity, and steering mode are all required for reuse.
 #pragma once
 
+#include "strata/core/checkpoint_block.hpp"
 #include "strata/core/conversation_buffer.hpp"
 
 #include <algorithm>
@@ -23,7 +24,8 @@ struct ConversationImageKey {
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
-    std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
+    // S (crashfix-20261117): shared copy-on-write blocks; copying a checkpoint shares them (checkpoint_block.hpp)
+    CheckpointBlock gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
