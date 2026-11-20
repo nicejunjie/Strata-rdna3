@@ -531,6 +531,24 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                 cudaError_t st = cudaSuccess;
                 if (!cols.empty()) {   // every row's blocks of the column ranges: strided copies from the mapped file
                     const uint64_t new_row = new_in / (uint64_t) be * (uint64_t) bb;
+#if defined(_WIN32)
+                    (void) new_row;
+                    // [claude] issue #6: on Windows a strided hipMemcpy2D from the read-only file mapping (MapViewOfFile,
+                    // FILE_MAP_READ) returned success and wrote wrong bytes (8.3 of 8.4 MB of a slice differed; a standalone
+                    // repro outside the engine).  The rows are packed on the CPU and go up in one copy (load time only).
+                    std::vector<uint8_t> packed;
+                    try { packed.resize(bytes); } catch (const std::exception&) { err = "tp: " + t.name + ": no RAM to pack the slice"; return false; }
+                    uint64_t poff = 0;
+                    for (uint64_t o = 0; o < n_out; ++o)
+                        for (const Range& c : cols) {
+                            const uint64_t w = c.count / (uint64_t) be * (uint64_t) bb, so = c.begin / (uint64_t) be * (uint64_t) bb;
+                            if (poff + w > bytes) { err = "tp: " + t.name + ": the slice bytes do not add up"; return false; }
+                            std::memcpy(packed.data() + poff, src + o * row_bytes + so, w);
+                            poff += w;
+                        }
+                    if (poff != bytes) { err = "tp: " + t.name + ": the slice bytes do not add up"; return false; }
+                    st = cudaMemcpy(dst, packed.data(), bytes, cudaMemcpyHostToDevice);
+#else
                     uint64_t doff = 0;
                     for (const Range& c : cols) {
                         const uint64_t w = c.count / (uint64_t) be * (uint64_t) bb, so = c.begin / (uint64_t) be * (uint64_t) bb;
@@ -538,6 +556,7 @@ bool TpWeights::build(const WeightTable& full, const ModelGeometry& g, int rank,
                         if (st != cudaSuccess) break;
                         doff += w;
                     }
+#endif
                 } else {
                     uint64_t off = 0;
                     for (const Range& rg : rows) {
