@@ -76,7 +76,9 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
 /// calling thread's private copy stream - so the first requests do not pay for it.  Staging area 1 stays lazy.  The
 /// state after it is the state after the first save and the first restore.  False + error when a part could not be made;
 /// the copies then make it on first use, as before.  A no-op (true) where there is no staging (not HIP).
-bool conversation_checkpoint_prepare(const SessionState& session, const ModelGeometry& g, std::string& error);
+/// area0_bytes (optional): the size of the device's staging area 0 after it (0 where there is none).
+bool conversation_checkpoint_prepare(const SessionState& session, const ModelGeometry& g, std::string& error,
+                                     size_t* area0_bytes = nullptr);
 /// P1 (crashfix-20261117): the checkpoint copies a save handed to the helper threads are held until this is called (the serve
 /// loop after the last late join; a reader at a pending block, a save with both staging areas busy and the request's scope
 /// release them too).  A no-op where there is no helper.

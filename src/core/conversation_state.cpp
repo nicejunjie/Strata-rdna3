@@ -245,7 +245,8 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
-bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry& g, std::string& error) {
+bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry& g, std::string& error, size_t* area0_bytes) {
+    if (area0_bytes) *area0_bytes = 0;
 #if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(STRATA_GPU_METAL)
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, 0, z, error)) return false;   // the save's own sizes (they do not depend on the prompt)
@@ -255,13 +256,16 @@ bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry
     if (e != cudaSuccess) { error = std::string("conversation checkpoint setup: no current device: ") + cudaGetErrorString(e); return false; }
     cudaStream_t s = nullptr;
     if ((e = conversation_detail::private_stream(s)) != cudaSuccess) {   // this thread's copy stream on the device
+        (void) cudaGetLastError();
         error = std::string("conversation checkpoint setup: private stream: ") + cudaGetErrorString(e);
         return false;
     }
     bool ok = true;
-    if (lay.total && !conversation_detail::ckpt_prepare(conversation_detail::ckpt_helper(dev), lay.total)) {
+    auto& h = conversation_detail::ckpt_helper(dev);
+    if (lay.total && !conversation_detail::ckpt_prepare(h, lay.total)) {
         ok = fail(error, "staging area 0 could not be allocated (the first save allocates it)");
     }
+    if (area0_bytes) { std::lock_guard<std::mutex> lk(h.mu); *area0_bytes = h.cap[0]; }   // (the trace line's bytes)
     if ((e = conversation_detail::bounce_prepare()) != cudaSuccess) {
         (void) cudaGetLastError();
         error = std::string("conversation checkpoint setup: bounce buffers: ") + cudaGetErrorString(e);
@@ -269,7 +273,7 @@ bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry
     }
     return ok;
 #else
-    (void) ss; (void) g; (void) error;
+    (void) ss; (void) g; (void) error; (void) area0_bytes;
     return true;
 #endif
 }

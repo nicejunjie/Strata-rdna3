@@ -370,6 +370,17 @@ bool ckpt_threads_env() {
     }();
     return on;
 }
+// STRATA_TEST_CKPT_EAGER=0 (tests only; read once; default on): no checkpoint copy setup at load (d, exitfix-20261121), so
+// the first save and the first restore make their staging area, helper, bounce buffers and streams on first use exactly as
+// before (headp1).  The gate's lazy arm, which gives the 2nd request's restore split on the same binary (review-fable-impl
+// required change 1).
+bool ckpt_eager_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_TEST_CKPT_EAGER");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
 // STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
 // instead of copying it (~112 MB of host vectors).  The main session's chain no longer holds it, so the request path
 // looks for it in the slots' checkpoints too: while the main session's cells still hold its tokens it is restored there
@@ -12245,9 +12256,13 @@ int main(int argc, char** argv) {
         // every restore select the stage's device on it - and, with STRATA_CKPT_THREADS, each stage's save thread).
         // Area 1 stays lazy.  Only when a checkpoint can be saved (checkpoint_at's predicate).  A part that fails is made
         // on first use as before (one line).  Before the lock line, so these pinned blocks are in its count and VmLck.
-        if (o.prompt_cache > 0) {
+        // STRATA_TEST_CKPT_EAGER=0 (tests only): skipped, the copies set up on first use as in headp1 (one trace line)
+        if (o.prompt_cache > 0 && !ckpt_eager_env() && std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: checkpoint copy setup at load: off (STRATA_TEST_CKPT_EAGER=0), set up on first use\n");
+        if (o.prompt_cache > 0 && ckpt_eager_env()) {
             const Clock::time_point e0 = Clock::now();
             int prepared = 0;
+            std::string area0;   // the bytes of each device's staging area 0, in the trace line
             auto prepare_on = [&](int dev, const strata::core::SessionState& pss) {   // dev < 0: the thread's current device
                 const strata::core::OnDevice on(dev);
                 int cur = -1;
@@ -12258,11 +12273,15 @@ int main(int argc, char** argv) {
                                          "its copies set up on first use\n", dev);
                     return;
                 }
-                if (!strata::core::conversation_checkpoint_prepare(pss, g, pe))
+                size_t a0 = 0;
+                if (!strata::core::conversation_checkpoint_prepare(pss, g, pe, &a0))
                     std::fprintf(stderr, "strata serve: checkpoint copy setup at load (device %d): %s; set up on first use\n",
                                  dev, pe.c_str());
                 else
                     ++prepared;
+                int adev = dev;
+                if (adev < 0) (void) cudaGetDevice(&adev);
+                area0 += (area0.empty() ? "" : ", ") + std::string("device ") + std::to_string(adev) + " " + std::to_string(a0);
             };
             prepare_on(-1, ss);
             for (auto& st : stages) prepare_on(st->dev, st->ss);
@@ -12276,8 +12295,8 @@ int main(int argc, char** argv) {
                 ckpt_threads.run(stages.size() + 1, job);   // starts the save threads now, as a first save would
             }
             if (ckpt_trace)
-                std::fprintf(stderr, "strata trace: checkpoint copy setup at load: %d part(s), %.1f ms\n", prepared,
-                             std::chrono::duration<double, std::milli>(Clock::now() - e0).count());
+                std::fprintf(stderr, "strata trace: checkpoint copy setup at load: %d part(s), %.1f ms, staging area 0 bytes: %s\n",
+                             prepared, std::chrono::duration<double, std::milli>(Clock::now() - e0).count(), area0.c_str());
         }
         ::strata::hip_compat::host_lock_report("at READY");   // the one host memory lock line (hip_compat/host_lock.hpp)
 #endif
