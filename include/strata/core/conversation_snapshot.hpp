@@ -70,6 +70,13 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// (d, exitfix-20261121) at load, on the thread that will issue this session's checkpoint copies and with the session's
+/// device current: everything a save and a restore of this session make on first use today - the device's staging area 0
+/// at the exact size of this session's save, the device's helper thread, the device's bounce buffers and events, and the
+/// calling thread's private copy stream - so the first requests do not pay for it.  Staging area 1 stays lazy.  The
+/// state after it is the state after the first save and the first restore.  False + error when a part could not be made;
+/// the copies then make it on first use, as before.  A no-op (true) where there is no staging (not HIP).
+bool conversation_checkpoint_prepare(const SessionState& session, const ModelGeometry& g, std::string& error);
 /// P1 (crashfix-20261117): the checkpoint copies a save handed to the helper threads are held until this is called (the serve
 /// loop after the last late join; a reader at a pending block, a save with both staging areas busy and the request's scope
 /// release them too).  A no-op where there is no helper.

@@ -31,6 +31,15 @@ static_assert(std::is_trivially_destructible<std::mutex>::value, "a static std::
 /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
 /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
 /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
+/// STRATA_TRACE (exitfix-20261121 (d)): where a checkpoint restore's time goes on this thread - the one-time setup
+/// (the bounce buffers' allocation, the bounce events and this thread's private stream) against the copies.  Summed only
+/// while tracing; conversation_checkpoint_restore resets and prints it.
+struct CopySplit { double alloc_ms = 0.0, create_ms = 0.0; };
+inline bool copy_trace_on() { static const bool on = std::getenv("STRATA_TRACE") != nullptr; return on; }
+inline CopySplit& copy_split() { thread_local CopySplit c; return c; }
+inline double ms_since_(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
 /// private_stream: this thread's stream on the current device, created on first use.
 inline cudaError_t private_stream(cudaStream_t& s) {
     int dev = 0;
@@ -40,7 +49,9 @@ inline cudaError_t private_stream(cudaStream_t& s) {
     if (dev < 0) dev = 0;
     if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);   // never destroyed: process lifetime
     if (!streams[(size_t) dev]) {
+        const auto t0 = std::chrono::steady_clock::now();
         e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
+        if (copy_trace_on()) copy_split().create_ms += ms_since_(t0);
         if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
     }
     s = streams[(size_t) dev];
@@ -95,15 +106,27 @@ inline cudaError_t bounce_slot(BounceSlot*& out) {
 inline cudaError_t bounce_ready(BounceSlot& b) {   // under b.mu
     for (size_t i = 0; i < bounce_bufs; ++i) {
         if (!b.buf[i]) {
+            const auto t0 = std::chrono::steady_clock::now();
             const cudaError_t e = cudaHostAlloc(&b.buf[i], bounce_chunk, cudaHostAllocPortable);
+            if (copy_trace_on()) copy_split().alloc_ms += ms_since_(t0);
             if (e != cudaSuccess) { b.buf[i] = nullptr; return e; }
         }
         if (!b.ev[i]) {
+            const auto t0 = std::chrono::steady_clock::now();
             const cudaError_t e = cudaEventCreateWithFlags(&b.ev[i], cudaEventDisableTiming);
+            if (copy_trace_on()) copy_split().create_ms += ms_since_(t0);
             if (e != cudaSuccess) { b.ev[i] = nullptr; return e; }
         }
     }
     return cudaSuccess;
+}
+/// (d) at load: the current device's bounce buffers and events, made now instead of at the first restore
+inline cudaError_t bounce_prepare() {
+    BounceSlot* slot = nullptr;
+    cudaError_t e = bounce_slot(slot);
+    if (e != cudaSuccess) return e;
+    std::lock_guard<std::mutex> lk(slot->mu);
+    return bounce_ready(*slot);
 }
 /// The copy through the slot's pinned buffers on stream `s`, complete on return.
 inline cudaError_t copy_bounced(void* dst, const void* src, size_t bytes, HostSide side, cudaStream_t s) {
@@ -220,11 +243,15 @@ inline CkptHelper& ckpt_helper(int dev) {
     if (!(*helpers)[(size_t) dev]) (*helpers)[(size_t) dev] = new CkptHelper();
     return *(*helpers)[(size_t) dev];
 }
-/// A free staging area of at least `bytes` on device `dev`, waiting for one when both are busy; -1 when none can be allocated.
-inline int ckpt_acquire(CkptHelper& h, size_t bytes) {
-    // STRATA_TEST_CKPT_STAGING_FAIL=1 (tests only): no staging area can be allocated (the bounce path takes the save)
+/// STRATA_TEST_CKPT_STAGING_FAIL=1 (tests only): no staging area can be allocated (the bounce path takes the save)
+inline bool test_ckpt_staging_fail() {
     static const bool refuse = [] { const char* e = std::getenv("STRATA_TEST_CKPT_STAGING_FAIL"); return e && e[0] == '1'; }();
-    if (refuse) return -1;
+    return refuse;
+}
+/// A free staging area of at least `bytes` on device `dev`, waiting for one when both are busy; -1 when none can be allocated.
+/// (d): area 0 is normally made at load at its exact size (ckpt_prepare); this grow branch stays as the fallback.
+inline int ckpt_acquire(CkptHelper& h, size_t bytes) {
+    if (test_ckpt_staging_fail()) return -1;
     std::unique_lock<std::mutex> lk(h.mu);
     if (h.busy[0] && h.busy[1]) {   // both areas taken by held copies: let them run (P1), then wait for one
         lk.unlock(); ckpt_release_held(); lk.lock();
@@ -244,9 +271,7 @@ inline void ckpt_release(CkptHelper& h, int slot) {
     { std::lock_guard<std::mutex> lk(h.mu); h.busy[slot] = false; }
     h.freed.notify_all();
 }
-inline void ckpt_submit(CkptHelper& h, int slot, std::vector<CkptPart> parts) {
-    std::lock_guard<std::mutex> lk(h.mu);
-    h.q.push_back({slot, std::move(parts), true});
+inline void ckpt_start_locked(CkptHelper& h) {   // under h.mu: the device's helper thread, once
     ckpt_release_hook().store(&ckpt_release_held, std::memory_order_release);
     if (!h.started) {
         h.started = true;
@@ -270,7 +295,27 @@ inline void ckpt_submit(CkptHelper& h, int slot, std::vector<CkptPart> parts) {
             }
         }).detach();
     }
+}
+inline void ckpt_submit(CkptHelper& h, int slot, std::vector<CkptPart> parts) {
+    std::lock_guard<std::mutex> lk(h.mu);
+    h.q.push_back({slot, std::move(parts), true});
+    ckpt_start_locked(h);
     h.work.notify_one();
+}
+/// (d, exitfix-20261121) at load: staging area 0 of this helper at exactly `bytes` (what every save of the session asks
+/// for) and the helper thread, both made now instead of at the first save; area 1 stays lazy (made only when a save
+/// finds area 0 busy).  False when area 0 cannot be allocated (the save's grow branch then tries again, as before).
+inline bool ckpt_prepare(CkptHelper& h, size_t bytes) {
+    std::lock_guard<std::mutex> lk(h.mu);
+    bool ok = true;
+    if (bytes && !test_ckpt_staging_fail() && !h.busy[0] && h.cap[0] < bytes) {
+        if (h.area[0]) { (void) cudaFreeHost(h.area[0]); h.area[0] = nullptr; h.cap[0] = 0; }
+        void* a = nullptr;
+        if (cudaHostAlloc(&a, bytes, cudaHostAllocPortable) != cudaSuccess || !a) { (void) cudaGetLastError(); ok = false; }
+        else { h.area[0] = a; h.cap[0] = bytes; }
+    }
+    ckpt_start_locked(h);
+    return ok;
 }
 #endif
 

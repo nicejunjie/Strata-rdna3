@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <array>
 #include <limits>
 
@@ -97,6 +98,16 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     return true;
 }
 
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+/// the staging layout of a save (gdn | ple | tails | dead | block_pos, the layers' parts contiguous as in the blocks)
+struct StagingLayout {
+    size_t n_ple = 0, n_t = 0, n_d = 0, n_b = 0, off_ple = 0, off_t = 0, off_d = 0, off_b = 0, total = 0;
+    StagingLayout(const SessionState& ss, const ConversationStateSizes& z, size_t layers)
+        : n_ple(ss.ple_hist ? z.ple : 0), n_t(layers * z.tail), n_d(layers * z.dead), n_b(layers * z.block_pos),
+          off_ple(z.gdn), off_t(off_ple + n_ple), off_d(off_t + n_t), off_b(off_d + n_d), total(off_b + n_b) {}
+};
+#endif
+
 bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
@@ -177,8 +188,9 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     {   // O (crashfix-20261117): the state into a pinned staging area (direct DMA), the blocks filled by the device's helper
         // thread (pending until then); layout gdn | ple | tails | dead | block_pos, the layers' parts contiguous as in the blocks
-        const size_t n_ple = ss.ple_hist ? z.ple : 0, n_t = layers * z.tail, n_d = layers * z.dead, n_b = layers * z.block_pos;
-        const size_t off_ple = z.gdn, off_t = off_ple + n_ple, off_d = off_t + n_t, off_b = off_d + n_d, total = off_b + n_b;
+        const StagingLayout lay(ss, z, layers);
+        const size_t n_ple = lay.n_ple, n_t = lay.n_t, n_d = lay.n_d, n_b = lay.n_b;
+        const size_t off_ple = lay.off_ple, off_t = lay.off_t, off_d = lay.off_d, off_b = lay.off_b, total = lay.total;
         int dev = 0;
         if (total && cudaGetDevice(&dev) == cudaSuccess) {
             auto& h = conversation_detail::ckpt_helper(dev);
@@ -233,6 +245,35 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     return true;
 }
 
+bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry& g, std::string& error) {
+#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(STRATA_GPU_METAL)
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, 0, z, error)) return false;   // the save's own sizes (they do not depend on the prompt)
+    const StagingLayout lay(ss, z, owned_qsa(ss));
+    int dev = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess) { error = std::string("conversation checkpoint setup: no current device: ") + cudaGetErrorString(e); return false; }
+    cudaStream_t s = nullptr;
+    if ((e = conversation_detail::private_stream(s)) != cudaSuccess) {   // this thread's copy stream on the device
+        error = std::string("conversation checkpoint setup: private stream: ") + cudaGetErrorString(e);
+        return false;
+    }
+    bool ok = true;
+    if (lay.total && !conversation_detail::ckpt_prepare(conversation_detail::ckpt_helper(dev), lay.total)) {
+        ok = fail(error, "staging area 0 could not be allocated (the first save allocates it)");
+    }
+    if ((e = conversation_detail::bounce_prepare()) != cudaSuccess) {
+        (void) cudaGetLastError();
+        error = std::string("conversation checkpoint setup: bounce buffers: ") + cudaGetErrorString(e);
+        ok = false;
+    }
+    return ok;
+#else
+    (void) ss; (void) g; (void) error;
+    return true;
+#endif
+}
+
 void conversation_checkpoint_release_held(CkptRelease point, bool no_late_left) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     // STRATA_TEST_CKPT_RELEASE (tests only): decode_start = at the decode start whatever is left to join; request_end = at the
@@ -263,7 +304,21 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
+    // STRATA_TRACE (d, exitfix-20261121): one line per restore with its parts - the device sync, the wait for the helper's
+    // latch (a pending block), the bounce buffers' allocation and the event / stream creation (first use only), the copies
+    const bool trace = conversation_detail::copy_trace_on();
+    using TClock = std::chrono::steady_clock;
+    const TClock::time_point t0 = TClock::now();
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
+    double sync_ms = 0.0, latch_ms = 0.0;
+    if (trace) {
+        sync_ms = conversation_detail::ms_since_(t0);
+        const TClock::time_point t1 = TClock::now();
+        (void) c.gdn.data(); (void) c.ple.data(); (void) c.tails.data(); (void) c.dead.data(); (void) c.block_pos.data();
+        latch_ms = conversation_detail::ms_since_(t1);   // (each data() waits for its block's latch; the copies below then do not)
+        conversation_detail::copy_split() = {};
+    }
+    const TClock::time_point t2 = TClock::now();
     const auto S = HostSide::src;
     if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error, S) ||
         !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error, S)) return false;
@@ -280,7 +335,19 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
-    return sync(error);
+    const bool ok = sync(error);
+    if (trace) {
+        const conversation_detail::CopySplit sp = conversation_detail::copy_split();
+        const double copy_ms = conversation_detail::ms_since_(t2), total_ms = conversation_detail::ms_since_(t0);
+        int dev = -1;
+        (void) cudaGetDevice(&dev);
+        const size_t bytes = c.gdn.size() + c.ple.size() + c.tails.size() + c.dead.size() + c.block_pos.size();
+        std::fprintf(stderr, "strata trace: checkpoint restore on device %d: %.2f MB, sync %.2f ms, latch wait %.2f ms, bounce "
+                             "allocation %.2f ms, event/stream creation %.2f ms, copy (DMA) %.2f ms, total %.2f ms\n",
+                     dev, bytes / 1e6, sync_ms, latch_ms, sp.alloc_ms, sp.create_ms,
+                     copy_ms - sp.alloc_ms - sp.create_ms, total_ms);
+    }
+    return ok;
 }
 
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,

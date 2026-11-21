@@ -12231,6 +12231,47 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
 #if defined(STRATA_USE_HIP)
+        // (d) exitfix-20261121 (council-20261121 "Final design, topic 2"): what the first save and the first restore made on
+        // first use is made here, on the threads that issue those copies, so the first requests do not pay for it: each
+        // device's staging area 0 at its session's exact save size, its helper thread, its bounce buffers and events, and the
+        // issuing threads' private copy streams (thread-local: the main thread for every device - the sequential save and
+        // every restore select the stage's device on it - and, with STRATA_CKPT_THREADS, each stage's save thread).
+        // Area 1 stays lazy.  Only when a checkpoint can be saved (checkpoint_at's predicate).  A part that fails is made
+        // on first use as before (one line).  Before the lock line, so these pinned blocks are in its count and VmLck.
+        if (o.prompt_cache > 0) {
+            const Clock::time_point e0 = Clock::now();
+            int prepared = 0;
+            auto prepare_on = [&](int dev, const strata::core::SessionState& pss) {   // dev < 0: the thread's current device
+                const strata::core::OnDevice on(dev);
+                int cur = -1;
+                std::string pe;
+                if (dev >= 0 && (cudaGetDevice(&cur) != cudaSuccess || cur != dev)) {   // OnDevice does not report a failed selection
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "strata serve: checkpoint copy setup at load: device %d could not be selected; "
+                                         "its copies set up on first use\n", dev);
+                    return;
+                }
+                if (!strata::core::conversation_checkpoint_prepare(pss, g, pe))
+                    std::fprintf(stderr, "strata serve: checkpoint copy setup at load (device %d): %s; set up on first use\n",
+                                 dev, pe.c_str());
+                else
+                    ++prepared;
+            };
+            prepare_on(-1, ss);
+            for (auto& st : stages) prepare_on(st->dev, st->ss);
+            if (ckpt_threads_env() && !stages.empty()) {
+                std::mutex pmu;
+                const std::function<void(size_t)> job = [&](size_t k) {
+                    if (k == 0) return;   // the main thread: done above
+                    std::lock_guard<std::mutex> lk(pmu);   // (prepare_on counts)
+                    prepare_on(stages[k - 1]->dev, stages[k - 1]->ss);
+                };
+                ckpt_threads.run(stages.size() + 1, job);   // starts the save threads now, as a first save would
+            }
+            if (ckpt_trace)
+                std::fprintf(stderr, "strata trace: checkpoint copy setup at load: %d part(s), %.1f ms\n", prepared,
+                             std::chrono::duration<double, std::milli>(Clock::now() - e0).count());
+        }
         ::strata::hip_compat::host_lock_report("at READY");   // the one host memory lock line (hip_compat/host_lock.hpp)
 #endif
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP

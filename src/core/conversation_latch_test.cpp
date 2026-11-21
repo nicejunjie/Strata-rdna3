@@ -1,7 +1,7 @@
 // crashfix-20261117 design O: the pending-block latch and the checkpoint helper, host only (fake runtime), meant for TSan.
 // A save fills a staging area and hands the blocks to the device's helper; readers (data, ==, unique, mutable_data,
 // assign_for_overwrite, a copy then a read), a share without waiting, and the last reference dropped while pending must all
-// see the final bytes or wait, never torn ones; three saves in a row reuse the two areas.
+// see the final bytes or wait, never torn ones; three saves in a row reuse the two areas.  (d): the load-time setup.
 // Build: c++ -std=c++20 -fsanitize=thread -g -DSTRATA_USE_HIP=1 -I src/core/test_stubs/bounce -I include -I src/core src/core/conversation_latch_test.cpp
 #include "conversation_copy.hpp"
 #include <atomic>
@@ -27,6 +27,30 @@ int main() {
     setenv("STRATA_TEST_CKPT_HELPER_DELAY_MS", "20", 1);
     CkptHelper& h = ckpt_helper(0);
     const size_t n = 1 << 20;
+    {   // (d, exitfix-20261121) the load-time setup: area 0 at its exact size and the helper thread now, area 1 lazy, the
+        // bounce buffers and events made once; the saves after it use what it made (no regrow)
+        CkptHelper& h1 = ckpt_helper(1);
+        check(!h1.started && h1.cap[0] == 0, "a fresh helper has nothing yet");
+        check(ckpt_prepare(h1, 2 * n), "prepare");
+        void* const a0 = h1.area[0];
+        check(a0 != nullptr && h1.cap[0] == 2 * n && h1.cap[1] == 0 && h1.area[1] == nullptr, "prepare: area 0 exact, area 1 lazy");
+        check(h1.started && !h1.busy[0] && !h1.busy[1], "prepare: the helper thread is started, no area taken");
+        check(ckpt_prepare(h1, 2 * n) && h1.area[0] == a0, "prepare twice: nothing made again");
+        CheckpointBlock a, b;
+        save(h1, a, b, n, 41);
+        check(h1.area[0] == a0 && h1.cap[0] == 2 * n && h1.cap[1] == 0, "the first save takes the prepared area 0 as it is");
+        CheckpointBlock c, d;
+        save(h1, c, d, n, 43);   // area 0 is still held (P1) or copying: the second save makes area 1, as before
+        check(h1.area[0] == a0 && h1.cap[1] == 2 * n, "a second save while area 0 is busy makes area 1 (lazy)");
+        check(all(a, 41) && all(b, 42) && all(c, 43) && all(d, 44), "the saves after prepare carry their bytes");
+        BounceSlot* bs = nullptr;
+        check(bounce_prepare() == cudaSuccess && bounce_slot(bs) == cudaSuccess, "bounce prepare");
+        bool made = true;
+        for (size_t i = 0; i < bounce_bufs; ++i) made = made && bs->buf[i] != nullptr && bs->ev[i] != nullptr;
+        check(made, "bounce prepare: every buffer and event made");
+        void* const b0 = bs->buf[0];
+        check(bounce_prepare() == cudaSuccess && bs->buf[0] == b0, "bounce prepare twice: nothing made again");
+    }
     for (int round = 0; round < 20; ++round) {
         CheckpointBlock a, b;
         save(h, a, b, n, uint8_t(round));
