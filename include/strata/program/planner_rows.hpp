@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/program/segment_plan.hpp"   // kDpMinLast: the engine's DP_MIN floor (2 * kDpMinLast, dp_min_tokens)
+
 namespace strata::program::planner_rows {
 
 /// the threshold keys a row may set (classes A, B and C of review-fable-phase3 section 5, and the Thresholds fields
@@ -71,18 +73,24 @@ struct Applied { std::string key, value, source; };   // source: "env" (an expli
 /// fill: env, else the row (set with overwrite 0).  get / set are std::getenv / setenv in the engine, fakes in the test.
 /// (e, B2 review-fable-structural decision 1) the two derived chunk rows, after the rows are applied (--planner only):
 ///   STRATA_TP_PREFILL_CHUNK unset => ceil256(STRATA_TP_PREFILL_MAX), when the table sets TP_PREFILL_MAX;
-///   STRATA_DP_PIPE_CHUNK unset    => ceil1024(STRATA_DP_MIN),        when the table sets DP_MIN.
+///   STRATA_DP_PIPE_CHUNK unset    => ceil1024(max(2 * kDpMinLast, STRATA_DP_MIN) + 2), when the table sets DP_MIN.
 /// "Unset" = neither the environment nor a row gave it (an explicit value still wins); the base is the value in force
 /// after the fill (the environment's, if it overrode the row).  Without a table nothing is derived, so the parse-site
 /// defaults (16384, 8192) are unchanged.  A base that is not a positive integer derives nothing.  Both rules give
 /// today's rows exactly (IQ4 20480 / 11264, Q4 28672 / 18432) and 16384 on IQ3.
+/// The DP rule (results/exitfix-20261121/review-fable-impl.md required change 2) guarantees the bound the structural pass
+/// proved, chunk >= ceil256(DP_MIN + 2) on the DP_MIN the engine really uses: dp_min_tokens() floors an explicit value at
+/// 2 * kDpMinLast (8448), and a DP_MIN on (or one below) the 1024 grid needs the next step (11264 -> 12288, 5000 -> 9216).
 inline long long ceil_to(long long v, long long q) { return (v + q - 1) / q * q; }
 inline std::vector<Applied> derive(const std::vector<Row>& rows, const std::function<const char*(const char*)>& get,
                                    const std::function<void(const char*, const char*)>& set) {
     std::vector<Applied> out;
     auto in_table = [&](const char* k) { for (const auto& r : rows) if (r.key == k) return true; return false; };
-    struct Rule { const char* base; const char* key; long long quantum; };
-    for (const Rule& u : {Rule{"STRATA_TP_PREFILL_MAX", "STRATA_TP_PREFILL_CHUNK", 256}, Rule{"STRATA_DP_MIN", "STRATA_DP_PIPE_CHUNK", 1024}}) {
+    // value = ceil_quantum(max(floor, base) + add)
+    struct Rule { const char* base; const char* key; long long quantum, floor, add; };
+    constexpr long long kDpFloor = 2 * strata::program::segment_plan::kDpMinLast;   // dp_min_tokens()'s floor
+    for (const Rule& u : {Rule{"STRATA_TP_PREFILL_MAX", "STRATA_TP_PREFILL_CHUNK", 256, 0, 0},
+                          Rule{"STRATA_DP_MIN", "STRATA_DP_PIPE_CHUNK", 1024, kDpFloor, 2}}) {
         if (!in_table(u.base) || get(u.key) != nullptr) continue;
         const char* bv = get(u.base);
         if (bv == nullptr || *bv == '\0') continue;
@@ -90,7 +98,7 @@ inline std::vector<Applied> derive(const std::vector<Row>& rows, const std::func
         errno = 0;
         const long long v = std::strtoll(bv, &end, 10);
         if (errno != 0 || end == bv || *end != '\0' || v <= 0 || v > (1LL << 40)) continue;
-        const std::string d = std::to_string(ceil_to(v, u.quantum));
+        const std::string d = std::to_string(ceil_to((v < u.floor ? u.floor : v) + u.add, u.quantum));
         set(u.key, d.c_str());
         out.push_back({u.key, d, "derived"});
     }

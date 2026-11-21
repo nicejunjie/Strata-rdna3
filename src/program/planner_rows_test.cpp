@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
         auto e = run(r, {{"STRATA_DP_MIN", "11000"}}, &ap);
         CHECK(e["STRATA_DP_MIN"] == "11000" && e["STRATA_TP_PREFILL_MAX"] == "28672");
         CHECK(ap[0].source == "env" && ap[1].source == "table");
-        // (e) the derived chunk rows: TP_PREFILL_CHUNK = ceil256(TP_PREFILL_MAX), DP_PIPE_CHUNK = ceil1024(DP_MIN)
+        // (e) the derived chunk rows: TP_PREFILL_CHUNK = ceil256(TP_PREFILL_MAX), DP_PIPE_CHUNK = ceil1024(max(8448, DP_MIN) + 2)
         {   // table-only: the table sets the bases and not the chunks -> both derived (today's IQ4 / Q4 values)
             CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20480\nrow2 STRATA_DP_MIN 10500\n", r, err));
             auto d = run(r, {}, &ap);
@@ -53,6 +53,18 @@ int main(int argc, char** argv) {
             CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "16384" && !d.count("STRATA_DP_PIPE_CHUNK"));
             CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20481\n", r, err));
             CHECK(run(r, {})["STRATA_TP_PREFILL_CHUNK"] == "20736");                // rounds up to 256
+        }
+        {   // the DP rule's bound (review-fable-impl required change 2): chunk >= ceil256(max(8448, DP_MIN) + 2)
+            const std::pair<const char*, const char*> dp[] = {{"11264", "12288"}, {"11263", "12288"}, {"5000", "9216"},
+                                                              {"11000", "11264"}, {"18000", "18432"}, {"8448", "9216"},
+                                                              {"10238", "10240"}, {"10239", "11264"}};
+            for (const auto& c : dp) {
+                CHECK(PR::parse(std::string("row2 STRATA_DP_MIN ") + c.first + "\n", r, err));
+                const auto d = run(r, {});
+                CHECK(d.count("STRATA_DP_PIPE_CHUNK") && d.at("STRATA_DP_PIPE_CHUNK") == c.second);
+                if (d.count("STRATA_DP_PIPE_CHUNK") && d.at("STRATA_DP_PIPE_CHUNK") != c.second)
+                    std::fprintf(stderr, "  DP_MIN %s: derived %s, expected %s\n", c.first, d.at("STRATA_DP_PIPE_CHUNK").c_str(), c.second);
+            }
         }
         {   // the table's own chunk row: kept, nothing derived
             CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20480\nrow2 STRATA_TP_PREFILL_CHUNK 4096\nrow2 STRATA_DP_MIN 10500\nrow2 STRATA_DP_PIPE_CHUNK 8448\n", r, err));
