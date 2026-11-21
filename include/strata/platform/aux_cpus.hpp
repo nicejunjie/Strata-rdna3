@@ -167,8 +167,10 @@ struct State {
     State() { CPU_ZERO(&target); }
 };
 
+/// immortal (exitfix-20261121): detached threads (the checkpoint helper, the stdin reader, the watchdog) reach it, and a
+/// destroyed State (vectors, a set, a map) at exit is the host-lock sweep's use-after-destroy again
 inline State& state() {
-    static State s;
+    static State& s = *new State;
     return s;
 }
 

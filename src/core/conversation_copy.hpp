@@ -16,9 +16,15 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace strata::core::conversation_detail {
+
+#if defined(__GLIBCXX__)
+// the function-local mutexes below are never destroyed in effect: their destructor does nothing (exitfix-20261121)
+static_assert(std::is_trivially_destructible<std::mutex>::value, "a static std::mutex here must survive exit");
+#endif
 
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
@@ -68,19 +74,21 @@ struct BounceSlot {
     void* buf[bounce_bufs] = {};
     cudaEvent_t ev[bounce_bufs] = {};
 };
-/// the current device's slot, its buffers made on first use; never freed (process lifetime, like the streams)
+/// the current device's slot, its buffers made on first use; never freed (process lifetime, like the streams).  The table
+/// and the slots are immortal (exitfix-20261121): a static vector of unique_ptr freed every slot at exit while a stage
+/// thread could still be inside copy_bounced with one.
 inline cudaError_t bounce_slot(BounceSlot*& out) {
     int dev = 0;
     cudaError_t e = cudaGetDevice(&dev);
     if (e != cudaSuccess) return e;
     if (dev < 0) dev = 0;
-    static std::mutex mu;
-    static std::vector<std::unique_ptr<BounceSlot>> slots;
+    static std::mutex mu;   // (trivially destructible on libstdc++: asserted at the top of this namespace)
+    static std::vector<BounceSlot*>& slots = *new std::vector<BounceSlot*>();
     {
         std::lock_guard<std::mutex> lk(mu);
-        if ((size_t) dev >= slots.size()) slots.resize((size_t) dev + 1);
-        if (!slots[(size_t) dev]) slots[(size_t) dev] = std::make_unique<BounceSlot>();
-        out = slots[(size_t) dev].get();
+        if ((size_t) dev >= slots.size()) slots.resize((size_t) dev + 1, nullptr);
+        if (!slots[(size_t) dev]) slots[(size_t) dev] = new BounceSlot();
+        out = slots[(size_t) dev];
     }
     return cudaSuccess;
 }

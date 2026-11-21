@@ -12,10 +12,19 @@
 // - A failed mlock never fails an allocation: the block stays unlocked and is counted (the first 8 get one line each).
 // - The runtime's own GPU-mapped blocks (never made here) are locked by host_lock_sweep_locked at READY and every 10 s.
 // - host_lock_report() prints the one load line (blocks, GiB locked, runtime GiB, failures, the kernel's VmLck, the limit).
-// No environment variable and no flag.
+// No environment variable and no flag (STRATA_TEST_HOST_LOCK_SWEEP_MS: tests only, below).
+//
+// Exit (exitfix-20261121, council-20261121 "Final design, topic 2"): the state below is immortal (`static T& s = *new T`,
+// never destroyed), because the sweep thread is detached and any thread may host_free while exit() runs the static
+// destructors: four core dumps had the sweep walking HostLock::blocks / the seen map after their destructors freed them.
+// An exit handler, registered before the sweep thread starts (so it runs before every static destructor and every
+// handler registered earlier, __hip_module_dtor included), sets one lock-free stop flag; the sweep checks it before it
+// opens /proc/self/maps, between lines, and before each mlock and print.  No join: a thread that holds the mutex at
+// exit cannot deadlock the exit.
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -43,7 +52,11 @@ struct HostLock {
     int state = -1;                             // -1 not decided, 0 off, 1 on
     unsigned long long hard = 0;
 };
-inline HostLock& host_lock_state() { static HostLock s; return s; }
+inline HostLock& host_lock_state() { static HostLock& s = *new HostLock; return s; }   // immortal: see the exit note above
+/// set by the exit handler host_lock_report registers before the sweep thread starts; lock-free, never destroyed
+inline std::atomic<bool>& host_lock_exiting() { static std::atomic<bool> f{false}; return f; }
+static_assert(std::atomic<bool>::is_always_lock_free, "the exit flag must be lock-free");
+inline bool host_lock_quiet() { return host_lock_exiting().load(std::memory_order_acquire); }
 
 inline void host_lock_decide(HostLock& s) {   // under s.mu
     if (s.state >= 0) return;
@@ -106,11 +119,12 @@ inline void host_lock_forget(void* p) {
 /// READY and then from a background thread every 10 s (silent unless a lock fails).  Under s.mu.
 inline void host_lock_sweep_locked(HostLock& s, std::unordered_map<uintptr_t, std::pair<size_t, unsigned long long>>& seen, uint64_t& swept_bytes) {
 #if !defined(_WIN32)
-    if (s.state != 1) return;
+    if (s.state != 1 || host_lock_quiet()) return;   // exit has begun: the runtime is tearing its mappings down
     std::FILE* f = std::fopen("/proc/self/maps", "r");
     if (f == nullptr) return;
     char line[512];
     while (std::fgets(line, sizeof line, f) != nullptr) {
+        if (host_lock_quiet()) break;
         unsigned long long a = 0, b = 0, off = 0, inode = 0; char perm[8] = {0}, dev[16] = {0};
         if (std::sscanf(line, "%llx-%llx %7s %llx %15s %llu", &a, &b, perm, &off, dev, &inode) != 6) continue;
         if (std::strcmp(perm, "rw-s") != 0 || std::strstr(line, "/dev/zero (deleted)") == nullptr) continue;
@@ -125,8 +139,10 @@ inline void host_lock_sweep_locked(HostLock& s, std::unordered_map<uintptr_t, st
         for (auto& kv : s.failed)
             if ((uintptr_t) kv.first >= (uintptr_t) a && (uintptr_t) kv.first < (uintptr_t) b) { failed_ours = true; break; }
         if (failed_ours) { seen[(uintptr_t) a] = id; continue; }
+        if (host_lock_quiet()) break;
         if (mlock((void*) (uintptr_t) a, bytes) != 0) {
             const int e = errno;
+            if (host_lock_quiet()) break;   // an mlock that lost its mapping to the exit is not a failure to report
             if (s.fails++ < 8)
                 std::fprintf(stderr, "strata: host memory lock: a %zu KiB runtime block stays unlocked (mlock: %s)\n",
                              bytes >> 10, std::strerror(e));
@@ -146,7 +162,13 @@ inline void host_lock_sweep_locked(HostLock& s, std::unordered_map<uintptr_t, st
 #endif
 }
 struct HostLockSweep { std::unordered_map<uintptr_t, std::pair<size_t, unsigned long long>> seen; uint64_t bytes = 0; bool thread = false; };
-inline HostLockSweep& host_lock_sweep_state() { static HostLockSweep w; return w; }
+inline HostLockSweep& host_lock_sweep_state() { static HostLockSweep& w = *new HostLockSweep; return w; }   // immortal
+/// the background sweep's period: 10 s; STRATA_TEST_HOST_LOCK_SWEEP_MS=N (tests only, N >= 1) makes it N ms
+inline std::chrono::milliseconds host_lock_sweep_period() {
+    const char* e = std::getenv("STRATA_TEST_HOST_LOCK_SWEEP_MS");
+    const long ms = e ? std::atol(e) : 0;
+    return std::chrono::milliseconds(ms >= 1 ? ms : 10000);
+}
 
 /// The one load line (fixed form, for the watcher):
 /// "strata: host memory lock: <n> blocks, <x.xx> GiB locked, <r.rr> GiB runtime blocks, <f> failures (<y.yy> GiB unlocked),
@@ -177,9 +199,13 @@ inline void host_lock_report(const char* when) {
                  vmlck_kib / 1048576.0, lim, when);
     if (!w.thread) {
         w.thread = true;
-        std::thread([] {
+        // the stop handler first: registered after every static made so far, it runs before their destructors
+        (void) std::atexit([] { host_lock_exiting().store(true, std::memory_order_release); });
+        const std::chrono::milliseconds period = host_lock_sweep_period();
+        std::thread([period] {
             for (;;) {
-                std::this_thread::sleep_for(std::chrono::seconds(10));
+                std::this_thread::sleep_for(period);
+                if (host_lock_quiet()) return;
                 HostLock& s2 = host_lock_state();
                 HostLockSweep& w2 = host_lock_sweep_state();
                 std::lock_guard<std::mutex> g2(s2.mu);
