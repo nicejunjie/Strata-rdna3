@@ -39,6 +39,45 @@ int main(int argc, char** argv) {
         auto e = run(r, {{"STRATA_DP_MIN", "11000"}}, &ap);
         CHECK(e["STRATA_DP_MIN"] == "11000" && e["STRATA_TP_PREFILL_MAX"] == "28672");
         CHECK(ap[0].source == "env" && ap[1].source == "table");
+        // (e) the derived chunk rows: TP_PREFILL_CHUNK = ceil256(TP_PREFILL_MAX), DP_PIPE_CHUNK = ceil1024(DP_MIN)
+        {   // table-only: the table sets the bases and not the chunks -> both derived (today's IQ4 / Q4 values)
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20480\nrow2 STRATA_DP_MIN 10500\n", r, err));
+            auto d = run(r, {}, &ap);
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "20480" && d["STRATA_DP_PIPE_CHUNK"] == "11264");
+            CHECK(ap.size() == 4 && ap[2].source == "derived" && ap[3].source == "derived");
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 28500\nrow2 STRATA_DP_MIN 18000\n", r, err));
+            d = run(r, {});
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "28672" && d["STRATA_DP_PIPE_CHUNK"] == "18432");
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 16384\n", r, err));   // IQ3-like: the rule gives the default
+            d = run(r, {});
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "16384" && !d.count("STRATA_DP_PIPE_CHUNK"));
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20481\n", r, err));
+            CHECK(run(r, {})["STRATA_TP_PREFILL_CHUNK"] == "20736");                // rounds up to 256
+        }
+        {   // the table's own chunk row: kept, nothing derived
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20480\nrow2 STRATA_TP_PREFILL_CHUNK 4096\nrow2 STRATA_DP_MIN 10500\nrow2 STRATA_DP_PIPE_CHUNK 8448\n", r, err));
+            auto d = run(r, {}, &ap);
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "4096" && d["STRATA_DP_PIPE_CHUNK"] == "8448" && ap.size() == 4);
+        }
+        {   // env wins: an explicit chunk is kept; an explicit base is the base the rule uses
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 20480\nrow2 STRATA_DP_MIN 10500\n", r, err));
+            auto d = run(r, {{"STRATA_TP_PREFILL_CHUNK", "12000"}, {"STRATA_DP_PIPE_CHUNK", "9000"}}, &ap);
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "12000" && d["STRATA_DP_PIPE_CHUNK"] == "9000" && ap.size() == 2);
+            d = run(r, {{"STRATA_TP_PREFILL_MAX", "30000"}, {"STRATA_DP_MIN", "9000"}}, &ap);
+            CHECK(d["STRATA_TP_PREFILL_CHUNK"] == "30208" && d["STRATA_DP_PIPE_CHUNK"] == "9216");
+            CHECK(ap[0].source == "env" && ap[1].source == "env" && ap[2].source == "derived");
+        }
+        {   // no table rows for the bases (and no table at all): nothing derived, the parse-site defaults stay
+            CHECK(PR::parse("row2 STRATA_REFILL_HEAD2 2688\n", r, err));
+            auto d = run(r, {{"STRATA_TP_PREFILL_MAX", "30000"}, {"STRATA_DP_MIN", "9000"}});
+            CHECK(!d.count("STRATA_TP_PREFILL_CHUNK") && !d.count("STRATA_DP_PIPE_CHUNK"));
+            CHECK(PR::parse("", r, err));
+            d = run(r, {{"STRATA_TP_PREFILL_MAX", "30000"}});
+            CHECK(d.size() == 1 && !d.count("STRATA_TP_PREFILL_CHUNK"));
+            CHECK(PR::parse("row2 STRATA_TP_PREFILL_MAX 0\nrow2 STRATA_DP_MIN -5\n", r, err));   // a base that is not positive
+            d = run(r, {});
+            CHECK(!d.count("STRATA_TP_PREFILL_CHUNK") && !d.count("STRATA_DP_PIPE_CHUNK"));
+        }
         std::printf("planner_rows_test: unit cases %s\n", fails ? "FAILED" : "passed");
         return fails ? 1 : 0;
     }

@@ -66,9 +66,39 @@ inline bool parse(const std::string& text, std::vector<Row>& rows, std::string& 
     return true;
 }
 
-struct Applied { std::string key, value, source; };   // source: "env" (an explicit value kept) or "table"
+struct Applied { std::string key, value, source; };   // source: "env" (an explicit value kept), "table" or "derived"
 
 /// fill: env, else the row (set with overwrite 0).  get / set are std::getenv / setenv in the engine, fakes in the test.
+/// (e, B2 review-fable-structural decision 1) the two derived chunk rows, after the rows are applied (--planner only):
+///   STRATA_TP_PREFILL_CHUNK unset => ceil256(STRATA_TP_PREFILL_MAX), when the table sets TP_PREFILL_MAX;
+///   STRATA_DP_PIPE_CHUNK unset    => ceil1024(STRATA_DP_MIN),        when the table sets DP_MIN.
+/// "Unset" = neither the environment nor a row gave it (an explicit value still wins); the base is the value in force
+/// after the fill (the environment's, if it overrode the row).  Without a table nothing is derived, so the parse-site
+/// defaults (16384, 8192) are unchanged.  A base that is not a positive integer derives nothing.  Both rules give
+/// today's rows exactly (IQ4 20480 / 11264, Q4 28672 / 18432) and 16384 on IQ3.
+inline long long ceil_to(long long v, long long q) { return (v + q - 1) / q * q; }
+inline std::vector<Applied> derive(const std::vector<Row>& rows, const std::function<const char*(const char*)>& get,
+                                   const std::function<void(const char*, const char*)>& set) {
+    std::vector<Applied> out;
+    auto in_table = [&](const char* k) { for (const auto& r : rows) if (r.key == k) return true; return false; };
+    struct Rule { const char* base; const char* key; long long quantum; };
+    for (const Rule& u : {Rule{"STRATA_TP_PREFILL_MAX", "STRATA_TP_PREFILL_CHUNK", 256}, Rule{"STRATA_DP_MIN", "STRATA_DP_PIPE_CHUNK", 1024}}) {
+        if (!in_table(u.base) || get(u.key) != nullptr) continue;
+        const char* bv = get(u.base);
+        if (bv == nullptr || *bv == '\0') continue;
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(bv, &end, 10);
+        if (errno != 0 || end == bv || *end != '\0' || v <= 0 || v > (1LL << 40)) continue;
+        const std::string d = std::to_string(ceil_to(v, u.quantum));
+        set(u.key, d.c_str());
+        out.push_back({u.key, d, "derived"});
+    }
+    return out;
+}
+
+/// fill: env, else the row (set with overwrite 0), then the derived rows (derive above).  get / set are std::getenv /
+/// setenv in the engine, fakes in the test.
 inline std::vector<Applied> apply(const std::vector<Row>& rows, const std::function<const char*(const char*)>& get,
                                   const std::function<void(const char*, const char*)>& set) {
     std::vector<Applied> out;
@@ -78,6 +108,7 @@ inline std::vector<Applied> apply(const std::vector<Row>& rows, const std::funct
         set(r.key.c_str(), r.value.c_str());
         out.push_back({r.key, r.value, "table"});
     }
+    for (Applied& a : derive(rows, get, set)) out.push_back(std::move(a));
     return out;
 }
 

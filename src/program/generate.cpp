@@ -2591,10 +2591,17 @@ int main(int argc, char** argv) {
             setenv(k, v, 0);
 #endif
         });
-        std::string said; int from_table = 0;
-        for (const auto& a : ap) { said += " " + a.key.substr(7) + "=" + a.value + (a.source == "env" ? "(env)" : ""); from_table += a.source == "table"; }
-        std::fprintf(stderr, "strata planner rows: %s: %zu two-card rows, %d from the table, %zu kept from the environment:%s\n", argv[i + 1],
-                     ap.size(), from_table, ap.size() - (size_t) from_table, said.c_str());
+        // (e) the derived chunk rows (planner_rows::derive) are listed as KEY=V(derived) and counted apart; without one the
+        // line is as before
+        std::string said; int from_table = 0, derived = 0;
+        for (const auto& a : ap) {
+            said += " " + a.key.substr(7) + "=" + a.value + (a.source == "env" ? "(env)" : a.source == "derived" ? "(derived)" : "");
+            from_table += a.source == "table"; derived += a.source == "derived";
+        }
+        const size_t n_rows = ap.size() - (size_t) derived;
+        std::string dsaid = derived ? ", " + std::to_string(derived) + " derived" : std::string();
+        std::fprintf(stderr, "strata planner rows: %s: %zu two-card rows, %d from the table, %zu kept from the environment%s:%s\n", argv[i + 1],
+                     n_rows, from_table, n_rows - (size_t) from_table, dsaid.c_str(), said.c_str());
         break;
     }
 #if defined(STRATA_HAVE_QWEN35)
