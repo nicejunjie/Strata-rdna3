@@ -1,0 +1,30 @@
+{
+ "_doc": "B2 generator inputs, iq4 two-card: measured / copied / policy rows (make_planner_rows2.py derives TP_PREFILL_CHUNK and DP_PIPE_CHUNK)",
+ "measured": {
+  "STRATA_TP_PREFILL_MIN": {
+   "value": 4865,
+   "source": "today's row (Deploy A); the class A tool run (B2 session 1, 11-22) replaces it"
+  },
+  "STRATA_TP_PREFILL_MAX": {
+   "value": 20480,
+   "source": "today's row (Deploy A); the class A tool run (B2 session 1, 11-22) replaces it"
+  }
+ },
+ "copied": {
+  "STRATA_DP_MIN": {
+   "value": 11000,
+   "why": "declined-only (review-fable-structural Decision 2)"
+  },
+  "STRATA_PREFILL_AUTO_MAX": {
+   "value": 32768,
+   "why": "until measured (B2 session 2)"
+  }
+ },
+ "policy": {
+  "STRATA_REFILL_HEAD": 1344,
+  "STRATA_REFILL_HEAD_MIN": 49152,
+  "STRATA_REFILL_HEAD2": 2688,
+  "STRATA_REFILL_HEAD2_MIN": 245760,
+  "STRATA_REFILL_HEAD_TP_KEEP": 800
+ }
+}
