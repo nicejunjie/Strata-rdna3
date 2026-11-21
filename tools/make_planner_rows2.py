@@ -11,8 +11,11 @@ Every row is classified in its comment: derived / measured / copied / policy.  T
 (B2 structural pass, structural-pass.md: identical plans in every text and declined state, any cap):
   STRATA_TP_PREFILL_CHUNK = ceil256(STRATA_TP_PREFILL_MAX)   asserted >= ceil256(TP_PREFILL_MAX); no row when it equals the
                                                              engine default 16384 (generate.cpp:210; IQ3)
-  STRATA_DP_PIPE_CHUNK    = ceil1024(STRATA_DP_MIN)          only where a DP_MIN row exists; asserted >= ceil256(DP_MIN + 2);
+  STRATA_DP_PIPE_CHUNK    = ceil1024(max(8448, STRATA_DP_MIN) + 2)
+                                                             only where a DP_MIN row exists; asserted >= ceil256(DP_MIN + 2);
                                                              without a DP_MIN row DP_PIPE_CHUNK is a copied input (IQ3 8448)
+                                                             (the engine's planner_rows::derive uses the same formula,
+                                                             results/exitfix-20261121/review-fable-impl.md required change 2)
 A flat Deploy A environment may still carry the two derived keys: their values must satisfy the same bound (plan-identical
 to the derived value), else the generator fails.  --json prints the classified rows as JSON instead of the table."""
 import json, sys
@@ -84,12 +87,12 @@ def derive(rows, legacy):
                                       (' = engine default: no row' if ch == TP_CHUNK_DEFAULT else ''))
     if 'STRATA_DP_MIN' in rows:
         dp_min = max(DP_MIN_FLOOR, rows['STRATA_DP_MIN'][0])
-        pc = ceil_to(dp_min, 1024)
+        pc = ceil_to(dp_min + 2, 1024)   # = planner_rows::derive (the bound holds by construction; the check stays)
         check(pc >= ceil_to(dp_min + 2, 256), 'DP_PIPE_CHUNK below ceil256(DP_MIN + 2): plans change')
         if 'STRATA_DP_PIPE_CHUNK' in legacy:
             check(legacy['STRATA_DP_PIPE_CHUNK'] >= ceil_to(dp_min + 2, 256), \
                 f"input DP_PIPE_CHUNK {legacy['STRATA_DP_PIPE_CHUNK']} < ceil256(DP_MIN + 2): not plan-identical to the derived row")
-        out['STRATA_DP_PIPE_CHUNK'] = (pc, 'derived', 'B', 'ceil1024(STRATA_DP_MIN)')
+        out['STRATA_DP_PIPE_CHUNK'] = (pc, 'derived', 'B', 'ceil1024(max(8448, STRATA_DP_MIN) + 2)')
     return out
 
 
