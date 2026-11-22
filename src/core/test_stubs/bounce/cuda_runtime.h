@@ -1,12 +1,16 @@
 // Host-only stand-in for the HIP runtime, for conversation_copy_bounce_test.cpp only.  A stream is a FIFO of deferred
 // copies that run when an event recorded after them, or the stream, is synchronized - so a bounce buffer reused
-// before its copy ran shows up as wrong bytes.  Every pointer the "runtime" is handed is recorded.
+// before its copy ran shows up as wrong bytes.  Every pointer the "runtime" is handed is recorded.  (exitfix-20261121,
+// review-fable-q4stop.md) The current device is per thread (cudaSetDevice; 0 by default) and every live cudaHostAlloc
+// block is counted with its size (fake::host_allocs), for conversation_latch_test's "what the setup makes" cases.
 #pragma once
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -26,11 +30,15 @@ inline std::vector<std::pair<const void*, size_t>>& handed() { static std::vecto
 inline void run_until(size_t s) {
     while (!queue().empty() && queue().front().seq <= s) { queue().front().run(); queue().pop_front(); }
 }
+inline int& cur_dev() { thread_local int d = 0; return d; }
+struct HostAllocs { std::mutex mu; std::map<const void*, size_t> live; size_t calls = 0; };
+inline HostAllocs& host_allocs() { static HostAllocs* h = new HostAllocs(); return *h; }   // immortal, like the state it counts
 }  // namespace fake
 struct FakeEvent { size_t seq = 0; };
 
 inline const char* cudaGetErrorString(cudaError_t) { return "fake"; }
-inline cudaError_t cudaGetDevice(int* d) { *d = 0; return cudaSuccess; }
+inline cudaError_t cudaGetDevice(int* d) { *d = fake::cur_dev(); return cudaSuccess; }
+inline cudaError_t cudaSetDevice(int d) { fake::cur_dev() = d; return cudaSuccess; }
 inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* s, unsigned) { *s = reinterpret_cast<cudaStream_t>(1); return cudaSuccess; }
 inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t n, cudaMemcpyKind, cudaStream_t) {
     fake::handed().push_back({dst, n});
@@ -43,10 +51,13 @@ inline cudaError_t cudaEventCreateWithFlags(cudaEvent_t* e, unsigned) { *e = new
 inline cudaError_t cudaEventRecord(cudaEvent_t e, cudaStream_t) { e->seq = fake::seq(); return cudaSuccess; }
 inline cudaError_t cudaEventSynchronize(cudaEvent_t e) { fake::run_until(e->seq); return cudaSuccess; }
 inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned) { return cudaSuccess; }
-inline cudaError_t cudaFreeHost(void* p) { fake::pinned().erase(p); delete[] static_cast<uint8_t*>(p); return cudaSuccess; }
+inline cudaError_t cudaFreeHost(void* p) {
+    { std::lock_guard<std::mutex> lk(fake::host_allocs().mu); fake::host_allocs().live.erase(p); }
+    fake::pinned().erase(p); delete[] static_cast<uint8_t*>(p); return cudaSuccess; }
 inline cudaError_t cudaGetLastError() { return cudaSuccess; }
 template<class T> inline cudaError_t cudaHostAlloc(T** p, size_t n, unsigned) {
     *p = reinterpret_cast<T*>(new uint8_t[n]);
     fake::pinned().insert(*p);
+    { std::lock_guard<std::mutex> lk(fake::host_allocs().mu); fake::host_allocs().live[*p] = n; ++fake::host_allocs().calls; }
     return cudaSuccess;
 }
