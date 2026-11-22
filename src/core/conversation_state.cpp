@@ -346,10 +346,14 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
         int dev = -1;
         (void) cudaGetDevice(&dev);
         const size_t bytes = c.gdn.size() + c.ple.size() + c.tails.size() + c.dead.size() + c.block_pos.size();
+        // (d trace) the copy part's absolute start / end on the shared trace clock (trace_clock.hpp; the request trace's
+        // "@ ms" stamps), and the restore's own start: the durations are as before
+        const double at_end = trace_ms();
         std::fprintf(stderr, "strata trace: checkpoint restore on device %d: %.2f MB, sync %.2f ms, latch wait %.2f ms, bounce "
-                             "allocation %.2f ms, event/stream creation %.2f ms, copy (DMA) %.2f ms, total %.2f ms\n",
+                             "allocation %.2f ms, event/stream creation %.2f ms, copy (DMA) %.2f ms, total %.2f ms; "
+                             "start @%.2f ms, copy @%.2f-@%.2f ms\n",
                      dev, bytes / 1e6, sync_ms, latch_ms, sp.alloc_ms, sp.create_ms,
-                     copy_ms - sp.alloc_ms - sp.create_ms, total_ms);
+                     copy_ms - sp.alloc_ms - sp.create_ms, total_ms, trace_ms(t0), trace_ms(t2), at_end);
     }
     return ok;
 }

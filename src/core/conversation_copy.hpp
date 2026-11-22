@@ -3,6 +3,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/core/trace_clock.hpp"
 
 #include <cuda_runtime.h>
 
@@ -11,6 +12,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -212,9 +214,11 @@ struct CkptHelper {
     void* area[2] = {nullptr, nullptr};
     size_t cap[2] = {0, 0};
     bool busy[2] = {false, false};
-    struct Job { int slot; std::vector<CkptPart> parts; bool held = true; };   // P1: held until ckpt_release_held()
+    struct Job { int slot; std::vector<CkptPart> parts; bool held = true; unsigned id = 0; double submit_ms = 0.0; };   // P1: held until ckpt_release_held(); (d trace) id, submit stamp
     std::deque<Job> q;
     bool started = false;
+    int dev = -1;            // (d trace) the device, set by ckpt_helper
+    unsigned next_job = 0;   // (d trace) under mu: the job counter of this helper (1, 2, ...)
 };
 inline long test_ckpt_helper_delay_ms() {
     static const long v = [] { const char* e = std::getenv("STRATA_TEST_CKPT_HELPER_DELAY_MS"); return e ? std::atol(e) : 0L; }();
@@ -240,7 +244,7 @@ inline CkptHelper& ckpt_helper(int dev) {
     auto* helpers = &ckpt_helpers();
     if (dev < 0) dev = 0;
     if ((size_t) dev >= helpers->size()) helpers->resize((size_t) dev + 1, nullptr);
-    if (!(*helpers)[(size_t) dev]) (*helpers)[(size_t) dev] = new CkptHelper();
+    if (!(*helpers)[(size_t) dev]) { (*helpers)[(size_t) dev] = new CkptHelper(); (*helpers)[(size_t) dev]->dev = dev; }
     return *(*helpers)[(size_t) dev];
 }
 /// STRATA_TEST_CKPT_STAGING_FAIL=1 (tests only): no staging area can be allocated (the bounce path takes the save)
@@ -256,7 +260,15 @@ inline int ckpt_acquire(CkptHelper& h, size_t bytes) {
     if (h.busy[0] && h.busy[1]) {   // both areas taken by held copies: let them run (P1), then wait for one
         lk.unlock(); ckpt_release_held(); lk.lock();
     }
+    // STRATA_TRACE (d trace): a save that waits for a staging area (both held by jobs the helper has not finished) prints
+    // the wait on the shared trace clock; only when it really waits
+    const bool wait_tr = trace_on() && h.busy[0] && h.busy[1];
+    const double aw0 = wait_tr ? trace_ms() : 0.0;
     h.freed.wait(lk, [&] { return !h.busy[0] || !h.busy[1]; });
+    if (wait_tr) {
+        const double aw1 = trace_ms();
+        std::fprintf(stderr, "strata trace: ckpt area wait dev %d: begin @%.2f ms end @%.2f ms (%.2f ms)\n", h.dev, aw0, aw1, aw1 - aw0);
+    }
     const int slot = !h.busy[0] ? 0 : 1;
     if (h.cap[slot] < bytes) {
         if (h.area[slot]) { (void) cudaFreeHost(h.area[slot]); h.area[slot] = nullptr; h.cap[slot] = 0; }
@@ -285,12 +297,27 @@ inline void ckpt_start_locked(CkptHelper& h) {   // under h.mu: the device's hel
                     job = std::move(h.q.front());
                     h.q.pop_front();
                 }
+                // STRATA_TRACE (d trace): one line per job on the shared trace clock (trace_clock.hpp) - dequeue, first copy
+                // start, copy end, first / last latch open; no sync, only clock reads
+                const bool tr = trace_on();
+                const double deq = tr ? trace_ms() : 0.0;
                 if (const long ms = test_ckpt_helper_delay_ms(); ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 const auto* a = static_cast<const uint8_t*>(h.area[job.slot]);
+                double c0 = -1.0, c1 = 0.0, o0 = -1.0, o1 = 0.0;
+                size_t bytes = 0;
+                const void* first_block = job.parts.empty() ? nullptr : (const void*) job.parts.front().store;
                 for (const CkptPart& p : job.parts) {
+                    if (tr && c0 < 0.0) c0 = trace_ms();
                     if (p.bytes) std::memcpy(p.store->bytes.data(), a + p.off, p.bytes);
+                    bytes += p.bytes;
+                    if (tr) c1 = trace_ms();
                     p.store->open();   // the block holds the bytes now; its readers go on
+                    if (tr) { o1 = trace_ms(); if (o0 < 0.0) o0 = o1; }
                 }
+                if (tr)
+                    std::fprintf(stderr, "strata trace: ckpt copy dev %d job %u block %p: %zu part(s), %.2f MB, submit @%.2f ms, "
+                                         "dequeue @%.2f ms, first copy @%.2f ms, copy end @%.2f ms, latch open @%.2f-@%.2f ms\n",
+                                 h.dev, job.id, first_block, job.parts.size(), bytes / 1e6, job.submit_ms, deq, c0, c1, o0, o1);
                 ckpt_release(h, job.slot);
             }
         }).detach();
@@ -298,7 +325,10 @@ inline void ckpt_start_locked(CkptHelper& h) {   // under h.mu: the device's hel
 }
 inline void ckpt_submit(CkptHelper& h, int slot, std::vector<CkptPart> parts) {
     std::lock_guard<std::mutex> lk(h.mu);
-    h.q.push_back({slot, std::move(parts), true});
+    const unsigned id = ++h.next_job;
+    for (const CkptPart& p : parts)
+        if (p.store) { p.store->dev.store(h.dev, std::memory_order_relaxed); p.store->job.store(id, std::memory_order_relaxed); }
+    h.q.push_back({slot, std::move(parts), true, id, trace_on() ? trace_ms() : 0.0});
     ckpt_start_locked(h);
     h.work.notify_one();
 }

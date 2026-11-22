@@ -157,6 +157,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <string>
 #include <set>
 #include "strata/program/planner_rows.hpp"
+#include "strata/core/trace_clock.hpp"
 #include <vector>
 
 
@@ -12071,9 +12072,9 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            static const Clock::time_point tr0 = Clock::now();
-            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f ms\n", what, a, b,
-                         std::chrono::duration<double, std::milli>(Clock::now() - tr0).count());
+            // (d trace, exitfix-20261121) the stamps' origin is the shared trace clock (trace_clock.hpp), so the checkpoint
+            // copy and latch lines stamp on the same clock; its origin is fixed at its first use, as tr0 was
+            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f ms\n", what, a, b, strata::core::trace_ms());
             std::fflush(stderr);
         };
         {

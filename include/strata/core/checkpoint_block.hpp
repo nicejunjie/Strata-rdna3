@@ -15,11 +15,14 @@
 #include <mutex>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include "strata/core/trace_clock.hpp"
 
 namespace strata::core {
 
@@ -49,13 +52,27 @@ public:
         std::atomic<bool> ready{true};
         std::mutex mu;
         std::condition_variable cv;
+        // (d trace, exitfix-20261121) set by ckpt_submit for the STRATA_TRACE latch-wait line: the helper's device and job
+        std::atomic<int> dev{-1};
+        std::atomic<unsigned> job{0};
         Store() = default;
         explicit Store(Bytes b) : bytes(std::move(b)) {}
         void wait() {
             if (ready.load(std::memory_order_acquire)) return;
+            // STRATA_TRACE (d trace): a reader that blocks on a pending latch prints its wait on the shared trace clock
+            // (only on this slow path; nothing when the block is ready or tracing is off)
+            const bool tr = trace_on();
+            const double w0 = tr ? trace_ms() : 0.0;
             if (auto f = ckpt_release_hook().load(std::memory_order_acquire)) f();   // a held copy: let it run now
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return ready.load(std::memory_order_acquire); });
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return ready.load(std::memory_order_acquire); });
+            }
+            if (tr) {
+                const double w1 = trace_ms();
+                std::fprintf(stderr, "strata trace: ckpt latch wait dev %d job %u block %p: begin @%.2f ms end @%.2f ms (%.2f ms)\n",
+                             dev.load(std::memory_order_relaxed), job.load(std::memory_order_relaxed), (void*) this, w0, w1, w1 - w0);
+            }
         }
         void open() {   // the helper, after its copy: under the mutex, so a waiting destructor cannot free us mid-notify
             std::lock_guard<std::mutex> lk(mu);
