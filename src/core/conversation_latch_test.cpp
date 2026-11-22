@@ -69,7 +69,8 @@ void trace_lines(const char* self) {
                                                  "dequeue @%lf ms, first copy @%lf ms, copy end @%lf ms, latch open @%lf-@%lf ms",
                                                  &dev, &job, &blk, &parts, &mb, &sub, &deq, &c0, &c1, &o0, &o1) == 11,
           "trace on: the helper's line for job 1 (device, job, block, parts, stamps)");
-    check(parts == 2 && sub <= deq && deq <= c0 && c0 <= c1 && c1 <= o0 && o0 <= o1, "trace on: the helper's stamps in order");
+    // each part is copied, then its latch opened: the first open follows the first copy, the last open the last copy end
+    check(parts == 2 && sub <= deq && deq <= c0 && c0 <= c1 && c0 <= o0 && o0 <= o1 && c1 <= o1, "trace on: the helper's stamps in order");
     check(deq - sub >= 0.0 && c0 - deq >= 19.0, "trace on: the copy starts after the helper's 20 ms delay");
     const size_t pw = on.find("strata trace: ckpt latch wait dev 2 job 1 ");
     check(pw != std::string::npos && std::sscanf(on.c_str() + pw, "strata trace: ckpt latch wait dev %d job %u block %p: begin @%lf ms end @%lf ms (%lf ms)",
