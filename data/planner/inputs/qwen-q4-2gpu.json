@@ -1,16 +1,17 @@
 {
- "_doc": "B2 generator inputs, q4 two-card: measured / copied / policy rows (make_planner_rows2.py derives TP_PREFILL_CHUNK and DP_PIPE_CHUNK)",
+ "_doc": "B2 generator inputs, q4 two-card, tier 0 deploy (11-25): measured / copied / policy rows (make_planner_rows2.py derives TP_PREFILL_CHUNK and DP_PIPE_CHUNK)",
  "measured": {
   "STRATA_TP_PREFILL_MIN": {
    "value": 8192,
-   "source": "today's row (Deploy A); the class A tool run (B2 session 1, 11-22) replaces it"
-  },
-  "STRATA_TP_PREFILL_MAX": {
-   "value": 28672,
-   "source": "today's row (Deploy A); the class A tool run (B2 session 1, 11-22) replaces it"
+   "source": "B2 class A session 1 (11-22, b2/classA/s1-judge.txt): tool row 8192 = today -> KEEP"
   }
  },
  "copied": {
+  "STRATA_TP_PREFILL_MAX": {
+   "value": 28672,
+   "why": "today's row (Deploy A)",
+   "pending": "session 1 MOVE-EDGE (tool row 29184 at the bracket top), bracket extension pending (classA/review-fable-s1.md 2)"
+  },
   "STRATA_DP_MIN": {
    "value": 18000,
    "why": "declined-only (review-fable-structural Decision 2)"
