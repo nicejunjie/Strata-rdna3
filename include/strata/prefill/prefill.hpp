@@ -92,6 +92,18 @@ public:
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
     static int64_t stream_all_min_tokens();
+    /// [claude] planner step 1b: the part's plan sets the staged threshold (the chunk size from which a chunk streams every
+    /// expert: stream_all_min_tokens) and the routed walk's limit (STRATA_FUSED_ROUTED_MAX) for the part's layout and
+    /// read; 0 = none (today's rule: STRATA_PREFILL_STREAM_MIN, the CPU share's limit, 1024; FUSED_ROUTED_MAX, 2048).
+    /// The threshold a layout was laid out with is recorded (layout_stream_min) and run() refuses a part whose
+    /// threshold differs from it (review 1 M1: the fused layouts keep MMQ buffers for stream_all_min - 1 rows only).
+    static void set_part_stream_min(int64_t tokens);
+    static int64_t legacy_stream_min_tokens();   ///< the threshold without a part's plan (today's rule)
+    static void set_part_walk_max(int64_t tokens);
+    static int64_t walk_max_tokens();            ///< the routed walk's limit in force (the part's plan, else today's)
+    static int64_t legacy_walk_max_tokens();
+    int64_t layout_stream_min() const;
+    bool layout_stream_min_forced() const;
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk
@@ -256,6 +268,20 @@ public:
     /// download a chunk).  generate.cpp refills a long prompt's lent cache slots in this order (STRATA_REFILL_OVERLAP).
     void route_hist_enable(bool on) { route_hist_on_ = on; }
     const std::vector<int32_t>& route_hist() const { return route_hist_; }
+    /// [claude] planner step 1: what the last run() / run_impl() really did per chunk (the decisions made inside the
+    /// prompt kernels), for the per-part plan log line next to the planned values.  Accumulated over every run_impl of
+    /// this instance (a DP / TP read calls it per chunk); the serve loop resets it before each part.  Read only.
+    struct RunFacts {
+        int32_t chunks = 0;        ///< chunks read
+        int32_t stream_all = 0;    ///< chunks that streamed every non-resident expert
+        int32_t staged = 0;        ///< chunks staged after their routing (the CPU share's range)
+        int32_t walk = 0;          ///< chunks on the routed walk (STRATA_FUSED_ROUTED)
+        int32_t helped = 0;        ///< chunks with the layer split's help (the idle stage streams a share)
+        int32_t ring = 0;          ///< the ring slots the layout holds (m.ring)
+        int64_t first_chunk = 0;   ///< the first chunk's tokens
+    };
+    const RunFacts& run_facts() const { return run_facts_; }
+    void reset_run_facts() { run_facts_ = RunFacts{}; }
     void route_hist_reset() { std::fill(route_hist_.begin(), route_hist_.end(), 0); }
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
@@ -315,6 +341,7 @@ private:
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     bool route_hist_on_ = false;                     ///< route_hist_enable
+    RunFacts run_facts_;                             ///< [claude] planner step 1: run_facts()
     std::vector<int32_t> route_hist_;                ///< route_hist
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.

@@ -3,6 +3,8 @@
 #include "conversation_copy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <array>
 #include <limits>
 
@@ -30,10 +32,12 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool queued = false) {
+using conversation_detail::HostSide;
+// `side`: which end is the checkpoint's own (pageable) host vector - see conversation_copy.hpp, crashfix-20261117
+bool copy(void* dst, const void* src, size_t bytes, std::string& error, HostSide side, bool queued = false) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
+    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued, side);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -93,6 +97,16 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     }
     return true;
 }
+
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+/// the staging layout of a save (gdn | ple | tails | dead | block_pos, the layers' parts contiguous as in the blocks)
+struct StagingLayout {
+    size_t n_ple = 0, n_t = 0, n_d = 0, n_b = 0, off_ple = 0, off_t = 0, off_d = 0, off_b = 0, total = 0;
+    StagingLayout(const SessionState& ss, const ConversationStateSizes& z, size_t layers)
+        : n_ple(ss.ple_hist ? z.ple : 0), n_t(layers * z.tail), n_d(layers * z.dead), n_b(layers * z.block_pos),
+          off_ple(z.gdn), off_t(off_ple + n_ple), off_d(off_t + n_t), off_b(off_d + n_d), total(off_b + n_b) {}
+};
+#endif
 
 bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
@@ -171,17 +185,115 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss);
-    c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
-    c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    {   // O (crashfix-20261117): the state into a pinned staging area (direct DMA), the blocks filled by the device's helper
+        // thread (pending until then); layout gdn | ple | tails | dead | block_pos, the layers' parts contiguous as in the blocks
+        const StagingLayout lay(ss, z, layers);
+        const size_t n_ple = lay.n_ple, n_t = lay.n_t, n_d = lay.n_d, n_b = lay.n_b;
+        const size_t off_ple = lay.off_ple, off_t = lay.off_t, off_d = lay.off_d, off_b = lay.off_b, total = lay.total;
+        int dev = 0;
+        if (total && cudaGetDevice(&dev) == cudaSuccess) {
+            auto& h = conversation_detail::ckpt_helper(dev);
+            const int slot = conversation_detail::ckpt_acquire(h, total);
+            if (slot >= 0) {
+                auto* a = static_cast<uint8_t*>(h.area[slot]);
+                bool ok = copy(a, ss.gdn_state, z.gdn, error, HostSide::none, true) &&
+                          copy(a + off_ple, ss.ple_hist, n_ple, error, HostSide::none, true);
+                for (size_t j = 0; ok && j < layers; ++j) {
+                    const auto& st = owned(ss, j);
+                    ok = copy(a + off_t + j * z.tail, st.idx_tail, z.tail, error, HostSide::none, true) &&
+                         copy(a + off_d + j * z.dead, st.idx_dead, z.dead, error, HostSide::none, true) &&
+                         copy(a + off_b + j * z.block_pos, st.idx_block_pos, z.block_pos, error, HostSide::none, true);
+                }
+                cudaStream_t s = nullptr;
+                if (ok && conversation_detail::private_stream(s) == cudaSuccess) {
+                    const cudaError_t e = cudaStreamSynchronize(s);
+                    if (e != cudaSuccess) { ok = false; error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(e); }
+                } else if (ok) ok = fail(error, "no private copy stream");
+                if (!ok) {
+                    cudaStream_t s2 = nullptr;
+                    if (conversation_detail::private_stream(s2) == cudaSuccess) (void) cudaStreamSynchronize(s2);   // nothing in flight
+                    conversation_detail::ckpt_release(h, slot);
+                    c.gdn.clear(); c.ple.clear(); c.tails.clear(); c.dead.clear(); c.block_pos.clear();
+                    return false;
+                }
+                std::vector<conversation_detail::CkptPart> parts{
+                    {c.gdn.begin_pending(z.gdn), 0, z.gdn}, {c.ple.begin_pending(n_ple), off_ple, n_ple},
+                    {c.tails.begin_pending(n_t), off_t, n_t}, {c.dead.begin_pending(n_d), off_d, n_d},
+                    {c.block_pos.begin_pending(n_b), off_b, n_b}};
+                conversation_detail::ckpt_submit(h, slot, std::move(parts));
+                return true;
+            }
+        }
+    }
+#endif
+    // L (crashfix-20261117): every byte is overwritten from the GPU below, so the blocks are fresh and unfilled; a failed copy
+    // clears them (h: no half-written checkpoint stays readable), and every caller drops the checkpoint on false
+    c.gdn.assign_for_overwrite(z.gdn); c.ple.assign_for_overwrite(ss.ple_hist ? z.ple : 0);
+    c.tails.assign_for_overwrite(layers * z.tail); c.dead.assign_for_overwrite(layers * z.dead);
+    c.block_pos.assign_for_overwrite(layers * z.block_pos);
+    auto failed = [&] { c.gdn.clear(); c.ple.clear(); c.tails.clear(); c.dead.clear(); c.block_pos.clear(); return false; };
+    const auto D = HostSide::dst;
+    if (!copy(c.gdn.mutable_data(), ss.gdn_state, c.gdn.size(), error, D) ||
+        !copy(c.ple.mutable_data(), ss.ple_hist, c.ple.size(), error, D)) return failed();
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.tails.mutable_data() + j * z.tail, st.idx_tail, z.tail, error, D) ||
+            !copy(c.dead.mutable_data() + j * z.dead, st.idx_dead, z.dead, error, D) ||
+            !copy(c.block_pos.mutable_data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, D)) return failed();
     }
     return true;
+}
+
+bool conversation_checkpoint_prepare(const SessionState& ss, const ModelGeometry& g, std::string& error, size_t* area0_bytes) {
+    if (area0_bytes) *area0_bytes = 0;
+#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(STRATA_GPU_METAL)
+    ConversationStateSizes z;
+    if (!checkpoint_targets(ss, g, 0, z, error)) return false;   // the save's own sizes (they do not depend on the prompt)
+    const StagingLayout lay(ss, z, owned_qsa(ss));
+    int dev = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e != cudaSuccess) { error = std::string("conversation checkpoint setup: no current device: ") + cudaGetErrorString(e); return false; }
+    cudaStream_t s = nullptr;
+    if ((e = conversation_detail::private_stream(s)) != cudaSuccess) {   // this thread's copy stream on the device
+        (void) cudaGetLastError();
+        error = std::string("conversation checkpoint setup: private stream: ") + cudaGetErrorString(e);
+        return false;
+    }
+    bool ok = true;
+    auto& h = conversation_detail::ckpt_helper(dev);
+    if (lay.total && !conversation_detail::ckpt_prepare(h, lay.total)) {
+        ok = fail(error, "staging area 0 could not be allocated (the first save allocates it)");
+    }
+    if (area0_bytes) { std::lock_guard<std::mutex> lk(h.mu); *area0_bytes = h.cap[0]; }   // (the trace line's bytes)
+    if ((e = conversation_detail::bounce_prepare()) != cudaSuccess) {
+        (void) cudaGetLastError();
+        error = std::string("conversation checkpoint setup: bounce buffers: ") + cudaGetErrorString(e);
+        ok = false;
+    }
+    return ok;
+#else
+    (void) ss; (void) g; (void) error; (void) area0_bytes;
+    return true;
+#endif
+}
+
+void conversation_checkpoint_release_held(CkptRelease point, bool no_late_left) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    // STRATA_TEST_CKPT_RELEASE (tests only): decode_start = at the decode start whatever is left to join; request_end = at the
+    // request's end only (the deadlock releases still apply).  Unset: the first of decode start with nothing left and the last join.
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_TEST_CKPT_RELEASE");
+        if (!e) return 0;
+        return std::string(e) == "decode_start" ? 1 : std::string(e) == "request_end" ? 2 : 0;
+    }();
+    bool go = point == CkptRelease::request_end;
+    if (mode == 0) go = go || point == CkptRelease::late_join_done || (point == CkptRelease::decode_start && no_late_left);
+    if (mode == 1) go = go || point == CkptRelease::decode_start;
+    if (go) conversation_detail::ckpt_release_held();
+#else
+    (void) point; (void) no_late_left;
+#endif
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
@@ -196,23 +308,54 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
+    // STRATA_TRACE (d, exitfix-20261121): one line per restore with its parts - the device sync, the wait for the helper's
+    // latch (a pending block), the bounce buffers' allocation and the event / stream creation (first use only), the copies
+    const bool trace = conversation_detail::copy_trace_on();
+    using TClock = std::chrono::steady_clock;
+    const TClock::time_point t0 = TClock::now();
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    double sync_ms = 0.0, latch_ms = 0.0;
+    if (trace) {
+        sync_ms = conversation_detail::ms_since_(t0);
+        const TClock::time_point t1 = TClock::now();
+        (void) c.gdn.data(); (void) c.ple.data(); (void) c.tails.data(); (void) c.dead.data(); (void) c.block_pos.data();
+        latch_ms = conversation_detail::ms_since_(t1);   // (each data() waits for its block's latch; the copies below then do not)
+        conversation_detail::copy_split() = {};
+    }
+    const TClock::time_point t2 = TClock::now();
+    const auto S = HostSide::src;
+    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error, S) ||
+        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error, S)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error, S) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error, S) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error, S)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error, S)) return false;
         }
     }
     const size_t tokens = c.ids.size();
     ss.ple_prev[0] = tokens >= 2 ? c.ids[tokens - 2] : -1;
     ss.ple_prev[1] = tokens >= 1 ? c.ids[tokens - 1] : -1;
-    return sync(error);
+    const bool ok = sync(error);
+    if (trace) {
+        const conversation_detail::CopySplit sp = conversation_detail::copy_split();
+        const double copy_ms = conversation_detail::ms_since_(t2), total_ms = conversation_detail::ms_since_(t0);
+        int dev = -1;
+        (void) cudaGetDevice(&dev);
+        const size_t bytes = c.gdn.size() + c.ple.size() + c.tails.size() + c.dead.size() + c.block_pos.size();
+        // (d trace) the copy part's absolute start / end on the shared trace clock (trace_clock.hpp; the request trace's
+        // "@ ms" stamps), and the restore's own start: the durations are as before
+        const double at_end = trace_ms();
+        std::fprintf(stderr, "strata trace: checkpoint restore on device %d: %.2f MB, sync %.2f ms, latch wait %.2f ms, bounce "
+                             "allocation %.2f ms, event/stream creation %.2f ms, copy (DMA) %.2f ms, total %.2f ms; "
+                             "start @%.2f ms, copy @%.2f-@%.2f ms\n",
+                     dev, bytes / 1e6, sync_ms, latch_ms, sp.alloc_ms, sp.create_ms,
+                     copy_ms - sp.alloc_ms - sp.create_ms, total_ms, trace_ms(t0), trace_ms(t2), at_end);
+    }
+    return ok;
 }
 
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
@@ -227,7 +370,7 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
     if (zf.gdn != zt.gdn || zf.tail != zt.tail || zf.dead != zt.dead || zf.block_pos != zt.block_pos ||
         owned_qsa(from) != owned_qsa(to) || (from.ple_hist != nullptr) != (to.ple_hist != nullptr))
         return fail(error, "direct copy between differently carved sessions");
-    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, queued); };
+    auto acopy = [&](void* dst, const void* src, size_t bytes) { return copy(dst, src, bytes, error, HostSide::none, queued); };
     if (!acopy(to.gdn_state, from.gdn_state, zf.gdn) ||
         !acopy(to.ple_hist, from.ple_hist, from.ple_hist ? zf.ple : 0)) return false;
     for (size_t j = 0; j < owned_qsa(from); ++j) {

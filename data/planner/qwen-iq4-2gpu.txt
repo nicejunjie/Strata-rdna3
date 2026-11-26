@@ -1,0 +1,13 @@
+# two-card threshold rows, iq4 (Deploy A: today's values, parity by construction; make_planner_rows2.py)
+# class A = path crossover (copied until a measured crossover moves it), B = geometry (copied), C = refill policy
+row2 STRATA_TP_PREFILL_MIN 4865   # class A copied
+row2 STRATA_TP_PREFILL_MAX 20480   # class A copied
+row2 STRATA_TP_PREFILL_CHUNK 20480   # class B copied
+row2 STRATA_DP_MIN 11000   # class A copied
+row2 STRATA_DP_PIPE_CHUNK 11264   # class B copied
+row2 STRATA_PREFILL_AUTO_MAX 32768   # class B copied
+row2 STRATA_REFILL_HEAD 1344   # class C policy
+row2 STRATA_REFILL_HEAD_MIN 49152   # class C policy
+row2 STRATA_REFILL_HEAD2 2688   # class C policy
+row2 STRATA_REFILL_HEAD2_MIN 245760   # class C policy
+row2 STRATA_REFILL_HEAD_TP_KEEP 800   # class C policy

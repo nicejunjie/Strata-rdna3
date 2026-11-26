@@ -644,6 +644,7 @@ struct Out {
     void u64(uint64_t v) { raw(&v, 8); }
     void i64(int64_t v) { raw(&v, 8); }
     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+    void vec(const CheckpointBlock& v) { u64(v.size()); raw(v.data(), v.size()); }   // S: the shared block's bytes
     void buffer(const ConversationBuffer& b) {
         u64(b.size());
         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
@@ -733,6 +734,12 @@ struct In {
         if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
                                    std::to_string(limit));
         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    bool vec(CheckpointBlock& b, uint64_t limit = UINT64_MAX) {   // S: read into a fresh vector, then a unique block
+        std::vector<uint8_t> v;
+        if (!vec(v, limit)) return false;
+        b = CheckpointBlock(v);
         return true;
     }
     template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {

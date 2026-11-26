@@ -668,7 +668,7 @@ int main() {
         check(session_save_checkpoints({}, live, agree, out, why) && out.empty(), "save: no checkpoints, none copied");
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
         // under a real address-space limit that cannot hold one more copy: the refusal comes first, no bad_alloc;
-        // and the same limit with an admitting preflight does fail at the copy (the test can see the difference)
+        // and with an admitting preflight the copy shares the blocks (S), so it succeeds without allocating
         std::vector<ConversationCheckpoint> fat(1);
         fat[0].ids = {1, 2, 3};
         fat[0].gdn.assign(256u << 20, 0x22);
@@ -688,13 +688,17 @@ int main() {
             bool refused = false;
             try { refused = !session_save_checkpoints(fat, live, low, o2, w) && o2.empty(); } catch (...) { ::_exit(11); }
             if (!refused) ::_exit(12);
-            try { session_save_checkpoints(fat, live, agree, o2, w); } catch (const std::bad_alloc&) { ::_exit(0); }
-            ::_exit(13);   // the copy fitted: the limit did not bite, the test proves nothing
+            // S (crashfix-20261117): the admitted copy shares the checkpoint's blocks, so it allocates nothing and fits
+            try {
+                const bool ok = session_save_checkpoints(fat, live, agree, o2, w) && o2.size() == 1 &&
+                                o2[0].gdn.data() == fat[0].gdn.data() && o2[0].gdn == fat[0].gdn;
+                ::_exit(ok ? 0 : 13);
+            } catch (const std::bad_alloc&) { ::_exit(14); }
         }
         int status = 0;
         check(pid > 0 && ::waitpid(pid, &status, 0) == pid, "save: low-memory child ran");
         check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-              "save: under a low address-space limit the preflight refuses before the copy (an admitted copy fails)");
+              "save: under a low address-space limit the preflight refuses before the copy (an admitted copy shares, no allocation)");
         check(fat[0].gdn.size() == (256u << 20) && fat[0].gdn[12345] == 0x22 &&
               slurp(old_file) == std::vector<char>(9, 'o'), "save: live state and the old file intact");
 #endif

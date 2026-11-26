@@ -70,6 +70,22 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// (d, exitfix-20261121) at load, on the thread that will issue this session's checkpoint copies and with the session's
+/// device current: everything a save and a restore of this session make on first use today - the device's staging area 0
+/// at the exact size of this session's save, the device's helper thread, the device's bounce buffers and events, and the
+/// calling thread's private copy stream - so the first requests do not pay for it.  Staging area 1 stays lazy.  The
+/// state after it is the state after the first save and the first restore.  False + error when a part could not be made;
+/// the copies then make it on first use, as before.  A no-op (true) where there is no staging (not HIP).
+/// area0_bytes (optional): the size of the device's staging area 0 after it (0 where there is none).
+bool conversation_checkpoint_prepare(const SessionState& session, const ModelGeometry& g, std::string& error,
+                                     size_t* area0_bytes = nullptr);
+/// P1 (crashfix-20261117): the checkpoint copies a save handed to the helper threads are held until this is called (the serve
+/// loop after the last late join; a reader at a pending block, a save with both staging areas busy and the request's scope
+/// release them too).  A no-op where there is no helper.
+/// `point`: where the serve loop is.  The default releases at the first of the decode start with no late refill part left and the
+/// late join that leaves none (and at the request's end); STRATA_TEST_CKPT_RELEASE=decode_start|request_end (tests only) moves it.
+enum class CkptRelease { late_join_done, decode_start, request_end };
+void conversation_checkpoint_release_held(CkptRelease point = CkptRelease::request_end, bool no_late_left = true);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two

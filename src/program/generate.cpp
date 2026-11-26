@@ -90,6 +90,7 @@
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
 #include "strata/program/prefill_plan.hpp"
+#include "strata/program/segment_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -155,6 +156,8 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <stdexcept>
 #include <string>
 #include <set>
+#include "strata/program/planner_rows.hpp"
+#include "strata/core/trace_clock.hpp"
 #include <vector>
 
 
@@ -196,57 +199,106 @@ bool refill_order_prompt() {
     }();
     return v;
 }
-// the DP plan's chunk for a segment of n tokens (Prefill::run_dp: an even number of balanced chunks, multiples of 256)
-int64_t dp_step_for(int64_t n, int64_t cap) {
-    int64_t k = std::max<int64_t>(2, (n + cap - 1) / cap);
-    if (k & 1) ++k;
-    return ((n + k - 1) / k + 255) / 256 * 256;
+// [claude] planner step 1 (results/planner-20261112): today's thresholds, parsed once exactly as the helpers below parsed
+// them before; the rules themselves live in include/strata/program/segment_plan.hpp (one place, CPU-tested)
+strata::program::segment_plan::Thresholds legacy_base_thresholds() {
+    static const strata::program::segment_plan::Thresholds t = [] {
+        strata::program::segment_plan::Thresholds t;
+        auto env = [](const char* k) { return std::getenv(k); };
+        t.tp_on = strata::prefill::Prefill::tp_prefill_env();
+        if (const char* e = env("STRATA_TP_PREFILL_MIN")) t.tp_lo = std::max<int64_t>(1024, std::atoll(e));
+        if (const char* e = env("STRATA_TP_PREFILL_MAX")) t.tp_hi = std::atoll(e);
+        if (const char* e = env("STRATA_TP_PREFILL_CHUNK")) t.tp_chunk = std::max<int64_t>(1024, std::atoll(e));
+        t.dp_min = dp_min_tokens();
+        t.pipe_chunk = dp_pipe_chunk();
+        if (const char* e = env("STRATA_PIPE_HALF_MIN")) t.pipe_half_min = std::max<int64_t>(2048, std::atoll(e));
+        if (const char* e = env("STRATA_PIPE_HALF_MAX")) t.pipe_half_max = std::atoll(e);
+        { const char* e = env("STRATA_PREFILL_EQUAL"); t.equal = e != nullptr && e[0] == '1'; }
+        if (const char* v = env("STRATA_PREFILL_EQUAL_TAIL_MAX")) t.equal_tail_max = (int64_t) std::atoll(v);
+        if (const char* v = env("STRATA_REFILL_HEAD")) t.head = (int64_t) std::max(0, std::atoi(v));
+        { const char* v = env("STRATA_REFILL_HEAD_DP"); t.head_dp = v != nullptr && std::atoi(v) != 0; }
+        if (const char* v = env("STRATA_REFILL_HEAD_MIN")) t.head_min = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD2")) t.head2 = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD2_MIN")) t.head2_min = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD_BIG")) t.head_big = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD_BIG_CHUNK")) t.head_big_chunk = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD_TP_KEEP")) t.head_tp_keep = (int64_t) std::max(0, std::atoi(v));
+        if (const char* v = env("STRATA_REFILL_HEAD_TP_MIN")) t.head_tp_min = (int64_t) std::max(0, std::atoi(v));
+        return t;
+    }();
+    return t;
 }
+// [claude] planner step 1b: the thresholds in force for the request now - today's (legacy_base_thresholds) unless the
+// request forces a plan through its per-request switches (strata_tune env PLAN_*; request_switches.hpp, request-only)
+strata::program::segment_plan::Thresholds& thresholds_now() {
+    static strata::program::segment_plan::Thresholds t = legacy_base_thresholds();
+    return t;
+}
+const strata::program::segment_plan::Thresholds& legacy_thresholds() { return thresholds_now(); }
+// at every GEN/GENI after reqsw::apply_request: the request's forced plan values (none: today's), and the staged threshold
+// and walk limit the prompt kernels take for this request's parts (Prefill::set_part_stream_min / set_part_walk_max)
+bool g_plan_forced = false;   // the request running now forced a plan (for the plan log line)
+// [claude] planner step 2b (review 4 A2): the PLAN_* switches are honoured only by an engine the calibration tool started
+// with --calibration-plans (a CLI flag, never an environment variable), never under --batch slots (a slot read keeps the
+// last GEN's switches), and PLAN_STAGED_MAX never on a layer split (not audited there).  Forced values are clamped and
+// checked: the staged threshold and the walk limit at least 1024 (the key's floor; below ~1000 tokens other kernels run)
+// and at most the start-up chunk, on the 256 grid or one past it (an exclusive bound); anything else rejects the
+// request's whole plan and says so on one line.
+bool apply_plan_switches(bool allowed, int64_t cap, bool batch, bool split) {
+    namespace R = strata::core::reqsw;
+    strata::program::segment_plan::Thresholds t = legacy_base_thresholds();
+    int64_t tp_min = R::get_i64(R::PLAN_TP_MIN), tp_max = R::get_i64(R::PLAN_TP_MAX), dp_min = R::get_i64(R::PLAN_DP_MIN);
+    int64_t tail = R::get_i64(R::PLAN_TAIL_MAX), staged = R::get_i64(R::PLAN_STAGED_MAX), walk = R::get_i64(R::PLAN_WALK_MAX);
+    const bool asked = tp_min >= 0 || tp_max >= 0 || dp_min >= 0 || tail >= 0 || staged >= 0 || walk >= 0;
+    std::string why;
+    auto grid_ok = [](int64_t v) { return v % 256 == 0 || v % 256 == 1; };
+    if (asked) {
+        if (!allowed) why = "this engine was not started with --calibration-plans";
+        else if (batch) why = "batch slots are configured (a slot read would keep the forced plan)";
+        else if (staged >= 0 && split) why = "PLAN_STAGED_MAX is not supported on a layer split";
+        else if (staged >= 0 && (staged < 1024 || staged > cap + 1 || !grid_ok(staged))) why = "PLAN_STAGED_MAX outside [1024, start-up chunk + 1] or off the 256 grid";
+        else if (walk >= 0 && (walk < 1024 || walk > cap || !grid_ok(walk))) why = "PLAN_WALK_MAX outside [1024, start-up chunk] or off the 256 grid";
+        else if (tp_min >= 0 && (tp_min < 1024 || !grid_ok(tp_min))) why = "PLAN_TP_MIN below 1024 or off the 256 grid";
+        else if ((tp_max >= 0 && !grid_ok(tp_max)) || (dp_min >= 0 && !grid_ok(dp_min))) why = "PLAN_TP_MAX / PLAN_DP_MIN off the 256 grid";
+        if (!why.empty()) {
+            std::fprintf(stderr, "strata plan: forced plan REJECTED (%s): this request runs today's plan\n", why.c_str());
+            tp_min = tp_max = dp_min = tail = staged = walk = -1;
+        }
+    }
+    if (tp_min >= 0) t.tp_lo = std::max<int64_t>(1024, tp_min);     // (the env floors, as legacy_base_thresholds)
+    if (tp_max >= 0) t.tp_hi = tp_max;
+    if (dp_min >= 0) t.dp_min = std::max<int64_t>(2 * strata::program::segment_plan::kDpMinLast, dp_min);
+    if (tail >= 0) t.equal_tail_max = tail;
+    thresholds_now() = t;
+    strata::prefill::Prefill::set_part_stream_min(staged > 0 ? staged : 0);
+    strata::prefill::Prefill::set_part_walk_max(walk > 0 ? walk : 0);
+    g_plan_forced = tp_min >= 0 || tp_max >= 0 || dp_min >= 0 || tail >= 0 || staged > 0 || walk > 0;
+    return g_plan_forced;
+}
+// the DP plan's chunk for a segment of n tokens (Prefill::run_dp: an even number of balanced chunks, multiples of 256)
+int64_t dp_step_for(int64_t n, int64_t cap) { return strata::program::segment_plan::dp_step_for(n, cap); }
 // the shortest last chunk Prefill::run_dp takes: the drafter's window (--mtp-window 4096) and 64 positions before it,
 // on the 256 grid
-constexpr int64_t kDpMinLast = 4224;
+constexpr int64_t kDpMinLast = strata::program::segment_plan::kDpMinLast;
 // a segment the DP plan takes (two or more balanced chunks, the last of at least kDpMinLast tokens); a shorter one is
 // read by the layer pipeline and must lend the pipeline's chunk, not the DP step (8K prompts lent two 4096-token
 // chunks, then the pipeline read them in those: every expert a card does not hold streamed twice, Q4 dual 1406 tok/s
 // against 1867 in one chunk)
 // (the last chunk is what remains after the full steps: 8441 tokens plan 4352 + 4089, refused)
-bool dp_takes(int64_t n, int64_t cap) {
-    if (n < dp_min_tokens()) return false;
-    const int64_t step = dp_step_for(n, cap);
-    const int64_t full = (n + step - 1) / step;
-    return full >= 2 && n - (full - 1) * step >= kDpMinLast;
-}
+bool dp_takes(int64_t n, int64_t cap) { return strata::program::segment_plan::dp_takes(n, cap, legacy_thresholds()); }
 // [claude] TP prefill (STRATA_TP_PREFILL=1, Prefill::run_tp): segments of STRATA_TP_PREFILL_MIN (4096) ..
 // STRATA_TP_PREFILL_MAX (32768) tokens read on both GPUs, every layer, in balanced chunks of at most
 // STRATA_TP_PREFILL_CHUNK (16384) tokens; it needs the DP path's link and sessions (STRATA_DP_PREFILL=1)
-bool tpp_takes(int64_t n) {
-    static const bool on = strata::prefill::Prefill::tp_prefill_env();
-    static const int64_t lo = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MIN"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 4096; }();
-    static const int64_t hi = [] { const char* e = std::getenv("STRATA_TP_PREFILL_MAX"); return e ? std::atoll(e) : (int64_t) 32768; }();
-    return on && n >= lo && n <= hi;
-}
-int64_t tpp_chunk_for(int64_t n, int64_t cap) {
-    static const int64_t c = [] { const char* e = std::getenv("STRATA_TP_PREFILL_CHUNK"); return e ? std::max<int64_t>(1024, std::atoll(e)) : (int64_t) 16384; }();
-    const int64_t C = std::min(cap, c);
-    const int64_t k = std::max<int64_t>(1, (n + C - 1) / C);
-    return std::min(C, ((n + k - 1) / k + 255) / 256 * 256);
-}
+bool tpp_takes(int64_t n) { return strata::program::segment_plan::tpp_takes(n, legacy_thresholds()); }
+int64_t tpp_chunk_for(int64_t n, int64_t cap) { return strata::program::segment_plan::tpp_chunk_for(n, cap, legacy_thresholds()); }
 // the head read_part reads on the layer pipeline before DP: up to the next K/V block boundary from a0
-int64_t dp_head(int64_t a0) {
-    const int64_t blk = strata::kernels::qsa_real_shapes().idx_block;
-    return (blk - a0 % blk) % blk;
-}
+int64_t dp_head(int64_t a0) { return strata::program::segment_plan::dp_head(a0, strata::kernels::qsa_real_shapes().idx_block); }
 // the layer pipeline's chunk for a segment of n tokens below the DP path: STRATA_PIPE_HALF_MIN..STRATA_PIPE_HALF_MAX
 // (default 2048..0: off) reads a segment of that many tokens in two equal halves on the 256 grid, so both cards stream
 // and compute at once instead of one after the other; the others take STRATA_DP_PIPE_CHUNK.  Which sizes pay depends on
 // the pack (2x RX 7900 XTX, prompt tok/s, one chunk -> halves): Q4_K_XL 4K 1027 -> 1183 but 8K 1867 -> 1406;
 // IQ3 4K 2243 -> 1908 but 8K 2891 -> 3050; IQ4 4K 1637 -> 1573 - so the presets set the range per pack
-int64_t pipe_chunk_for(int64_t n) {
-    static const int64_t half_min = [] { const char* e = std::getenv("STRATA_PIPE_HALF_MIN"); return e ? std::max<int64_t>(2048, std::atoll(e)) : (int64_t) 2048; }();
-    static const int64_t half_max = [] { const char* e = std::getenv("STRATA_PIPE_HALF_MAX"); return e ? std::atoll(e) : (int64_t) 0; }();
-    if (n >= half_min && n <= half_max) return ((n + 1) / 2 + 255) / 256 * 256;
-    return dp_pipe_chunk();
-}
+int64_t pipe_chunk_for(int64_t n) { return strata::program::segment_plan::pipe_chunk_for(n, legacy_thresholds()); }
 }  // namespace
 
 namespace {
@@ -316,6 +368,17 @@ bool ckpt_threads_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CKPT_THREADS");
         return v && v[0] != '0';
+    }();
+    return on;
+}
+// STRATA_TEST_CKPT_EAGER=0 (tests only; read once; default on): no checkpoint copy setup at load (d, exitfix-20261121), so
+// the first save and the first restore make their staging area, helper, bounce buffers and streams on first use exactly as
+// before (headp1).  The gate's lazy arm, which gives the 2nd request's restore split on the same binary (review-fable-impl
+// required change 1).
+bool ckpt_eager_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_TEST_CKPT_EAGER");
+        return !(v && v[0] == '0');
     }();
     return on;
 }
@@ -863,6 +926,8 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    /// [claude] planner step 2b: --calibration-plans: honour a request's PLAN_* switches (the calibration tool's engines only)
+    bool calibration_plans = false;
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
@@ -1860,6 +1925,8 @@ public:
     bool on() const { return on_; }
     void give(ConvCheckpoint&& c) {
         if (!on_ || c.gdn.empty()) return;
+        // S (crashfix-20261117): only storage no parked copy shares is reused (copy-on-write would keep others safe anyway)
+        if (!c.gdn.unique() || !c.ple.unique() || !c.tails.unique() || !c.dead.unique() || !c.block_pos.unique()) return;
         clear_marks(c);
         std::lock_guard<std::mutex> lk(mu_);
         if (free_.size() < cap_) free_.push_back(std::move(c));
@@ -2509,6 +2576,46 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
+    // [claude] phase 3 Deploy A (results/planner-20261112/phase3, review-fable-phase3 sections 1 and 5): the --planner table's
+    // two-card threshold rows (`row2 STRATA_<KEY> <integer>`, planner_rows.hpp).  Applied here, before the option loop and
+    // before any parse site reads a key, with the arch defaults' rule: an explicit environment value wins, else the row,
+    // else the engine default.  A table holding today's values is behaviour-identical by construction.  A table that
+    // cannot be read or is refused applies nothing (one line); the environment alone decides, as before.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) != "--planner") continue;
+        namespace PR = strata::program::planner_rows;
+        std::string text, err;
+        std::FILE* pf = std::fopen(argv[i + 1], "rb");
+        if (pf == nullptr) { std::fprintf(stderr, "strata planner rows: cannot read %s: no rows applied\n", argv[i + 1]); break; }
+        char pbuf[65536]; size_t pn;
+        while ((pn = std::fread(pbuf, 1, sizeof pbuf, pf)) > 0) text.append(pbuf, pn);
+        std::fclose(pf);
+        std::vector<PR::Row> rows;
+        if (!PR::parse(text, rows, err)) {
+            std::fprintf(stderr, "strata planner rows: %s refused (%s): no rows applied, the environment alone decides\n", argv[i + 1], err.c_str());
+            break;
+        }
+        if (rows.empty()) break;   // a one-card table without two-card rows: nothing to say
+        const auto ap = PR::apply(rows, [](const char* k) { return (const char*) std::getenv(k); }, [](const char* k, const char* v) {
+#if defined(_WIN32)
+            _putenv_s(k, v);
+#else
+            setenv(k, v, 0);
+#endif
+        });
+        // (e) the derived chunk rows (planner_rows::derive) are listed as KEY=V(derived) and counted apart; without one the
+        // line is as before
+        std::string said; int from_table = 0, derived = 0;
+        for (const auto& a : ap) {
+            said += " " + a.key.substr(7) + "=" + a.value + (a.source == "env" ? "(env)" : a.source == "derived" ? "(derived)" : "");
+            from_table += a.source == "table"; derived += a.source == "derived";
+        }
+        const size_t n_rows = ap.size() - (size_t) derived;
+        std::string dsaid = derived ? ", " + std::to_string(derived) + " derived" : std::string();
+        std::fprintf(stderr, "strata planner rows: %s: %zu two-card rows, %d from the table, %zu kept from the environment%s:%s\n", argv[i + 1],
+                     n_rows, from_table, n_rows - (size_t) from_table, dsaid.c_str(), said.c_str());
+        break;
+    }
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
@@ -2541,6 +2648,7 @@ int main(int argc, char** argv) {
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
+        else if (a == "--planner") { (void) next("--planner"); }   // [claude] phase 3: its two-card rows are applied at startup (planner_rows.hpp)
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
@@ -2797,6 +2905,7 @@ int main(int argc, char** argv) {
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--calibration-plans") o.calibration_plans = true;   // [claude] planner: the tool's engines only
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -8048,11 +8157,7 @@ int main(int argc, char** argv) {
     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
     auto request_chunk = [](int64_t tokens, int64_t max_chunk) -> int64_t {
-        if (tokens <= 0 || max_chunk <= 0) return 0;
-        const int64_t rounded = tokens > std::numeric_limits<int64_t>::max() - 255
-                                    ? tokens
-                                    : ((tokens + 255) / 256) * 256;
-        return std::min(max_chunk, rounded);
+        return strata::program::segment_plan::request_chunk(tokens, max_chunk);   // [claude] planner step 1: the rule moved
     };
     // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
     // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
@@ -8061,30 +8166,18 @@ int main(int argc, char** argv) {
     // stream_all_min_tokens() stays as it is (it moves only the experts its own tokens route to).  Used ONLY where a
     // segment's chunk is chosen (the serve lend, generate's prompt); `request_chunk` is unchanged because
     // STRATA_SPLIT_SMALL_OWN uses it too.  The chunk geometry changes the rounding, so it is off by default.
-    static const bool equal_chunks = [] { const char* e = std::getenv("STRATA_PREFILL_EQUAL"); return e != nullptr && e[0] == '1'; }();
+    // [claude] planner step 1: the rule moved to segment_plan::equal_chunk (STRATA_PREFILL_EQUAL / _TAIL_MAX parsed once there)
     auto equal_chunk = [&](int64_t tokens, int64_t max_chunk) -> int64_t {
-        const int64_t plain = request_chunk(tokens, max_chunk);
-        if (!equal_chunks || tokens <= 0 || max_chunk <= 0) return plain;
-        const int64_t n = tokens / max_chunk + (tokens % max_chunk != 0);
-        const int64_t last = tokens - (n - 1) * max_chunk;
-        // [claude] 2026-11-11 STRATA_PREFILL_EQUAL_TAIL_MAX=<tokens> (default: no limit): the short-last-chunk exception only
-        // for chunks up to that size.  With STRATA_PREFILL_AUTO_MAX 49152 a 57K prompt read 49152 + 8185: the 49152 loan
-        // took 81% of a Q4 1-GPU cache, so both passes streamed nearly every expert (18.6 s against 15.35 s in two 28672
-        // chunks); past the limit the prompt is split evenly whatever its tail.  Default 32768 since 2026-11-11 (review 2,
-        // section 4: the unlimited default was the configuration that regressed)
-        static const int64_t equal_tail_max = [] { const char* v = std::getenv("STRATA_PREFILL_EQUAL_TAIL_MAX"); return v ? (int64_t) std::atoll(v) : (int64_t) 32768; }();
-        if (n <= 1 || (last < strata::prefill::Prefill::stream_all_min_tokens() && max_chunk <= equal_tail_max)) return plain;
-        const int64_t per = tokens / n + (tokens % n != 0);
-        const int64_t rounded = per > std::numeric_limits<int64_t>::max() - 255 ? per : ((per + 255) / 256) * 256;
-        return std::min(max_chunk, rounded);
+        return strata::program::segment_plan::equal_chunk(tokens, max_chunk, legacy_thresholds(),
+                                                          strata::prefill::Prefill::stream_all_min_tokens());
     };
     // #2824: the chunk a request of `tokens` reads in when the host-aware plan chose `plan` (< cap, the buffers' chunk = what the VRAM
     // scan picked).  A prompt that fits one chunk of `cap` keeps ONE chunk, as before (a single pass reads each expert once, so the
     // page cache cannot thrash, and splitting it would only add a pass); a longer one reads in n = ceil(tokens / plan) chunks of
     // EQUAL size (no tiny tail), at most `cap`.
     auto planned_chunk = [&](int64_t tokens, int64_t cap, int64_t plan) -> int64_t {
-        if (plan <= 0 || plan >= cap || tokens <= 0) return equal_chunk(tokens, cap);
-        return strata::program::prefill_plan::balanced_chunk(tokens, cap, plan);
+        return strata::program::segment_plan::planned_chunk(tokens, cap, plan, legacy_thresholds(),
+                                                            strata::prefill::Prefill::stream_all_min_tokens());
     };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
     // or with --prefill auto the largest chunk whose buffers take at most kAutoLendPct % of the slots (a
@@ -9841,6 +9934,9 @@ int main(int argc, char** argv) {
         // site; cleared by every other move and every call that keeps the state on the stages (a batched part writes
         // them), and at each request's start
         int64_t tp_clean_cells = -1;
+        // [claude] head split (phase3 followup, review-fable-round4 section 3): set by the head split right before the
+        // batched sub-part's tp_to(false, ...) - a no-op there, which would clear the credit; that one call keeps it
+        bool tp_keep_clean_once = false;
         std::string tp_pre_err;
         auto tp_pre_join = [&]() -> int64_t {   // the precopy's pages (0: none, or it failed)
             if (tp_pre_th.joinable()) tp_pre_th.join();
@@ -9852,7 +9948,12 @@ int main(int argc, char** argv) {
             return p;
         };
         auto tp_to = [&](bool want_tp, int64_t cells, std::string& e) -> bool {
-            if (!tp_on || tp_state_tp == want_tp) { if (tp_on && !want_tp) { tp_pre_join(); tp_clean_cells = -1; } return true; }
+            if (!tp_on || tp_state_tp == want_tp) {
+                if (tp_on && !want_tp) { tp_pre_join(); if (!tp_keep_clean_once) tp_clean_cells = -1; }
+                tp_keep_clean_once = false;
+                return true;
+            }
+            tp_keep_clean_once = false;
             strata::core::SessionState* sst[2] = {&ss, &stages[0]->ss};
             const int sdev[2] = {0, stages[0]->dev};
             const int64_t slb[2] = {0, split_at[0]};
@@ -11106,6 +11207,7 @@ int main(int argc, char** argv) {
                 ++joined;
             }
             late.swap(keep);   // (the parts not joined were moved into `keep`: back, whether any joined or not)
+            if (late.empty()) strata::core::conversation_checkpoint_release_held(strata::core::CkptRelease::late_join_done);   // P1: after the last late join
             if (joined == 0) return;
             if (late_tr) {
                 std::fprintf(stderr, "strata trace: late join %zu parts %zu rows at window %lld, %zu parts left\n", joined,
@@ -11991,9 +12093,9 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            static const Clock::time_point tr0 = Clock::now();
-            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f ms\n", what, a, b,
-                         std::chrono::duration<double, std::milli>(Clock::now() - tr0).count());
+            // (d trace, exitfix-20261121) the stamps' origin is the shared trace clock (trace_clock.hpp), so the checkpoint
+            // copy and latch lines stamp on the same clock; its origin is fixed at its first use, as tr0 was
+            std::fprintf(stderr, "strata trace: %s %lld %lld @%.1f ms\n", what, a, b, strata::core::trace_ms());
             std::fflush(stderr);
         };
         {
@@ -12169,6 +12271,55 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
 #if defined(STRATA_USE_HIP)
+        // (d) exitfix-20261121 (council-20261121 "Final design, topic 2"): what the first save and the first restore made on
+        // first use is made here, on the threads that issue those copies, so the first requests do not pay for it: each
+        // device's staging area 0 at its session's exact save size, its helper thread, its bounce buffers and events, and the
+        // issuing threads' private copy streams (thread-local: the main thread for every device - the sequential save and
+        // every restore select the stage's device on it - and, with STRATA_CKPT_THREADS, each stage's save thread).
+        // Area 1 stays lazy.  Only when a checkpoint can be saved (checkpoint_at's predicate).  A part that fails is made
+        // on first use as before (one line).  Before the lock line, so these pinned blocks are in its count and VmLck.
+        // STRATA_TEST_CKPT_EAGER=0 (tests only): skipped, the copies set up on first use as in headp1 (one trace line)
+        if (o.prompt_cache > 0 && !ckpt_eager_env() && std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: checkpoint copy setup at load: off (STRATA_TEST_CKPT_EAGER=0), set up on first use\n");
+        if (o.prompt_cache > 0 && ckpt_eager_env()) {
+            const Clock::time_point e0 = Clock::now();
+            int prepared = 0;
+            std::string area0;   // the bytes of each device's staging area 0, in the trace line
+            auto prepare_on = [&](int dev, const strata::core::SessionState& pss) {   // dev < 0: the thread's current device
+                const strata::core::OnDevice on(dev);
+                int cur = -1;
+                std::string pe;
+                if (dev >= 0 && (cudaGetDevice(&cur) != cudaSuccess || cur != dev)) {   // OnDevice does not report a failed selection
+                    (void) cudaGetLastError();
+                    std::fprintf(stderr, "strata serve: checkpoint copy setup at load: device %d could not be selected; "
+                                         "its copies set up on first use\n", dev);
+                    return;
+                }
+                size_t a0 = 0;
+                if (!strata::core::conversation_checkpoint_prepare(pss, g, pe, &a0))
+                    std::fprintf(stderr, "strata serve: checkpoint copy setup at load (device %d): %s; set up on first use\n",
+                                 dev, pe.c_str());
+                else
+                    ++prepared;
+                int adev = dev;
+                if (adev < 0) (void) cudaGetDevice(&adev);
+                area0 += (area0.empty() ? "" : ", ") + std::string("device ") + std::to_string(adev) + " " + std::to_string(a0);
+            };
+            prepare_on(-1, ss);
+            for (auto& st : stages) prepare_on(st->dev, st->ss);
+            if (ckpt_threads_env() && !stages.empty()) {
+                std::mutex pmu;
+                const std::function<void(size_t)> job = [&](size_t k) {
+                    if (k == 0) return;   // the main thread: done above
+                    std::lock_guard<std::mutex> lk(pmu);   // (prepare_on counts)
+                    prepare_on(stages[k - 1]->dev, stages[k - 1]->ss);
+                };
+                ckpt_threads.run(stages.size() + 1, job);   // starts the save threads now, as a first save would
+            }
+            if (ckpt_trace)
+                std::fprintf(stderr, "strata trace: checkpoint copy setup at load: %d part(s), %.1f ms, staging area 0 bytes: %s\n",
+                             prepared, std::chrono::duration<double, std::milli>(Clock::now() - e0).count(), area0.c_str());
+        }
         ::strata::hip_compat::host_lock_report("at READY");   // the one host memory lock line (hip_compat/host_lock.hpp)
 #endif
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
@@ -13379,6 +13530,7 @@ int main(int argc, char** argv) {
                 // (every GEN/GENI starts from the start-up values)
                 std::string said;
                 strata::core::reqsw::apply_request(req_env, said);
+                apply_plan_switches(o.calibration_plans, o.prefill_chunk, o.batch > 0, !stages.empty());   // [claude] planner: this request's forced plan (none: today's rules)
                 if (!said.empty()) std::fprintf(stderr, "strata serve: %s\n", said.c_str());
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
@@ -14051,6 +14203,8 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
             tr("request", n, geni ? 1 : 0);
+            // P1: whichever way this request ends (an error, a cancel, no token, a disconnect), its held checkpoint copies run
+            struct CkptReleaseGuard { ~CkptReleaseGuard() { strata::core::conversation_checkpoint_release_held(); } } ckpt_release_guard;
             req_times = ReqTimes{};
             tp_clean_cells = -1;
             if (use_mtp) mtp.set_prompt_len(n);
@@ -14329,6 +14483,16 @@ int main(int argc, char** argv) {
             bool dp_read_req = false;   // [claude] this request's prompt was read by the DP path (STRATA_REFILL_HEAD_DP)
             bool tpp_read_req = false;  // [claude] this request's prompt was read by the TP prompt path (STRATA_REFILL_HEAD_TP_KEEP)
             int64_t req_prompt_n = 0;   // [claude] this request's prompt tokens (STRATA_REFILL_HEAD_MIN)
+            // [claude] planner step 1: the refill heads this request's parts took (per participant: lent rows, head rows),
+            // and the time the head joins waited before the first token - printed once with the request's plan line
+            struct PlanHeads { int n = 0; int dev[8] = {}; size_t rows[8] = {}; size_t head[8] = {}; bool paced[8] = {};
+                               double join_ms = 0; size_t joined = 0; bool sync = false; };
+            PlanHeads plan_heads;
+            auto plan_heads_note = [&](int dev, size_t rows, size_t head, bool paced) {
+                if (plan_heads.n >= 8) return;
+                plan_heads.dev[plan_heads.n] = dev; plan_heads.rows[plan_heads.n] = rows; plan_heads.head[plan_heads.n] = head;
+                plan_heads.paced[plan_heads.n] = paced; ++plan_heads.n;
+            };
             auto late_stream_of = [&](const PfPart& p) -> cudaStream_t {
                 if (p.dev < 0) return adapt_stream;
                 for (auto& st : stages)
@@ -14408,31 +14572,12 @@ int main(int argc, char** argv) {
                 // windows lose more without it)
                 static const int64_t late_head2 = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
                 static const int64_t late_head2_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD2_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) INT64_MAX; }();
-                int64_t head_want = late_head2 >= 0 && req_prompt_n >= late_head2_min ? late_head2 : late_head;
-                // [claude] 2026-11-11 STRATA_REFILL_HEAD_BIG=<n slots> (with STRATA_REFILL_HEAD_BIG_CHUNK=<tokens>, default 32768):
-                // a part whose loan was laid out for a chunk above that (STRATA_PREFILL_AUTO_MAX past 32768: a 66-80K DP prompt in
-                // two 40K chunks instead of four) is bigger than the others; at least n of its rows join before the first token,
-                // so the first windows do not pay for the larger loan (Q4 2-GPU 72-80K: ms/window +3.4%, hit -1.7 pt without it)
-                static const int64_t late_head_big = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_BIG"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
-                static const int64_t late_head_big_chunk = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_BIG_CHUNK"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 32768; }();
-                if (late_head_big > 0 && p.lent_chunk > late_head_big_chunk) head_want = std::max(head_want, late_head_big);
-                // [claude] STRATA_REFILL_HEAD_TP_KEEP=<n slots> (P16K): after a prompt the TP prompt path read (both cards
-                // busy to its last layer, so neither card's loan went back during it), every lent row of a part but its
-                // n coldest joins before the first token; a part of at most n rows keeps the late refill as before.
-                // Only after TP reads: a DP read's first card refilled beside the second's last chunk, and its TTFT keeps.
-                static const int64_t late_head_tp_keep = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_KEEP"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1; }();
-                size_t head_n = paced && (!late_head_dp || dp_read_req) && req_prompt_n >= late_head_min
-                                    ? std::min(rows.size(), (size_t) head_want) : 0;
-                // STRATA_REFILL_HEAD_TP_MIN=<tokens> (default 0): only after a prompt of at least that many tokens (an 8K
-                // TP read's loan is refilled beside the first windows at no measured decode cost; a head there costs TTFT)
-                static const int64_t late_head_tp_min = [] { const char* v = std::getenv("STRATA_REFILL_HEAD_TP_MIN"); return v ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0; }();
-                if (paced && tpp_read_req && late_head_tp_keep >= 0 && req_prompt_n >= late_head_tp_min &&
-                    rows.size() > (size_t) late_head_tp_keep)
-                    head_n = std::max(head_n, rows.size() - (size_t) late_head_tp_keep);
-                // [claude] 2026-11-11 (review 2, R2-L2): the big head applies on its own, not only past STRATA_REFILL_HEAD_MIN
-                // (IQ3's 131072 would have turned it off at 66-80K, where the bigger loan is)
-                if (paced && late_head_big > 0 && p.lent_chunk > late_head_big_chunk)
-                    head_n = std::max(head_n, std::min(rows.size(), (size_t) late_head_big));
+                // [claude] planner step 1: the head rule moved verbatim to segment_plan::head_rows (the same thresholds,
+                // parsed once in legacy_thresholds(); the statics above stay as the readable record of what each means)
+                (void) late_head; (void) late_head_dp; (void) late_head_min; (void) late_head2; (void) late_head2_min;
+                const size_t head_n = strata::program::segment_plan::head_rows(legacy_thresholds(), rows.size(), p.lent_chunk,
+                                                                               req_prompt_n, paced, dp_read_req, tpp_read_req);
+                plan_heads_note(p.dev, rows.size(), head_n, paced);
                 for (size_t t0 = 0, t = 0, step = head_n > 0 ? head_n : per; t0 < rows.size(); t0 += step, ++t, step = per) {
                     const bool is_head = head_n > 0 && t0 == 0;
                     LateTranche lt;
@@ -14495,6 +14640,7 @@ int main(int argc, char** argv) {
             static const bool late_join_now_env = [] { const char* v = std::getenv("STRATA_REFILL_JOIN_NOW"); return v != nullptr && std::atoi(v) != 0; }();
             auto late_join_now = [&]() {
                 size_t joined = 0, rows_joined = 0;
+                const auto t_join = Clock::now();   // [claude] planner step 1: the head joins' wait, for the plan line
                 std::vector<LateTranche> keep;
                 for (LateTranche& t : late) {
                     bool join = t.head && !t.bad;
@@ -14512,6 +14658,8 @@ int main(int argc, char** argv) {
                     ++joined;
                 }
                 late.swap(keep);
+                plan_heads.join_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_join).count();
+                plan_heads.joined += rows_joined;
                 if (joined == 0) return;
                 if (late_tr) {
                     std::fprintf(stderr, "strata trace: join now %zu parts %zu rows before the first token, %zu parts left\n",
@@ -14553,6 +14701,11 @@ int main(int argc, char** argv) {
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
                 if (n_parts > 0) res_upload();
+                if (n_parts > 0) {   // [claude] planner step 1: a refill before the first token, for the plan line
+                    plan_heads.join_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count();
+                    plan_heads.joined += (size_t) n_lent;
+                    plan_heads.sync = true;
+                }
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
                                  (long long) n_lent, (long long) n_parts,
@@ -14566,33 +14719,40 @@ int main(int argc, char** argv) {
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
             bool lend_no_tp = false;   // [claude] review M1: lend lays this segment out for the usual read, not TP's
+            // [claude] planner step 1: the part's SegmentPlan - lend() fills the lend side, read_part() the read side,
+            // the part loop logs it once (and what the prompt kernels really did, Prefill::run_facts)
+            strata::program::segment_plan::PartFacts seg_facts;
+            strata::program::segment_plan::SegmentPlan seg_cur;
+            bool seg_cur_set = false;
+            strata::program::segment_plan::Path seg_ran = strata::program::segment_plan::Path::Single;   // what really ran
             auto lend = [&](int64_t a0, int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 late_apply(true);   // a refill still joining: its slots are in the tables before any is lent again
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
-                // prompt needs, so a large chunk costs a short prompt nothing
-                int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
-                bool tp_read = false;   // [claude] TP prefill: this segment's loan carves the exchange buffers
-                if (dp_on) {   // [claude] DP: a long segment lends the DP plan's step; the layer pipeline keeps its chunk
-                    // the part DP reads: read_part takes the head to the next K/V block boundary on the pipeline first
-                    // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
-                    // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
-                    const int64_t dp_n = tokens - dp_head(a0);
+                // prompt needs, so a large chunk costs a short prompt nothing.  [claude] planner step 1: the choice is
+                // segment_plan::lend_side (the rules moved verbatim: planned_chunk; on the DP link TP's chunk, DP's step
+                // or the pipeline's chunk; #340 split_small; --prefill-head-alias; `exact` for a planned segment read on)
+                {
+                    namespace spn = strata::program::segment_plan;
+                    spn::PartFacts& f = seg_facts;
+                    f = spn::PartFacts{};
+                    f.a0 = a0; f.b0 = a0 + tokens; f.cap = o.prefill_chunk; f.host_plan_chunk = pf_plan_chunk;
+                    f.stream_all_min = strata::prefill::Prefill::stream_all_min_tokens();
+                    f.idx_block = strata::kernels::qsa_real_shapes().idx_block;
+                    f.dp_on = dp_on; f.layer_split = !stages.empty();
                     // [claude] STRATA_TP_PREFILL_OWNROWS: a prompt with picture rows is not read by run_tp (it declines them),
                     // and the usual path cannot use a TP layout that holds only its own rows: that loan is laid out as DP's
-                    const bool tpp_pictures = strata::prefill::Prefill::tp_ownrows_env() && sp.embd_rows != nullptr;
-                    if (tpp_takes(dp_n) && !tpp_pictures && !lend_no_tp) { want_full = std::min(o.prefill_chunk, tpp_chunk_for(dp_n, o.prefill_chunk)); tp_read = true; }   // [claude] TP prefill
-                    else if (dp_takes(dp_n, o.prefill_chunk)) want_full = std::min(o.prefill_chunk, dp_step_for(dp_n, o.prefill_chunk));
-                    else want_full = std::min(want_full, pipe_chunk_for(tokens));
+                    f.tpp_pictures = strata::prefill::Prefill::tp_ownrows_env() && sp.embd_rows != nullptr;
+                    f.lend_no_tp = lend_no_tp; f.head_alias = o.prefill_head_alias;
+                    f.split_small = split_small; f.split_small_max = split_small_max; f.exact = exact;
+                    seg_cur = spn::SegmentPlan{};
+                    spn::lend_side(seg_cur, f, legacy_thresholds());
+                    seg_cur_set = true;
                 }
-                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                     : want_full;
-                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                const bool tp_read = seg_cur.tp_read;   // [claude] TP prefill: this segment's loan carves the exchange buffers
+                const int64_t want = seg_cur.want;
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -14603,8 +14763,13 @@ int main(int argc, char** argv) {
                     if (p.first < 0) continue;
                     // [claude] TP prefill: a loan laid out for the other kind of read is laid out again
                     const bool tp_mismatch = strata::prefill::Prefill::tp_prefill_env() && p.sp->tp_layout_now() != tp_read;
+                    // [claude] planner step 1b: a layout laid out for another staged threshold (a forced plan now or then)
+                    // is laid out again: its buffers hold MMQ's rows for that threshold only (review 1 M1)
+                    const bool smin_mismatch = (p.sp->layout_stream_min_forced() ||
+                                                strata::prefill::Prefill::stream_all_min_tokens() != strata::prefill::Prefill::legacy_stream_min_tokens()) &&
+                                               p.sp->layout_stream_min() != strata::prefill::Prefill::stream_all_min_tokens();
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk && !tp_mismatch) continue;            // its current loan already covers this
+                        if (want <= p.lent_chunk && !tp_mismatch && !smin_mismatch) continue;   // its current loan already covers this
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -14633,13 +14798,15 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
                                          "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
                                          (long long) want_p);
+                        if (want_p != want && g_plan_forced)   // [claude] review 4 A2.2: the tool discards this arm (only when halved)
+                            std::fprintf(stderr, "strata plan: forced plan INVALID: a chunk was halved (#2090) under it\n");
                         if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
                             std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
                                          "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now || tp_mismatch) {
+                    if (want_p != p.sp->chunk() || first != p.first_now || tp_mismatch || smin_mismatch) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
@@ -14654,6 +14821,15 @@ int main(int argc, char** argv) {
                             }
                         }
                     p.lent_chunk = want_p;
+                }
+                {   // [claude] planner step 1: the loan each participant really took (facts for the plan log)
+                    seg_cur.cards = 0;
+                    for (const PfPart& p : pf_parts) {
+                        if (p.first < 0 || seg_cur.cards >= strata::program::segment_plan::SegmentPlan::kMaxCards) continue;
+                        seg_cur.lent_chunk[seg_cur.cards] = p.lent_chunk;
+                        seg_cur.lent_rows[seg_cur.cards] = (int64_t) p.lent.size();
+                        ++seg_cur.cards;
+                    }
                 }
                 for (const PfPart& p : pf_parts)
                     if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
@@ -14737,8 +14913,11 @@ int main(int argc, char** argv) {
                     }
                     std::fprintf(stderr, "strata serve: the TP loan is laid out again for the usual prompt path\n");
                     lend_no_tp = true;
+                    const strata::program::segment_plan::SegmentPlan chosen = seg_cur;   // [claude] review 3 B2.2: the relend
                     const bool ok = lend(a0, b0 - a0, e2, planned ? plan.chunk : 0);   // a plan keeps its chunk
                     lend_no_tp = false;
+                    seg_cur.path = chosen.path; seg_cur.head = chosen.head; seg_cur.dp_n = chosen.dp_n;   // keeps the lend side
+                    seg_cur.read_chunk = chosen.read_chunk;                                                  // only: the read chose TP
                     return ok;
                 };
                 if (planned && dp_on && !own_rows_back(e)) return false;
@@ -14766,25 +14945,39 @@ int main(int argc, char** argv) {
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk
                                           : std::max<int64_t>(sp.chunk(), 1);
                 const int64_t C_read = planned ? plan.chunk : C;   // what the yield test calls a chunk
-                if (!planned && dp_on && tpp_takes(b0 - a0 - dp_head(a0))) {
+                {   // [claude] planner step 1: the read side of the part's SegmentPlan (segment_plan::read_side: TP, then DP,
+                    // then the pipeline / one stage - the rule read_part applied inline before, moved verbatim)
+                    namespace spn = strata::program::segment_plan;
+                    spn::PartFacts f = seg_cur_set && seg_facts.a0 == a0 && seg_facts.b0 == b0 ? seg_facts : spn::PartFacts{};
+                    f.a0 = a0; f.b0 = b0; f.cap = o.prefill_chunk; f.dp_on = dp_on; f.layer_split = !stages.empty();
+                    f.idx_block = strata::kernels::qsa_real_shapes().idx_block; f.planned = planned;
+                    if (!(seg_cur_set && seg_facts.a0 == a0 && seg_facts.b0 == b0)) seg_cur = spn::SegmentPlan{};
+                    spn::read_side(seg_cur, f, legacy_thresholds());
+                    seg_facts = f;
+                    seg_cur_set = true;
+                    seg_ran = seg_cur.path;
+                }
+                if (seg_cur.path == strata::program::segment_plan::Path::TP) {
                     // [claude] TP prefill: both GPUs read every layer of the same chunks (Prefill::run_tp); a head to the
                     // next K/V block boundary first (the pipeline, as DP); a prompt it cannot take goes on below
-                    const int64_t head = dp_head(a0);
+                    const int64_t head = seg_cur.head;
                     if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
                     std::string te;
-                    const int64_t tn = b0 - a0 - head;
+                    const int64_t tn = seg_cur.dp_n;
                     if (strata::prefill::Prefill::run_tp(sp, stages[0]->sp, ids.data() + a0 + head, tn, a0 + head,
-                                                         std::min(o.prefill_chunk, tpp_chunk_for(tn, o.prefill_chunk)),
-                                                         kDpMinLast, te)) {
+                                                         seg_cur.read_chunk, kDpMinLast, te)) {
                         dp_read_req = true;
                         tpp_read_req = true;
                         return true;
                     }
                     if (te.rfind("prefill TP: ", 0) != 0) { e = te; return false; }   // it ran: the state is not usable
                     std::fprintf(stderr, "strata serve: %s - the usual prompt path reads it\n", te.c_str());
+                    tp_clean_cells = -1;   // [claude] head split (review-fable-gate8 condition 2, option B): a declined TP read takes
+                                           // another path from here; the in-request page credit is not carried across it
                     if (!own_rows_back(e)) return false;   // [claude] review M1
                     if (dp_takes(tn, o.prefill_chunk)) {
                         std::string de;
+                        seg_ran = strata::program::segment_plan::Path::DP;   // (run_tp declined: the plan's fallback)
                         if (strata::prefill::Prefill::run_dp(sp, stages[0]->sp, ids.data() + a0 + head, tn, a0 + head,
                                                              o.prefill_chunk, kDpMinLast, de)) {
                             dp_read_req = true;
@@ -14792,12 +14985,13 @@ int main(int argc, char** argv) {
                         }
                         if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
                     }
+                    seg_ran = strata::program::segment_plan::Path::Pipe;
                     return sp.run(ids.data() + a0 + head, tn, a0 + head, e);
                 }
-                if (!planned && dp_on && dp_takes(b0 - a0 - dp_head(a0), o.prefill_chunk)) {
+                if (seg_cur.path == strata::program::segment_plan::Path::DP) {
                     // [claude] DP: both GPUs on alternating chunks; a head to the next K/V block boundary first (the
                     // pipeline), and the pipeline for a prompt the plan cannot take
-                    const int64_t head = dp_head(a0);
+                    const int64_t head = seg_cur.head;
                     if (head > 0 && !sp.run(ids.data() + a0, head, a0, e)) return false;
                     std::string de;
                     // STRATA_DP_EARLY_REFILL (default on; 0 = off): the first path's GPU finishes its chunk first (the
@@ -14845,6 +15039,7 @@ int main(int argc, char** argv) {
                     if (early != nullptr && (early->issued || early->lent.empty())) { e = de; return false; }   // its loan is half given back
                     if (de.rfind("prefill DP: the p", 0) != 0) { e = de; return false; }
                     std::fprintf(stderr, "strata serve: %s - the layer pipeline reads it\n", de.c_str());
+                    seg_ran = strata::program::segment_plan::Path::Pipe;
                     return sp.run(ids.data() + a0 + head, b0 - a0 - head, a0 + head, e);
                 }
                 // BYIELD <ys> with the read stopped at q (nothing in flight): the part read waits in slot ys and the
@@ -15344,6 +15539,7 @@ int main(int argc, char** argv) {
             std::string read_err;
             tr("prompt start", n - 1);
             req_prompt_n = n;
+            plan_heads = PlanHeads{};   // [claude] planner step 1
             tpp_read_req = false;   // [claude] (set by this request's TP read)
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
@@ -15437,6 +15633,51 @@ int main(int argc, char** argv) {
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
+                // [claude] head split (results/planner-20261112/phase3/followup, review-fable-round4.md section 3): a batched
+                // part that runs TP or DP from a0 = at first reads the head up to the next K/V block boundary (1-3 tokens;
+                // run_tp / run_dp start on a boundary).  read_part read it with sp.run - the layer pipeline over both cards,
+                // about 85 ms a stage whatever the head, 150-180 ms in all (IQ3 / Q4 cache-on maps).  Here the head goes
+                // through the windows on the TP pair instead (the short-read path, about 20 ms), the state goes back to the
+                // stages, and the pages below at + h stay marked clean (tp_clean_cells, the H1 credit) across the batched
+                // sub-part, which writes only from at + h on: the hand-over to the pair after it copies only the new pages.
+                // The batched sub-part then starts on the boundary (its head is 0) and takes the same path and chunk (its
+                // TP / DP length is the same).  Not for: windows parts, batch slots, pictures, a planned or resumed
+                // segment, or loans still out (they go back before any windows read).
+                if (tp_on && o.batch == 0 && req_imgs.empty() && !windows_ok(at, to) &&
+                    !(resume_plan.chunk > 0 && at == resume_plan_at) &&
+                    std::none_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return !p.lent.empty(); })) {
+                    namespace spn = strata::program::segment_plan;
+                    spn::PartFacts hf;
+                    hf.a0 = at; hf.b0 = to; hf.cap = o.prefill_chunk; hf.dp_on = dp_on; hf.layer_split = !stages.empty();
+                    hf.idx_block = strata::kernels::qsa_real_shapes().idx_block;
+                    hf.planned = !stages.empty() && sp.plan_chunk(to - at) > 0;
+                    spn::SegmentPlan hs;
+                    spn::read_side(hs, hf, legacy_thresholds());
+                    const int64_t h = hs.head;
+                    if ((hs.path == spn::Path::TP || hs.path == spn::Path::DP) && h > 0 && at + h < to && windows_ok(at, at + h)) {
+                        if (!tp_to(true, at, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        const auto t_head = Clock::now();
+                        if (!read_windows(at, at + h, err)) {
+                            tp_clean_cells = -1;
+                            if (stop_req.load()) { cancelled = true; break; }   // as a cancelled part: refills below, DONE cancel
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        std::fprintf(stderr, "strata plan: part %lld-%lld windows (head before %s) %.1f ms\n", (long long) at,
+                                     (long long) (at + h), spn::path_name(hs.path),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t_head).count());
+                        if (!tp_to(false, at + h, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        tp_clean_cells = at + h;     // both sides' host pages below at + h are equal now
+                        tp_keep_clean_once = true;   // the batched sub-part's tp_to(false, at) below is a no-op that keeps it
+                        at += h;
+                    }
+                }
                 const bool win = windows_ok(at, to);
                 const bool late_now = win && late_w > 0 && o.batch == 0;
                 tr("part next", at, to);
@@ -15477,7 +15718,41 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 tr(win ? "part start (windows)" : "part start (batched)", at, to);
+                sp.reset_run_facts();   // [claude] planner step 1: what the prompt kernels do in this part
+                for (auto& st : stages) st->sp.reset_run_facts();
+                if (win) seg_cur_set = false;
+                const auto t_part = Clock::now();
                 const bool sp_ok = read_to <= at || (win ? read_windows(at, read_to, err) : read_part(at, to, err));
+                {   // [claude] planner step 1: one line per part - the plan (lend and read sides), the loans each card took,
+                    // and what the prompt kernels really did; `ran` differs from `path` only when a read declined (run_tp)
+                    namespace spn = strata::program::segment_plan;
+                    const double part_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_part).count();
+                    if (win) {
+                        std::fprintf(stderr, "strata plan: part %lld-%lld windows (short read <= %lld) %.1f ms\n", (long long) at,
+                                     (long long) read_to, (long long) req_short_read, part_ms);
+                    } else if (seg_cur_set) {
+                        strata::prefill::Prefill::RunFacts rf = sp.run_facts();
+                        int ring1 = -1;
+                        for (auto& st : stages) {
+                            const strata::prefill::Prefill::RunFacts& q = st->sp.run_facts();
+                            rf.chunks += q.chunks; rf.stream_all += q.stream_all; rf.staged += q.staged; rf.walk += q.walk;
+                            rf.helped += q.helped; ring1 = q.ring;
+                        }
+                        char cards[160] = ""; size_t cl = 0;
+                        for (int c = 0; c < seg_cur.cards && cl < sizeof(cards) - 40; ++c)
+                            cl += (size_t) std::snprintf(cards + cl, sizeof(cards) - cl, "%s%lld@%lld", c ? "," : "",
+                                                         (long long) seg_cur.lent_rows[c], (long long) seg_cur.lent_chunk[c]);
+                        std::fprintf(stderr, "strata plan: part %lld-%lld %s (lend %s want %lld head %lld chunk %lld) ran %s | lent %s | "
+                                     "kernels: chunks %d stream_all %d staged %d walk %d helped %d ring %d/%d first %lld | staged< %lld walk<= %lld%s | %.1f ms\n",
+                                     (long long) at, (long long) to, spn::path_name(seg_cur.path), spn::path_name(seg_cur.lend_path),
+                                     (long long) seg_cur.want, (long long) seg_cur.head, (long long) seg_cur.read_chunk,
+                                     spn::path_name(seg_ran), cards[0] ? cards : "-", rf.chunks, rf.stream_all, rf.staged, rf.walk,
+                                     rf.helped, sp.run_facts().ring, ring1, (long long) sp.run_facts().first_chunk,
+                                     (long long) strata::prefill::Prefill::stream_all_min_tokens(), (long long) strata::prefill::Prefill::walk_max_tokens(),
+                                     g_plan_forced ? " forced" : "", part_ms);
+                    }
+                    seg_cur_set = false;
+                }
                 if (sp_ok) pp_exact = true;
                 if (trace) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - tsp).count();
@@ -15589,6 +15864,14 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             tr("prompt done (slots refilled)");
+            if (plan_heads.n > 0 || plan_heads.joined > 0) {   // [claude] planner step 1: the refill heads of this request
+                char hb[256] = ""; size_t hl = 0;
+                for (int i = 0; i < plan_heads.n && hl < sizeof(hb) - 48; ++i)
+                    hl += (size_t) std::snprintf(hb + hl, sizeof(hb) - hl, "%sdev%d %zu/%zu%s", i ? "," : "", plan_heads.dev[i],
+                                                 plan_heads.head[i], plan_heads.rows[i], plan_heads.paced[i] ? "" : " early");
+                std::fprintf(stderr, "strata plan: heads %s | before the first token: %zu rows in %.1f ms (%s)\n", hb[0] ? hb : "-",
+                             plan_heads.joined, plan_heads.join_ms, plan_heads.sync ? "refill" : "head join");
+            }
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
@@ -16337,6 +16620,7 @@ int main(int argc, char** argv) {
                 }
             }
             tr("decode start", n);
+            strata::core::conversation_checkpoint_release_held(strata::core::CkptRelease::decode_start, late.empty());   // P1
             // [claude] review M3: the stages hold [0, n - 1) here (the first window reads token n - 1): moving n recorded cell
             // n - 1 as moved, and STRATA_TP_BACK_SKIP then skipped its page on the way back when n % page_size == 0 (stale K/V
             // for the next live-continued turn)
