@@ -1,0 +1,37 @@
+{
+ "_doc": "B2 generator inputs, iq3 two-card, tier 0 deploy (11-25): measured / copied / policy rows (make_planner_rows2.py derives TP_PREFILL_CHUNK and DP_PIPE_CHUNK)",
+ "measured": {
+  "STRATA_TP_PREFILL_MIN": {
+   "value": 2817,
+   "source": "B2 class A session 1 (11-22, b2/classA/s1-judge.txt): tool row 2817 = today -> KEEP"
+  }
+ },
+ "copied": {
+  "STRATA_TP_PREFILL_MAX": {
+   "value": 16384,
+   "why": "today's row (Deploy A)",
+   "pending": "session 1 MOVE-EDGE (tool row 16896 at the bracket top), bracket extension pending (classA/review-fable-s1.md 2)"
+  },
+  "STRATA_DP_PIPE_CHUNK": {
+   "value": 8448,
+   "why": "declined-only, no DP_MIN row (review-fable-structural Decision 1)"
+  },
+  "STRATA_PREFILL_AUTO_MAX": {
+   "value": 32768,
+   "why": "until measured (B2 session 2)"
+  },
+  "STRATA_TP_DEAL_BUDGET": {
+   "value": 8350,
+   "why": "until measured (B2 session 2)"
+  },
+  "STRATA_FUSED_ROUTED_MAX": {
+   "value": 1152,
+   "why": "until measured (B2 session 2)"
+  }
+ },
+ "policy": {
+  "STRATA_REFILL_HEAD": 2688,
+  "STRATA_REFILL_HEAD_MIN": 131072,
+  "STRATA_REFILL_HEAD_TP_KEEP": 900
+ }
+}
